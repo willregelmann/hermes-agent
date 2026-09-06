@@ -258,6 +258,10 @@ class TestRollbackNeverStrands:
                 return 0, "", ""
             if "rev-parse" in cmd:
                 return 0, "abc1234", ""
+            if "command -v uv" in cmd:
+                return 0, "/usr/bin/uv", ""
+            if "importlib.metadata" in cmd:
+                return 0, "JSON {}", ""
             if "uv sync" in cmd and fail_sync:
                 return 1, "", "No `pyproject.toml` found"
             return 0, "", ""
@@ -282,3 +286,139 @@ class TestRollbackNeverStrands:
         with patch.object(pd, "_run", side_effect=fake_run):
             with pytest.raises(DeployError, match="checkout"):
                 pd._checkout_and_sync("h", "abc1234", best_effort_sync=True)
+
+
+class TestPackagesRemovedBySyncAreRestored:
+    """Regression for the 2026-09-06 incident.
+
+    `uv sync --extra all --locked` rebuilt the venv and removed numpy,
+    onnxruntime, tokenizers (semantic memory), google-cloud-pubsub (Google Chat
+    transport), pip and pytest. Nothing errored: sync returned 0, the gateway
+    started, every health gate passed. One agent was left unreachable and could
+    not report it, because the thing removed WAS the way it reports.
+
+    Note the approach: measure before and after, do not predict. An earlier
+    version of this fix diffed against uv.lock and was WRONG — 4 of the 5
+    casualties are named in uv.lock and were removed anyway.
+    """
+
+    def test_uv_path_is_discovered_not_assumed(self):
+        """~/.hermes/bin/uv here, ~/.local/bin/uv on the Pi."""
+        def fake_run(host, cmd, timeout=120):
+            if "command -v uv" in cmd:
+                return 0, "/home/will/.hermes/bin/uv", ""
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            assert pd._find_uv("h") == "/home/will/.hermes/bin/uv"
+
+    def test_missing_uv_is_a_clear_error(self):
+        with patch.object(pd, "_run", return_value=(0, "", "")):
+            with pytest.raises(DeployError, match="uv not found"):
+                pd._find_uv("h")
+
+    def test_packages_dropped_by_sync_are_reinstalled_at_pinned_versions(self):
+        order = []
+        before = {"numpy": "2.4.6", "google-cloud-pubsub": "2.39.0",
+                  "requests": "2.32.0"}
+        after = {"requests": "2.32.0"}          # sync dropped the other two
+        state = {"synced": False}
+
+        def fake_run(host, cmd, timeout=120):
+            import json as _j
+            if "checkout" in cmd:
+                order.append("checkout")
+            elif "rev-parse" in cmd:
+                return 0, "abc1234", ""
+            elif "command -v uv" in cmd:
+                return 0, "/usr/bin/uv", ""
+            elif "importlib.metadata" in cmd:
+                order.append("measure")
+                snap = after if state["synced"] else before
+                return 0, "JSON " + _j.dumps(snap), ""
+            elif "sync --extra" in cmd:
+                order.append("sync")
+                state["synced"] = True
+            elif "pip install" in cmd:
+                order.append("restore")
+                assert "numpy==2.4.6" in cmd, cmd
+                assert "google-cloud-pubsub==2.39.0" in cmd, cmd
+                assert "requests" not in cmd, "survivors must not be reinstalled"
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._checkout_and_sync("h", "abc1234")
+
+        assert order.index("measure") < order.index("sync")
+        assert order.index("restore") > order.index("sync")
+
+    def test_nothing_removed_means_no_reinstall(self):
+        same = {"numpy": "2.4.6"}
+        with patch.object(pd, "_run") as run:
+            pd._restore_removed("h", same, same, "/usr/bin/uv")
+            run.assert_not_called()
+
+    def test_upgraded_package_is_not_downgraded(self):
+        """Only DISAPPEARANCES are repaired; a version bump is left alone."""
+        with patch.object(pd, "_run") as run:
+            pd._restore_removed("h", {"numpy": "2.4.6"}, {"numpy": "2.5.0"},
+                                "/usr/bin/uv")
+            run.assert_not_called()
+
+    def test_restore_failure_is_loud(self):
+        def fake_run(host, cmd, timeout=120):
+            if "pip install" in cmd:
+                return 1, "", "network unreachable"
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="uv sync removed"):
+                pd._restore_removed("h", {"numpy": "2.4.6"}, {}, "/usr/bin/uv")
+
+
+class TestUniversalHealthChecks:
+    """'Configured' is not 'working'. These import the real modules."""
+
+    def test_dead_memory_deps_fail_the_gate(self):
+        issued = 1_000_000.0
+
+        def fake_run(host, cmd, timeout=120):
+            if "gateway_state.json" in cmd:
+                return 0, _state_probe(issued + 10, "google_chat", "google_chat"), ""
+            if "is-active" in cmd:
+                return 0, "active", ""
+            if "journalctl" in cmd:
+                return 0, "0", ""
+            if "import numpy" in cmd:
+                return 1, "", "ModuleNotFoundError: No module named 'numpy'"
+            return 0, "", ""
+
+        checks = tuple(c.format(repo=pd.REPO) for _, c in pd.UNIVERSAL_CHECKS)
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="did not become healthy"):
+                pd._await_health("h", "system", issued, checks)
+
+    def test_dead_chat_transport_fails_the_gate(self):
+        """The exact silence: platforms report connected, pubsub is gone."""
+        issued = 1_000_000.0
+
+        def fake_run(host, cmd, timeout=120):
+            if "gateway_state.json" in cmd:
+                return 0, _state_probe(issued + 10, "google_chat", "google_chat"), ""
+            if "is-active" in cmd:
+                return 0, "active", ""
+            if "journalctl" in cmd:
+                return 0, "0", ""
+            if "pubsub_v1" in cmd:
+                return 1, "", "ImportError"
+            return 0, "", ""
+
+        checks = tuple(c.format(repo=pd.REPO) for _, c in pd.UNIVERSAL_CHECKS)
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="did not become healthy"):
+                pd._await_health("h", "system", issued, checks)
+
+    def test_both_universal_checks_present(self):
+        names = [n for n, _ in pd.UNIVERSAL_CHECKS]
+        assert "memory provider deps" in names
+        assert "chat transport" in names

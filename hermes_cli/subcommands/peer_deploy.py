@@ -233,6 +233,104 @@ def _snapshot(host: str, sha: str) -> str:
     return dest
 
 
+def _find_uv(host: str) -> str:
+    """Locate uv on the TARGET. Paths differ per host and a wrong guess is a
+    deploy that fails at the dependency step (measured: ~/.hermes/bin/uv on the
+    workstation, ~/.local/bin/uv on the Pi)."""
+    probe = (
+        "command -v uv 2>/dev/null || "
+        "for p in ~/.hermes/bin/uv ~/.local/bin/uv /usr/local/bin/uv /usr/bin/uv; "
+        "do [ -x \"$p\" ] && echo \"$p\" && break; done"
+    )
+    rc, out, _ = _run(host, probe)
+    path = (out or "").strip().splitlines()
+    if not path or not path[-1].strip():
+        raise DeployError(
+            f"uv not found on {host}. Looked on PATH and in ~/.hermes/bin, "
+            "~/.local/bin, /usr/local/bin, /usr/bin."
+        )
+    return path[-1].strip()
+
+
+def _installed_packages(host: str) -> dict:
+    """Every distribution installed in the target venv, name -> version.
+
+    THIS IS THE MOST IMPORTANT FUNCTION IN THE FILE.
+
+    `uv sync --extra all --locked` rebuilds the environment and REMOVES
+    anything it does not consider part of the synced set. Measured on
+    2026-09-06, both agents:
+
+      numpy, onnxruntime, tokenizers  -> semantic memory provider went dead
+      google-cloud-pubsub             -> Google Chat inbound went dead
+      pip, pytest                     -> removed too, so the obvious repair
+                                         command no longer existed
+
+    Nothing failed. `uv sync` returned 0, the gateway started, every health
+    gate passed, and the only evidence was one WARNING in a startup log. One
+    agent could not be reached at all afterwards and could not report it,
+    because the transport was the thing that had been removed.
+
+    NOTE ON A WRONG FIRST ATTEMPT: this originally diffed the venv against
+    uv.lock, on the assumption that "removed by sync" meant "absent from the
+    lockfile". Running it against the real venv disproved that — 4 of the 5
+    casualties (numpy, onnxruntime, tokenizers, pytest) ARE named in uv.lock
+    and were still removed, because being in the lock file is not the same as
+    being in the synced extra set. Only google-cloud-pubsub was genuinely
+    absent. Predicting what the sync will delete is guesswork; MEASURING what
+    it deleted is not. So we snapshot the installed set before and after, and
+    restore the difference.
+    """
+    script = (
+        "python3 - <<'PY'\n"
+        "import json, os, subprocess\n"
+        "py = os.path.join(os.path.expanduser(%r), 'venv', 'bin', 'python')\n"
+        "code = ('import json,importlib.metadata as m;'\n"
+        "        'print(json.dumps({d.metadata[\"Name\"]: d.version '\n"
+        "        'for d in m.distributions() if d.metadata.get(\"Name\")}))')\n"
+        "try:\n"
+        "    out = subprocess.run([py, '-c', code], capture_output=True,\n"
+        "                         text=True, timeout=120).stdout\n"
+        "    print('JSON ' + json.dumps(json.loads(out)))\n"
+        "except Exception as e:\n"
+        "    print('ERR', type(e).__name__)\n"
+        "PY"
+    ) % REPO
+    rc, out, _ = _run(host, script, timeout=180)
+    for line in (out or "").splitlines():
+        if line.startswith("JSON "):
+            try:
+                return json.loads(line[5:])
+            except ValueError:
+                break
+    return {}
+
+
+def _restore_removed(host: str, before: dict, after: dict, uv: str) -> None:
+    """Re-install what the sync deleted, pinned to the pre-sync versions.
+
+    This is a restoration, not an upgrade: a deploy is the wrong moment to also
+    move a dependency. Packages the sync UPGRADED are left alone — only ones
+    that disappeared entirely are put back.
+    """
+    lost = {n: v for n, v in before.items() if n not in after}
+    if not lost:
+        return
+    # pip is itself frequently a casualty, so install via uv, not pip.
+    specs = " ".join(shlex.quote(f"{n}=={v}") for n, v in sorted(lost.items()))
+    cmd = f"cd {REPO} && {uv} pip install --python ./venv/bin/python {specs}"
+    rc, _, err = _run(host, cmd, timeout=900)
+    if rc != 0:
+        raise DeployError(
+            f"failed to restore {len(lost)} package(s) that uv sync removed "
+            f"from {host}: {err[-300:]}. The peer is running but is missing "
+            "dependencies it had before the deploy (possibly its memory "
+            "provider or chat transport)."
+        )
+    _log(f"restored {len(lost)} package(s) removed by sync: "
+         f"{', '.join(sorted(lost)[:6])}{'...' if len(lost) > 6 else ''}")
+
+
 def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -> None:
     rc, out, err = _run(host, f"git -C {REPO} checkout --quiet {shlex.quote(sha)}", timeout=180)
     if rc != 0:
@@ -244,9 +342,20 @@ def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -
 
     # Dependencies BEFORE lifecycle. A restart onto a half-synced venv is the
     # bricking case with a green log.
+    #
+    # uv is NOT at a fixed path: ~/.hermes/bin/uv on the workstation,
+    # ~/.local/bin/uv on the Pi. Hardcoding either breaks the other direction,
+    # so resolve it on the target.
+    uv = _find_uv(host)
+
+    # MEASURE BEFORE THE SYNC DESTROYS IT. We do not try to predict which
+    # packages the sync will drop — that guess was wrong once already. We
+    # record the full installed set and diff it afterwards.
+    before = _installed_packages(host)
+
     sync = (
         f"cd {REPO} && "
-        f"UV_PROJECT_ENVIRONMENT=\"$PWD/venv\" ~/.local/bin/uv sync --extra all --locked"
+        f"UV_PROJECT_ENVIRONMENT=\"$PWD/venv\" {uv} sync --extra all --locked"
     )
     rc, _, err = _run(host, sync, timeout=900)
     if rc != 0:
@@ -265,6 +374,12 @@ def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -
             raise DeployError(f"uv sync failed on {host}: {err[-400:]}")
     else:
         _log("dependencies synced")
+
+    # Put back whatever the sync deleted. This runs on BOTH the deploy and
+    # rollback paths — a rollback that leaves the peer without its chat
+    # transport is not a recovery.
+    after = _installed_packages(host)
+    _restore_removed(host, before, after, uv)
 
 
 def _restart(host: str, scope: str) -> float:
@@ -450,6 +565,25 @@ EXTERNAL_CHECKS = {
     ),
 }
 
+# Gates that apply to EVERY agent, checked on the target after restart.
+#
+# These exist because the 2026-09-06 deploy passed every other gate while
+# having removed the memory provider's dependencies and the Google Chat
+# transport. "Configured" is not "working": the config still named the
+# provider, and the platform was still listed — both were dead. Each of these
+# imports the real module in the real venv rather than trusting a setting.
+UNIVERSAL_CHECKS = (
+    # Semantic memory: numpy/onnxruntime/tokenizers are not in uv.lock.
+    ("memory provider deps",
+     "cd {repo} && ./venv/bin/python -c "
+     "'import numpy, onnxruntime, tokenizers'"),
+    # Google Chat inbound: google-cloud-pubsub is not in uv.lock. Losing this
+    # is why an agent went unreachable and could not report it.
+    ("chat transport",
+     "cd {repo} && ./venv/bin/python -c "
+     "'from google.cloud import pubsub_v1'"),
+)
+
 
 def _deploy_once(peer: str, host: str, sha: str, scope: str,
                  *, allow_unresolved: bool, skip_fetch: bool = False) -> None:
@@ -459,7 +593,9 @@ def _deploy_once(peer: str, host: str, sha: str, scope: str,
     # signal that a dependency sync failure must not abort.
     _checkout_and_sync(host, sha, best_effort_sync=skip_fetch)
     issued = _restart(host, scope)
-    _await_health(host, scope, issued, EXTERNAL_CHECKS.get(peer, ()))
+    checks = tuple(c.format(repo=REPO) for _, c in UNIVERSAL_CHECKS)
+    checks += EXTERNAL_CHECKS.get(peer, ())
+    _await_health(host, scope, issued, checks)
     _verify_identity(peer, sha)
 
 
