@@ -1098,6 +1098,58 @@ def _contains_unsafe_gateway_action(
     return False
 
 
+_PEER_DEPLOY_RE = re.compile(
+    r"^\s*(?:\S*/)?hermes\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*peer\s+deploy\b"
+)
+
+
+def _is_peer_deploy_verb(command: str) -> bool:
+    """Exempt exactly one command shape: ``hermes peer deploy <peer> <sha>``.
+
+    WHY AN EXEMPTION EXISTS AT ALL
+    ------------------------------
+    The lifecycle guard blocks a gateway restart because a SELF-restart
+    SIGTERMs the process issuing it. That reasoning does not apply to a
+    PEER-directed restart — the target is another machine, in another cgroup,
+    and nothing signals the caller. But the guard gates on
+    ``_is_supervised_gateway_process()``, a check about *who is running*, and
+    never considers *what is being targeted*. So the safe case (blue-green
+    deploy between two agents, where a human-designated second party actuates
+    and can roll back) is currently forbidden, while the unsafe case it
+    protects against is one no agent should ever perform.
+
+    WHY THIS SHAPE, AND NOT "ALLOW COMMANDS THAT LOOK REMOTE"
+    ---------------------------------------------------------
+    The obvious alternative is to permit ``ssh <host> ... restart ...``. That
+    puts a regex between an agent and its own kill switch, and ssh is very good
+    at making one host look like another: ``~/.ssh/config`` Host aliases,
+    ProxyJump, ``-o HostName=``, and DNS that resolves anywhere. Any of those
+    lets a command look peer-directed while landing on self.
+
+    So the exemption is a single named verb whose target is read from
+    ``bot_peers`` in config.yaml and then PROVEN not to be this machine by
+    ``peer_deploy_target.assert_target_is_not_self()`` — three independent
+    checks (name, loopback literal, resolved-address overlap) before any ssh
+    happens. Free-form commands containing lifecycle phrasing stay blocked
+    exactly as before.
+
+    The guarantee therefore lives in the verb's own code, not in this regex.
+    This function's only job is to route to it. It is deliberately anchored at
+    the start of the command so that a lifecycle command merely *containing*
+    the phrase (``foo && hermes peer deploy ...``) is NOT exempted.
+    """
+    if not command or not isinstance(command, str):
+        return False
+    # Anchor on the whole command: an exemption that matches a substring could
+    # be prefixed with anything, which is how allow-lists become bypasses.
+    if not _PEER_DEPLOY_RE.match(command):
+        return False
+    # Refuse the exemption if the command chains into anything else.
+    if any(sep in command for sep in (";", "&&", "||", "|", "\n", "`", "$(")):
+        return False
+    return True
+
+
 def contains_gateway_lifecycle_command_or_referenced_script(
     command: str,
     *,
@@ -1119,6 +1171,8 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     every terminal command until the gateway restarts (#77780, #78256),
     which is strictly worse than either verdict.
     """
+    if _is_peer_deploy_verb(command):
+        return False
     try:
         # Includes the direct regex/submit scans at depth 0.
         return _contains_unsafe_gateway_action(

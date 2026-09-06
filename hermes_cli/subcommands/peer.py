@@ -184,6 +184,11 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 def cmd_peer(args) -> int:
     action = getattr(args, "peer_action", None)
 
+    if action == "deploy":
+        from hermes_cli.subcommands.peer_deploy import deploy
+
+        return deploy(args.peer, args.sha, dry_run=bool(getattr(args, "dry_run", False)))
+
     if action in ("add", "set"):
         name = (args.name or "").strip().lower()
         if not _PEER_NAME_RE.match(name):
@@ -338,5 +343,20 @@ def build_peer_parser(subparsers) -> None:
     dm_p.add_argument("target", help="<peer> or <peer>/<agent> (named profile on a multiplexed peer)")
     dm_p.add_argument("message", nargs="?", default=None, help="Message text (or stdin)")
     dm_p.add_argument("--json", action="store_true", default=False, help="Emit a JSON result")
+
+    dep_p = peer_sub.add_parser(
+        "deploy",
+        help="Blue-green deploy a peer agent's harness to a SHA (never self)",
+        description=(
+            "Deploy another agent's harness and verify it came back healthy, "
+            "rolling back automatically on failure or silence. Refuses to "
+            "target this machine: the safety of the scheme depends on a second "
+            "party being able to roll the first one back."
+        ),
+    )
+    dep_p.add_argument("peer", help="Registered peer name (from bot_peers)")
+    dep_p.add_argument("sha", help="Commit SHA to deploy (7-40 hex chars)")
+    dep_p.add_argument("--dry-run", action="store_true", default=False,
+                       help="Resolve, check targeting, and report without changing anything")
 
     parser.set_defaults(func=cmd_peer)
