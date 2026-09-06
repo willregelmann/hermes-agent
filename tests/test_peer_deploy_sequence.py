@@ -258,8 +258,8 @@ class TestRollbackNeverStrands:
                 return 0, "", ""
             if "rev-parse" in cmd:
                 return 0, "abc1234", ""
-            if "command -v uv" in cmd:
-                return 0, "/usr/bin/uv", ""
+            if "UV_NOT_FOUND" in cmd:
+                return 0, "UV /usr/bin/uv", ""
             if "importlib.metadata" in cmd:
                 # A real venv is never empty; an empty inventory is now
                 # correctly refused, so the fixture must be realistic.
@@ -307,14 +307,46 @@ class TestPackagesRemovedBySyncAreRestored:
     def test_uv_path_is_discovered_not_assumed(self):
         """~/.hermes/bin/uv here, ~/.local/bin/uv on the Pi."""
         def fake_run(host, cmd, timeout=120):
-            if "command -v uv" in cmd:
-                return 0, "/home/will/.hermes/bin/uv", ""
+            if "UV_NOT_FOUND" in cmd:          # the probe
+                return 0, "UV /home/will/.hermes/bin/uv", ""
             return 0, "", ""
 
         with patch.object(pd, "_run", side_effect=fake_run):
             assert pd._find_uv("h") == "/home/will/.hermes/bin/uv"
 
     def test_missing_uv_is_a_clear_error(self):
+        with patch.object(pd, "_run", return_value=(0, "UV_NOT_FOUND", "")):
+            with pytest.raises(DeployError, match="uv not found"):
+                pd._find_uv("h")
+
+    def test_uv_probe_does_not_depend_on_PATH(self):
+        """ssh gives a NON-LOGIN shell: ~/.profile is never sourced, so the
+        PATH entry that makes uv work in a terminal does not exist. The first
+        real peer deploy failed here — uv sync never ran at all.
+
+        Absolute candidates must be tried BEFORE falling back to command -v.
+        """
+        probe = {}
+
+        def fake_run(host, cmd, timeout=120):
+            probe["cmd"] = cmd
+            return 0, "UV /home/will/.hermes/bin/uv", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._find_uv("h")
+
+        c = probe["cmd"]
+        assert "$HOME/.hermes/bin/uv" in c, "must try absolute paths"
+        assert "$HOME/.local/bin/uv" in c, "must try the Pi's path too"
+        assert c.index("$HOME/.hermes/bin/uv") < c.index("command -v"), (
+            "absolute candidates must precede the PATH fallback")
+        assert "~/" not in c, (
+            "tilde may not expand inside a quoted ssh command; use $HOME")
+
+    def test_empty_output_is_not_read_as_success(self):
+        """A `for` loop that finds nothing still exits 0. Without an explicit
+        marker, 'not found' and 'found' differ only by empty stdout — the same
+        silent-falsy shape as the empty-inventory bug."""
         with patch.object(pd, "_run", return_value=(0, "", "")):
             with pytest.raises(DeployError, match="uv not found"):
                 pd._find_uv("h")
@@ -332,8 +364,8 @@ class TestPackagesRemovedBySyncAreRestored:
                 order.append("checkout")
             elif "rev-parse" in cmd:
                 return 0, "abc1234", ""
-            elif "command -v uv" in cmd:
-                return 0, "/usr/bin/uv", ""
+            elif "UV_NOT_FOUND" in cmd:
+                return 0, "UV /usr/bin/uv", ""
             elif "importlib.metadata" in cmd:
                 order.append("measure")
                 snap = after if state["synced"] else before
@@ -446,8 +478,8 @@ class TestInventoryFailureIsNotSilent:
     def _probe_fails(self, host, cmd, timeout=120):
         if "importlib.metadata" in cmd:
             return 1, "", "python3: command not found"
-        if "command -v uv" in cmd:
-            return 0, "/usr/bin/uv", ""
+        if "UV_NOT_FOUND" in cmd:
+            return 0, "UV /usr/bin/uv", ""
         if "rev-parse" in cmd:
             return 0, "abc1234", ""
         return 0, "", ""

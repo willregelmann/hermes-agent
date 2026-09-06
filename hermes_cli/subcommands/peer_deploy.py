@@ -251,22 +251,45 @@ def _snapshot(host: str, sha: str) -> str:
 
 
 def _find_uv(host: str) -> str:
-    """Locate uv on the TARGET. Paths differ per host and a wrong guess is a
-    deploy that fails at the dependency step (measured: ~/.hermes/bin/uv on the
-    workstation, ~/.local/bin/uv on the Pi)."""
+    """Locate uv on the TARGET.
+
+    Paths differ per host (~/.hermes/bin/uv on the workstation,
+    ~/.local/bin/uv on the Pi) so this cannot be hardcoded.
+
+    IT ALSO CANNOT RELY ON $PATH. `_run` invokes ssh with a command, which
+    gives a NON-INTERACTIVE, NON-LOGIN shell: ~/.bashrc returns early and
+    ~/.profile is never sourced, so the PATH entry that makes `uv` work in a
+    terminal does not exist here. Measured 2026-09-06 — the first real peer
+    deploy failed at exactly this point and `uv sync` never executed.
+
+    So the absolute-path candidates are authoritative and `command -v` is only
+    a fallback. Each is built from "$HOME" rather than a tilde, because tilde
+    expansion inside a quoted ssh command is a second thing that can silently
+    not happen.
+
+    The probe prints a definitive marker. A `for` loop that finds nothing still
+    exits 0, so "not found" and "found" would otherwise differ only by empty
+    stdout — the same silent-falsy shape as the empty-inventory bug.
+    """
     probe = (
-        "command -v uv 2>/dev/null || "
-        "for p in ~/.hermes/bin/uv ~/.local/bin/uv /usr/local/bin/uv /usr/bin/uv; "
-        "do [ -x \"$p\" ] && echo \"$p\" && break; done"
+        'for p in "$HOME/.hermes/bin/uv" "$HOME/.local/bin/uv" '
+        '"/usr/local/bin/uv" "/usr/bin/uv"; do '
+        'if [ -x "$p" ]; then echo "UV $p"; exit 0; fi; done; '
+        'w=$(command -v uv 2>/dev/null); '
+        'if [ -n "$w" ]; then echo "UV $w"; exit 0; fi; '
+        'echo "UV_NOT_FOUND"'
     )
-    rc, out, _ = _run(host, probe)
-    path = (out or "").strip().splitlines()
-    if not path or not path[-1].strip():
-        raise DeployError(
-            f"uv not found on {host}. Looked on PATH and in ~/.hermes/bin, "
-            "~/.local/bin, /usr/local/bin, /usr/bin."
-        )
-    return path[-1].strip()
+    rc, out, err = _run(host, probe)
+    for line in (out or "").splitlines():
+        if line.startswith("UV "):
+            return line[3:].strip()
+    raise DeployError(
+        f"uv not found on {host} (rc={rc}, out={out[:120]!r}, err={err[:120]!r}). "
+        "Looked at $HOME/.hermes/bin/uv, $HOME/.local/bin/uv, /usr/local/bin/uv, "
+        "/usr/bin/uv, then $PATH. Note ssh gives a NON-LOGIN shell, so a uv that "
+        "works in an interactive terminal may not be on PATH here — install it "
+        "at one of those paths or add a symlink."
+    )
 
 
 def _installed_packages(host: str) -> dict:
