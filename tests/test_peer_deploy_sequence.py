@@ -322,8 +322,8 @@ class TestPackagesRemovedBySyncAreRestored:
     def test_packages_dropped_by_sync_are_reinstalled_at_pinned_versions(self):
         order = []
         before = {"numpy": "2.4.6", "google-cloud-pubsub": "2.39.0",
-                  "requests": "2.32.0"}
-        after = {"requests": "2.32.0"}          # sync dropped the other two
+                  "requests": "2.32.0", "pip": "25.0"}
+        after = {"requests": "2.32.0", "pip": "25.0"}   # sync dropped two
         state = {"synced": False}
 
         def fake_run(host, cmd, timeout=120):
@@ -355,7 +355,8 @@ class TestPackagesRemovedBySyncAreRestored:
         assert order.index("restore") > order.index("sync")
 
     def test_nothing_removed_means_no_reinstall(self):
-        same = {"numpy": "2.4.6"}
+        # Essentials must be present or the essentials check fires (correctly).
+        same = {"numpy": "2.4.6", "pip": "25.0"}
         with patch.object(pd, "_run") as run:
             pd._restore_removed("h", same, same, "/usr/bin/uv")
             run.assert_not_called()
@@ -363,7 +364,9 @@ class TestPackagesRemovedBySyncAreRestored:
     def test_upgraded_package_is_not_downgraded(self):
         """Only DISAPPEARANCES are repaired; a version bump is left alone."""
         with patch.object(pd, "_run") as run:
-            pd._restore_removed("h", {"numpy": "2.4.6"}, {"numpy": "2.5.0"},
+            pd._restore_removed("h",
+                                {"numpy": "2.4.6", "pip": "25.0"},
+                                {"numpy": "2.5.0", "pip": "25.0"},
                                 "/usr/bin/uv")
             run.assert_not_called()
 
@@ -375,7 +378,8 @@ class TestPackagesRemovedBySyncAreRestored:
 
         with patch.object(pd, "_run", side_effect=fake_run):
             with pytest.raises(DeployError, match="uv sync removed"):
-                pd._restore_removed("h", {"numpy": "2.4.6"}, {}, "/usr/bin/uv")
+                pd._restore_removed("h", {"numpy": "2.4.6", "pip": "25.0"},
+                                    {"pip": "25.0"}, "/usr/bin/uv")
 
 
 class TestUniversalHealthChecks:
@@ -485,3 +489,72 @@ class TestInventoryFailureIsNotSilent:
         but it must still reach the restart."""
         with patch.object(pd, "_run", side_effect=self._probe_fails):
             pd._checkout_and_sync("h", "abc1234", best_effort_sync=True)
+
+
+class TestTimeoutsAndPriorCasualties:
+    """Both findings from Wren's second review."""
+
+    def test_identity_timeout_exceeds_observed_reply_times(self):
+        """Her last eight real replies included one at 126.5s. The DM runs a
+        full agent turn on a just-restarted gateway with cold caches — the slow
+        case. A tight budget rolls back a GOOD deploy because the peer was
+        thinking."""
+        assert pd.IDENTITY_TIMEOUT_S >= 300, (
+            "identity budget must clear observed reply times with headroom")
+
+    def test_health_timeout_stays_tight(self):
+        """Deliberately asymmetric: there the healthy path is ~1.5s, so slow
+        really does mean broken."""
+        assert pd.HEALTH_TIMEOUT_S <= 120
+
+    def test_timeouts_are_env_overridable(self, monkeypatch):
+        """Tuning a deploy timeout must not itself require a deploy."""
+        import importlib
+        monkeypatch.setenv("HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT", "42")
+        reloaded = importlib.reload(pd)
+        try:
+            assert reloaded.IDENTITY_TIMEOUT_S == 42
+        finally:
+            monkeypatch.delenv("HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT")
+            importlib.reload(pd)
+
+    def test_package_missing_from_both_snapshots_is_still_restored(self):
+        """pip was destroyed by an EARLIER sync, so it appears in neither
+        before nor after and the diff can never see it. Essentials are checked
+        for presence, not for change."""
+        captured = {}
+
+        def fake_run(host, cmd, timeout=120):
+            if "pip install" in cmd:
+                captured["cmd"] = cmd
+            return 0, "", ""
+
+        before = {"numpy": "2.4.6"}
+        after = {"numpy": "2.4.6"}          # nothing changed this run
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._restore_removed("h", before, after, "/usr/bin/uv")
+
+        assert "cmd" in captured, "prior casualty was never repaired"
+        assert "pip" in captured["cmd"]
+
+    def test_essential_present_means_no_action(self):
+        before = {"numpy": "2.4.6", "pip": "25.0"}
+        after = {"numpy": "2.4.6", "pip": "25.0"}
+        with patch.object(pd, "_run") as run:
+            pd._restore_removed("h", before, after, "/usr/bin/uv")
+            run.assert_not_called()
+
+    def test_prior_casualty_is_installed_unpinned(self):
+        """There is no known-good version to hold it to — before never had it."""
+        captured = {}
+
+        def fake_run(host, cmd, timeout=120):
+            if "pip install" in cmd:
+                captured["cmd"] = cmd
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._restore_removed("h", {"numpy": "2.4.6"}, {"numpy": "2.4.6"},
+                                "/usr/bin/uv")
+
+        assert "pip==" not in captured["cmd"], "cannot pin a version we never saw"

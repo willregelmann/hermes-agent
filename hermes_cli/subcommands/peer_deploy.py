@@ -83,11 +83,28 @@ FETCH_TIMEOUT_S = 600
 
 # Health: measured healthy path is ~1.5s (gateway "Starting" to both platforms
 # connected). 90s is 60x headroom; anything slower is a real fault, not slowness.
-HEALTH_TIMEOUT_S = 90
+HEALTH_TIMEOUT_S = int(os.environ.get("HERMES_PEER_DEPLOY_HEALTH_TIMEOUT", "90"))
 HEALTH_POLL_S = 2
 
-# The DM round-trip runs a full agent turn. Observed real responses: 36-127s.
-IDENTITY_TIMEOUT_S = 120
+# The DM round-trip runs a FULL AGENT TURN on a just-restarted gateway with
+# cold caches — the slow case, not the median. Wren's last eight real replies:
+# 91.6, 58.6, 94.9, 126.5, 36.0, 14.1, 101.6, 8.7s. One already exceeds 120s,
+# which was the original budget here.
+#
+# The asymmetry with HEALTH_TIMEOUT_S is deliberate. There, the healthy path is
+# ~1.5s and slow genuinely means broken. Here, slow is normal: a tight budget
+# rolls back a perfectly good deploy because the peer was thinking, which costs
+# a second restart and looks like a failure that never happened.
+IDENTITY_TIMEOUT_S = int(
+    os.environ.get("HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT", "300"))
+
+# Packages an agent cannot function without, restored on PRESENCE rather than
+# on change. The before/after diff only catches what THIS deploy removed; a
+# casualty of an EARLIER deploy is absent from both snapshots and would never
+# be repaired. pip was found in exactly that state — removed by an earlier
+# sync, and therefore invisible to the mechanism written to prevent the
+# problem. Keep this list short: it is a floor, not a dependency manifest.
+ESSENTIAL_PACKAGES = ("pip",)
 
 # Log lines that mean "came up, then failed downstream". These are the signal
 # that self-reported state cannot give us: on 2026-09-05 Wren's gateway was
@@ -338,12 +355,31 @@ def _restore_removed(host: str, before: dict, after: dict, uv: str) -> None:
     This is a restoration, not an upgrade: a deploy is the wrong moment to also
     move a dependency. Packages the sync UPGRADED are left alone — only ones
     that disappeared entirely are put back.
+
+    ESSENTIALS are handled separately. `_restore_removed` only knows about
+    packages present in `before`, so anything a PREVIOUS deploy already
+    destroyed stays destroyed — it is missing from both snapshots and never
+    appears in the diff. Wren found pip in exactly that state on this host: a
+    casualty of an earlier sync that nothing would ever restore. A short list
+    of packages an agent cannot function without is therefore checked for
+    presence, not just for change.
     """
     lost = {n: v for n, v in before.items() if n not in after}
+
+    # Repair prior casualties too, not only ones this run caused.
+    lower = {n.lower() for n in after}
+    for name in ESSENTIAL_PACKAGES:
+        if name.lower() not in lower and name not in lost:
+            lost[name] = None          # unpinned: no known-good version to hold
+            _log(f"NOTE: {name} was already missing before this deploy "
+                 "(earlier casualty); restoring it as well")
+
     if not lost:
         return
     # pip is itself frequently a casualty, so install via uv, not pip.
-    specs = " ".join(shlex.quote(f"{n}=={v}") for n, v in sorted(lost.items()))
+    specs = " ".join(
+        shlex.quote(f"{n}=={v}" if v else n) for n, v in sorted(lost.items())
+    )
     cmd = f"cd {REPO} && {uv} pip install --python ./venv/bin/python {specs}"
     rc, _, err = _run(host, cmd, timeout=900)
     if rc != 0:
