@@ -261,7 +261,9 @@ class TestRollbackNeverStrands:
             if "command -v uv" in cmd:
                 return 0, "/usr/bin/uv", ""
             if "importlib.metadata" in cmd:
-                return 0, "JSON {}", ""
+                # A real venv is never empty; an empty inventory is now
+                # correctly refused, so the fixture must be realistic.
+                return 0, 'JSON {"numpy": "2.4.6"}', ""
             if "uv sync" in cmd and fail_sync:
                 return 1, "", "No `pyproject.toml` found"
             return 0, "", ""
@@ -422,3 +424,64 @@ class TestUniversalHealthChecks:
         names = [n for n, _ in pd.UNIVERSAL_CHECKS]
         assert "memory provider deps" in names
         assert "chat transport" in names
+
+
+class TestInventoryFailureIsNotSilent:
+    """Wren caught this in review, before it ran on a live host.
+
+    _installed_packages() originally returned {} when its probe failed. Then
+    `before` and `after` are both empty, their difference is empty, and
+    _restore_removed() does nothing — and reports success. The guard against
+    silent breakage would itself have failed silently, which is the exact bug
+    class it exists to prevent.
+
+    Her sharper point was about the rollback path: there the peer would be told
+    it had recovered while missing the transport it would use to say otherwise.
+    """
+
+    def _probe_fails(self, host, cmd, timeout=120):
+        if "importlib.metadata" in cmd:
+            return 1, "", "python3: command not found"
+        if "command -v uv" in cmd:
+            return 0, "/usr/bin/uv", ""
+        if "rev-parse" in cmd:
+            return 0, "abc1234", ""
+        return 0, "", ""
+
+    def test_unreadable_inventory_raises_rather_than_returning_empty(self):
+        with patch.object(pd, "_run", side_effect=self._probe_fails):
+            with pytest.raises(DeployError, match="could not read the installed"):
+                pd._installed_packages("h")
+
+    def test_empty_inventory_is_refused(self):
+        """A working venv always has packages. Zero means the probe lied."""
+        def fake_run(host, cmd, timeout=120):
+            if "importlib.metadata" in cmd:
+                return 0, "JSON {}", ""
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="ZERO installed packages"):
+                pd._installed_packages("h")
+
+    def test_malformed_inventory_is_refused(self):
+        def fake_run(host, cmd, timeout=120):
+            if "importlib.metadata" in cmd:
+                return 0, "JSON {not json", ""
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="could not parse"):
+                pd._installed_packages("h")
+
+    def test_deploy_aborts_when_inventory_unreadable(self):
+        """Refuse the deploy rather than run an unprotected sync."""
+        with patch.object(pd, "_run", side_effect=self._probe_fails):
+            with pytest.raises(DeployError, match="could not read the installed"):
+                pd._checkout_and_sync("h", "abc1234")
+
+    def test_rollback_degrades_instead_of_aborting(self):
+        """Getting the peer running again outranks perfect dependencies —
+        but it must still reach the restart."""
+        with patch.object(pd, "_run", side_effect=self._probe_fails):
+            pd._checkout_and_sync("h", "abc1234", best_effort_sync=True)

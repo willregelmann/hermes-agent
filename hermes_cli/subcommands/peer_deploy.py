@@ -300,10 +300,36 @@ def _installed_packages(host: str) -> dict:
     for line in (out or "").splitlines():
         if line.startswith("JSON "):
             try:
-                return json.loads(line[5:])
-            except ValueError:
-                break
-    return {}
+                pkgs = json.loads(line[5:])
+            except ValueError as exc:
+                raise DeployError(
+                    f"could not parse the installed package set from {host}: "
+                    f"{exc}. Refusing to continue — an unreadable inventory "
+                    "makes the post-sync restore a silent no-op."
+                )
+            if not pkgs:
+                raise DeployError(
+                    f"{host} reported ZERO installed packages, which cannot be "
+                    "true of a working venv. Refusing to continue: an empty "
+                    "inventory would make the restore step do nothing and "
+                    "report success."
+                )
+            return pkgs
+
+    # NEVER return {} ON FAILURE.
+    # Wren caught this before it shipped: if this probe fails and returns an
+    # empty dict, `before` and `after` are both empty, their difference is
+    # empty, and _restore_removed() does nothing and reports success. The
+    # guard against silent breakage would itself have failed silently — the
+    # exact bug class it exists to prevent. On the rollback path the
+    # consequence is worse: the peer is told it recovered while missing the
+    # transport it would use to say otherwise.
+    raise DeployError(
+        f"could not read the installed package set from {host} (rc={rc}): "
+        f"{(out or '')[:200]!r}. Refusing to continue — without a package "
+        "inventory the post-sync restore cannot detect what was removed, and "
+        "would silently do nothing."
+    )
 
 
 def _restore_removed(host: str, before: dict, after: dict, uv: str) -> None:
@@ -351,7 +377,21 @@ def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -
     # MEASURE BEFORE THE SYNC DESTROYS IT. We do not try to predict which
     # packages the sync will drop — that guess was wrong once already. We
     # record the full installed set and diff it afterwards.
-    before = _installed_packages(host)
+    #
+    # On DEPLOY this raises if the inventory cannot be read: better to refuse
+    # than to run a restore that silently protects nothing.
+    # On ROLLBACK it must not abort — the peer is already in a bad state and
+    # getting it running again outranks getting its dependencies perfect. The
+    # degradation is logged as a WARNING, never swallowed.
+    try:
+        before = _installed_packages(host)
+    except DeployError as exc:
+        if not best_effort_sync:
+            raise
+        _log(f"WARNING: package inventory unreadable during rollback ({exc}); "
+             "continuing without restore protection — dependencies may be "
+             "missing after this rollback and will need manual repair.")
+        before = None
 
     sync = (
         f"cd {REPO} && "
@@ -378,8 +418,16 @@ def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -
     # Put back whatever the sync deleted. This runs on BOTH the deploy and
     # rollback paths — a rollback that leaves the peer without its chat
     # transport is not a recovery.
-    after = _installed_packages(host)
-    _restore_removed(host, before, after, uv)
+    if before is not None:
+        try:
+            after = _installed_packages(host)
+        except DeployError as exc:
+            if not best_effort_sync:
+                raise
+            _log(f"WARNING: post-sync inventory unreadable during rollback "
+                 f"({exc}); cannot verify dependencies survived.")
+        else:
+            _restore_removed(host, before, after, uv)
 
 
 def _restart(host: str, scope: str) -> float:
