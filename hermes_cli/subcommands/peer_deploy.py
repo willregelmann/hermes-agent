@@ -233,6 +233,178 @@ def _snapshot(host: str, sha: str) -> str:
     return dest
 
 
+# Bridge patch, extracted verbatim from 9b654f01 with `git show`.
+# Nothing hand-edited. Uses only json / shlex / os, all already imported.
+
+ESSENTIAL_PACKAGES = ("pip",)
+
+
+def _find_uv(host: str) -> str:
+    """Locate uv on the TARGET.
+
+    Paths differ per host (~/.hermes/bin/uv on the workstation,
+    ~/.local/bin/uv on the Pi) so this cannot be hardcoded.
+
+    IT ALSO CANNOT RELY ON $PATH. `_run` invokes ssh with a command, which
+    gives a NON-INTERACTIVE, NON-LOGIN shell: ~/.bashrc returns early and
+    ~/.profile is never sourced, so the PATH entry that makes `uv` work in a
+    terminal does not exist here. Measured 2026-09-06 — the first real peer
+    deploy failed at exactly this point and `uv sync` never executed.
+
+    So the absolute-path candidates are authoritative and `command -v` is only
+    a fallback. Each is built from "$HOME" rather than a tilde, because tilde
+    expansion inside a quoted ssh command is a second thing that can silently
+    not happen.
+
+    The probe prints a definitive marker. A `for` loop that finds nothing still
+    exits 0, so "not found" and "found" would otherwise differ only by empty
+    stdout — the same silent-falsy shape as the empty-inventory bug.
+    """
+    probe = (
+        'for p in "$HOME/.hermes/bin/uv" "$HOME/.local/bin/uv" '
+        '"/usr/local/bin/uv" "/usr/bin/uv"; do '
+        'if [ -x "$p" ]; then echo "UV $p"; exit 0; fi; done; '
+        'w=$(command -v uv 2>/dev/null); '
+        'if [ -n "$w" ]; then echo "UV $w"; exit 0; fi; '
+        'echo "UV_NOT_FOUND"'
+    )
+    rc, out, err = _run(host, probe)
+    for line in (out or "").splitlines():
+        if line.startswith("UV "):
+            return line[3:].strip()
+    raise DeployError(
+        f"uv not found on {host} (rc={rc}, out={out[:120]!r}, err={err[:120]!r}). "
+        "Looked at $HOME/.hermes/bin/uv, $HOME/.local/bin/uv, /usr/local/bin/uv, "
+        "/usr/bin/uv, then $PATH. Note ssh gives a NON-LOGIN shell, so a uv that "
+        "works in an interactive terminal may not be on PATH here — install it "
+        "at one of those paths or add a symlink."
+    )
+
+
+def _installed_packages(host: str) -> dict:
+    """Every distribution installed in the target venv, name -> version.
+
+    THIS IS THE MOST IMPORTANT FUNCTION IN THE FILE.
+
+    `uv sync --extra all --locked` rebuilds the environment and REMOVES
+    anything it does not consider part of the synced set. Measured on
+    2026-09-06, both agents:
+
+      numpy, onnxruntime, tokenizers  -> semantic memory provider went dead
+      google-cloud-pubsub             -> Google Chat inbound went dead
+      pip, pytest                     -> removed too, so the obvious repair
+                                         command no longer existed
+
+    Nothing failed. `uv sync` returned 0, the gateway started, every health
+    gate passed, and the only evidence was one WARNING in a startup log. One
+    agent could not be reached at all afterwards and could not report it,
+    because the transport was the thing that had been removed.
+
+    NOTE ON A WRONG FIRST ATTEMPT: this originally diffed the venv against
+    uv.lock, on the assumption that "removed by sync" meant "absent from the
+    lockfile". Running it against the real venv disproved that — 4 of the 5
+    casualties (numpy, onnxruntime, tokenizers, pytest) ARE named in uv.lock
+    and were still removed, because being in the lock file is not the same as
+    being in the synced extra set. Only google-cloud-pubsub was genuinely
+    absent. Predicting what the sync will delete is guesswork; MEASURING what
+    it deleted is not. So we snapshot the installed set before and after, and
+    restore the difference.
+    """
+    script = (
+        "python3 - <<'PY'\n"
+        "import json, os, subprocess\n"
+        "py = os.path.join(os.path.expanduser(%r), 'venv', 'bin', 'python')\n"
+        "code = ('import json,importlib.metadata as m;'\n"
+        "        'print(json.dumps({d.metadata[\"Name\"]: d.version '\n"
+        "        'for d in m.distributions() if d.metadata.get(\"Name\")}))')\n"
+        "try:\n"
+        "    out = subprocess.run([py, '-c', code], capture_output=True,\n"
+        "                         text=True, timeout=120).stdout\n"
+        "    print('JSON ' + json.dumps(json.loads(out)))\n"
+        "except Exception as e:\n"
+        "    print('ERR', type(e).__name__)\n"
+        "PY"
+    ) % REPO
+    rc, out, _ = _run(host, script, timeout=180)
+    for line in (out or "").splitlines():
+        if line.startswith("JSON "):
+            try:
+                pkgs = json.loads(line[5:])
+            except ValueError as exc:
+                raise DeployError(
+                    f"could not parse the installed package set from {host}: "
+                    f"{exc}. Refusing to continue — an unreadable inventory "
+                    "makes the post-sync restore a silent no-op."
+                )
+            if not pkgs:
+                raise DeployError(
+                    f"{host} reported ZERO installed packages, which cannot be "
+                    "true of a working venv. Refusing to continue: an empty "
+                    "inventory would make the restore step do nothing and "
+                    "report success."
+                )
+            return pkgs
+
+    # NEVER return {} ON FAILURE.
+    # Wren caught this before it shipped: if this probe fails and returns an
+    # empty dict, `before` and `after` are both empty, their difference is
+    # empty, and _restore_removed() does nothing and reports success. The
+    # guard against silent breakage would itself have failed silently — the
+    # exact bug class it exists to prevent. On the rollback path the
+    # consequence is worse: the peer is told it recovered while missing the
+    # transport it would use to say otherwise.
+    raise DeployError(
+        f"could not read the installed package set from {host} (rc={rc}): "
+        f"{(out or '')[:200]!r}. Refusing to continue — without a package "
+        "inventory the post-sync restore cannot detect what was removed, and "
+        "would silently do nothing."
+    )
+
+
+def _restore_removed(host: str, before: dict, after: dict, uv: str) -> None:
+    """Re-install what the sync deleted, pinned to the pre-sync versions.
+
+    This is a restoration, not an upgrade: a deploy is the wrong moment to also
+    move a dependency. Packages the sync UPGRADED are left alone — only ones
+    that disappeared entirely are put back.
+
+    ESSENTIALS are handled separately. `_restore_removed` only knows about
+    packages present in `before`, so anything a PREVIOUS deploy already
+    destroyed stays destroyed — it is missing from both snapshots and never
+    appears in the diff. Wren found pip in exactly that state on this host: a
+    casualty of an earlier sync that nothing would ever restore. A short list
+    of packages an agent cannot function without is therefore checked for
+    presence, not just for change.
+    """
+    lost = {n: v for n, v in before.items() if n not in after}
+
+    # Repair prior casualties too, not only ones this run caused.
+    lower = {n.lower() for n in after}
+    for name in ESSENTIAL_PACKAGES:
+        if name.lower() not in lower and name not in lost:
+            lost[name] = None          # unpinned: no known-good version to hold
+            _log(f"NOTE: {name} was already missing before this deploy "
+                 "(earlier casualty); restoring it as well")
+
+    if not lost:
+        return
+    # pip is itself frequently a casualty, so install via uv, not pip.
+    specs = " ".join(
+        shlex.quote(f"{n}=={v}" if v else n) for n, v in sorted(lost.items())
+    )
+    cmd = f"cd {REPO} && {uv} pip install --python ./venv/bin/python {specs}"
+    rc, _, err = _run(host, cmd, timeout=900)
+    if rc != 0:
+        raise DeployError(
+            f"failed to restore {len(lost)} package(s) that uv sync removed "
+            f"from {host}: {err[-300:]}. The peer is running but is missing "
+            "dependencies it had before the deploy (possibly its memory "
+            "provider or chat transport)."
+        )
+    _log(f"restored {len(lost)} package(s) removed by sync: "
+         f"{', '.join(sorted(lost)[:6])}{'...' if len(lost) > 6 else ''}")
+
+
 def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -> None:
     rc, out, err = _run(host, f"git -C {REPO} checkout --quiet {shlex.quote(sha)}", timeout=180)
     if rc != 0:
@@ -244,9 +416,17 @@ def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -
 
     # Dependencies BEFORE lifecycle. A restart onto a half-synced venv is the
     # bricking case with a green log.
+    # uv is NOT at a fixed path (~/.hermes/bin/uv on the workstation,
+    # ~/.local/bin/uv on the Pi) and ssh gives a non-login shell with no
+    # PATH, so resolve it on the target rather than hardcoding either.
+    uv = _find_uv(host)
+
+    # MEASURE BEFORE THE SYNC DESTROYS IT.
+    before = _installed_packages(host)
+
     sync = (
         f"cd {REPO} && "
-        f"UV_PROJECT_ENVIRONMENT=\"$PWD/venv\" ~/.local/bin/uv sync --extra all --locked"
+        f"UV_PROJECT_ENVIRONMENT=\"$PWD/venv\" {uv} sync --extra all --locked"
     )
     rc, _, err = _run(host, sync, timeout=900)
     if rc != 0:
@@ -265,6 +445,11 @@ def _checkout_and_sync(host: str, sha: str, *, best_effort_sync: bool = False) -
             raise DeployError(f"uv sync failed on {host}: {err[-400:]}")
     else:
         _log("dependencies synced")
+
+    # Put back whatever the sync deleted. Runs on BOTH paths — a rollback
+    # that leaves the peer without its chat transport is not a recovery.
+    after = _installed_packages(host)
+    _restore_removed(host, before, after, uv)
 
 
 def _restart(host: str, scope: str) -> float:
