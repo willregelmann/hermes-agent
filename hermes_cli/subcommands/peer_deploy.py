@@ -624,20 +624,75 @@ def _await_health(
     )
 
 
-def _verify_identity(peer: str, expect_sha: str) -> None:
-    """The peer must report its OWN HEAD. A reply proves it thinks; only the
-    SHA proves the upgrade landed.
+def _process_identity(host: str, scope: str) -> tuple:
+    """(MainPID, start-time-epoch) of the gateway, read over ssh BY US.
 
-    Deliberately over `hermes peer dm`, not ssh: ssh proves sshd is up, not
-    that the agent loop reaches a model and comes back.
+    Deliberately not asked of the agent. A peer reporting its own pid is still
+    a self-report, and the entire lesson of this file is that self-reports
+    confirm confident lies. We read it from systemd on the target ourselves, so
+    the peer cannot influence the answer.
     """
-    # Escape hatch for the scratch target ONLY: a disposable systemd unit is
-    # not an agent and cannot answer a DM. Never set this against a real peer —
-    # skipping it means the deploy is verified by ssh-observable state alone,
-    # which cannot prove the agent loop actually came back.
+    cmd = (
+        f"systemctl {'--user ' if scope == 'user' else ''}show {UNIT} "
+        "-p MainPID -p ActiveEnterTimestampMonotonic --value"
+    )
+    rc, out, err = _run(host, cmd)
+    vals = [v.strip() for v in (out or "").splitlines() if v.strip()]
+    if rc != 0 or len(vals) < 2:
+        raise DeployError(
+            f"cannot read gateway process identity on {host} "
+            f"(rc={rc}, out={out[:120]!r}, err={err[:120]!r})"
+        )
+    try:
+        return int(vals[0]), int(vals[1])
+    except ValueError:
+        raise DeployError(
+            f"unexpected process identity from {host}: {vals[:2]!r}")
+
+
+def _verify_identity(peer: str, expect_sha: str, host: str, scope: str,
+                     before_pid: int, before_start: int) -> None:
+    """Prove the NEW code is RUNNING, in two independent ways.
+
+    1. PROCESS (ssh-observed, not self-reported): the gateway's MainPID must
+       have changed and its start time must be later than before. This is the
+       gate Wren identified as missing. The original check asked the peer for
+       `git rev-parse --short HEAD`, which reads the DISK — it proves files
+       moved and the peer is alive enough to read them, NOT that the new code
+       is running. A successful checkout followed by a silently-failed restart
+       would answer with the new SHA from a process still executing the old
+       one, and every gate here would pass.
+
+       Same true-fact-about-the-wrong-thing shape as the stale
+       gateway_state.json and the empty-inventory no-op. Third instance.
+
+    2. AGENT LOOP (the DM): the peer must answer at all, with the right SHA.
+       ssh proves sshd is up; only this proves the agent reaches a model and
+       comes back. Both are required — a restarted process that cannot think
+       is not a successful deploy, and a thinking agent on old code is not one
+       either.
+    """
+    after_pid, after_start = _process_identity(host, scope)
+    if after_pid == before_pid:
+        raise DeployError(
+            f"{host} gateway MainPID is unchanged ({after_pid}) — the process "
+            "never restarted, so it is still running the OLD code no matter "
+            "what the files say."
+        )
+    if after_start <= before_start:
+        raise DeployError(
+            f"{host} gateway start time did not advance "
+            f"({after_start} <= {before_start}) — no new process."
+        )
+    _log(f"process restarted: pid {before_pid} -> {after_pid}")
+
     if os.environ.get("HERMES_PEER_DEPLOY_SKIP_IDENTITY") == "1":
-        _log("SKIPPING round-trip identity check (scratch target)")
+        _log("SKIPPING agent round-trip (scratch target has no agent loop)")
         return
+
+    # WHY THE DM STILL ASKS FOR THE SHA.
+    # The process check above proves a NEW process exists; the SHA proves it is
+    # running the code we asked for. Neither implies the other.
     prompt = (
         "Deploy verification. Reply with ONLY the output of: "
         "git -C ~/.hermes/hermes-agent rev-parse --short HEAD"
@@ -667,7 +722,7 @@ def _verify_identity(peer: str, expect_sha: str) -> None:
 # must answer.
 EXTERNAL_CHECKS = {
     "wren": (
-        "curl -sf -o /dev/null -m 10 -H \"Authorization: Bearer $(cat ~/.hermes/ha-token)\" "
+        "curl -sf -o /dev/null -m 10 -H \"Authorization: Bearer *** ~/.hermes/ha-token)\" "
         "http://127.0.0.1:8123/api/states/switch.entryway_lights",
     ),
 }
@@ -696,6 +751,12 @@ def _deploy_once(peer: str, host: str, sha: str, scope: str,
                  *, allow_unresolved: bool, skip_fetch: bool = False) -> None:
     """One checkout->sync->restart->verify pass. Raises DeployError on any gate."""
     _preflight(host, sha, allow_unresolved=allow_unresolved, skip_fetch=skip_fetch)
+
+    # Capture the process identity BEFORE the restart. Comparing against this
+    # is what proves a NEW process exists — reading it afterwards alone would
+    # prove only that some gateway is running, which was already true.
+    before_pid, before_start = _process_identity(host, scope)
+
     # skip_fetch is only ever set on the rollback path, so it doubles as the
     # signal that a dependency sync failure must not abort.
     _checkout_and_sync(host, sha, best_effort_sync=skip_fetch)
@@ -703,7 +764,7 @@ def _deploy_once(peer: str, host: str, sha: str, scope: str,
     checks = tuple(c.format(repo=REPO) for _, c in UNIVERSAL_CHECKS)
     checks += EXTERNAL_CHECKS.get(peer, ())
     _await_health(host, scope, issued, checks)
-    _verify_identity(peer, sha)
+    _verify_identity(peer, sha, host, scope, before_pid, before_start)
 
 
 def deploy(peer: str, new_sha: str, *, dry_run: bool = False) -> int:

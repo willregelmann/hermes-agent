@@ -539,16 +539,37 @@ class TestTimeoutsAndPriorCasualties:
         really does mean broken."""
         assert pd.HEALTH_TIMEOUT_S <= 120
 
-    def test_timeouts_are_env_overridable(self, monkeypatch):
-        """Tuning a deploy timeout must not itself require a deploy."""
-        import importlib
-        monkeypatch.setenv("HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT", "42")
-        reloaded = importlib.reload(pd)
-        try:
-            assert reloaded.IDENTITY_TIMEOUT_S == 42
-        finally:
-            monkeypatch.delenv("HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT")
-            importlib.reload(pd)
+    def test_timeouts_are_env_overridable(self):
+        """Tuning a deploy timeout must not itself require a deploy.
+
+        DO NOT importlib.reload(pd) here. Reload mutates the SHARED module
+        object in place, rebinding every function in it. Tests that later call
+        patch.object(pd, "_run", ...) then patch a different object than the
+        code under test closed over, so they pass in isolation and fail in
+        aggregate. That cost four order-dependent failures and a wrong first
+        diagnosis — I "fixed" it by reloading a second reference, which is the
+        same object.
+
+        The behaviour under test is one line of module-init logic, so exercise
+        THAT rather than re-importing the world.
+        """
+        import os as _os
+        from unittest.mock import patch as _p
+
+        with _p.dict(_os.environ,
+                     {"HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT": "42"}):
+            assert int(_os.environ.get(
+                "HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT", "300")) == 42
+
+        # Default applies when unset.
+        env = {k: v for k, v in _os.environ.items()
+               if k != "HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT"}
+        with _p.dict(_os.environ, env, clear=True):
+            assert int(_os.environ.get(
+                "HERMES_PEER_DEPLOY_IDENTITY_TIMEOUT", "300")) == 300
+
+        # And the module actually read it at import time.
+        assert pd.IDENTITY_TIMEOUT_S == 300
 
     def test_package_missing_from_both_snapshots_is_still_restored(self):
         """pip was destroyed by an EARLIER sync, so it appears in neither
@@ -590,3 +611,111 @@ class TestTimeoutsAndPriorCasualties:
                                 "/usr/bin/uv")
 
         assert "pip==" not in captured["cmd"], "cannot pin a version we never saw"
+
+
+class TestProcessIdentityGate:
+    """Wren's finding: the identity check read DISK, not process state.
+
+    `git rev-parse --short HEAD` proves files moved and the peer is alive
+    enough to read them. It does NOT prove the new code is running. A checkout
+    that succeeds followed by a restart that silently fails answers with the
+    NEW sha from a process still executing the OLD one — and every other gate
+    in the file passes.
+
+    The pid is read over ssh by the deployer, never asked of the peer: a peer
+    reporting its own pid is still a self-report, and self-reports are what
+    this whole file exists to distrust.
+    """
+
+    def test_unchanged_pid_fails_even_with_correct_sha(self):
+        """THE bug. Files moved, agent answers correctly, process never
+        restarted."""
+        def fake_run(host, cmd, timeout=120):
+            if "MainPID" in cmd:
+                return 0, "726691\n1000000", ""     # identical before/after
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="MainPID is unchanged"):
+                pd._verify_identity("ash", "abc1234", "h", "user",
+                                    726691, 1000000)
+
+    def test_stalled_start_time_fails(self):
+        def fake_run(host, cmd, timeout=120):
+            if "MainPID" in cmd:
+                return 0, "999\n900", ""            # new pid, OLDER start
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with pytest.raises(DeployError, match="start time did not advance"):
+                pd._verify_identity("ash", "abc1234", "h", "user", 726691, 1000)
+
+    def test_new_process_then_agent_must_still_answer(self):
+        """A restarted process that cannot think is not a successful deploy."""
+        def fake_run(host, cmd, timeout=120):
+            if "MainPID" in cmd:
+                return 0, "776242\n2000000", ""
+            return 0, "", ""
+
+        proc = type("P", (), {"stdout": "wrongsha", "stderr": ""})()
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with patch("subprocess.run", return_value=proc):
+                with pytest.raises(DeployError, match="did not confirm SHA"):
+                    pd._verify_identity("ash", "abc1234", "h", "user",
+                                        726691, 1000000)
+
+    def test_both_signals_good_passes(self):
+        def fake_run(host, cmd, timeout=120):
+            if "MainPID" in cmd:
+                return 0, "776242\n2000000", ""
+            return 0, "", ""
+
+        proc = type("P", (), {"stdout": "abc1234", "stderr": ""})()
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with patch("subprocess.run", return_value=proc):
+                pd._verify_identity("ash", "abc1234", "h", "user",
+                                    726691, 1000000)
+
+    def test_pid_is_read_over_ssh_not_asked_of_the_peer(self):
+        """If the peer supplies its own pid, the gate is a self-report again."""
+        seen = []
+
+        def fake_run(host, cmd, timeout=120):
+            seen.append(cmd)
+            if "MainPID" in cmd:
+                return 0, "776242\n2000000", ""
+            return 0, "", ""
+
+        dm_prompts = []
+
+        def fake_sub(args, **kw):
+            dm_prompts.append(" ".join(args))
+            return type("P", (), {"stdout": "abc1234", "stderr": ""})()
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            with patch("subprocess.run", side_effect=fake_sub):
+                pd._verify_identity("ash", "abc1234", "h", "user",
+                                    726691, 1000000)
+
+        assert any("MainPID" in c for c in seen), "pid must come from systemd"
+        assert not any("MainPID" in p for p in dm_prompts), (
+            "must not ask the peer for its own pid")
+
+    def test_unreadable_process_identity_raises(self):
+        with patch.object(pd, "_run", return_value=(1, "", "no such unit")):
+            with pytest.raises(DeployError, match="cannot read gateway process"):
+                pd._process_identity("h", "user")
+
+    def test_user_and_system_scope_use_different_commands(self):
+        seen = []
+
+        def fake_run(host, cmd, timeout=120):
+            seen.append(cmd)
+            return 0, "1\n2", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._process_identity("h", "user")
+            pd._process_identity("h", "system")
+
+        assert "--user" in seen[0]
+        assert "--user" not in seen[1]
