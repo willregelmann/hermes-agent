@@ -429,7 +429,30 @@ def load_cli_config() -> Dict[str, Any]:
     behavioral/config settings.
     """
     # Check user config first ({HERMES_HOME}/config.yaml)
-    user_config_path = _hermes_home / 'config.yaml'
+    # RESOLVE LIVE, NOT FROM THE MODULE-BODY SNAPSHOT.
+    #
+    # ``_hermes_home`` is assigned once in the module body. Nothing in the
+    # gateway imports this module eagerly — every reference is a function-local
+    # lazy import — and on a multiplexed gateway ~30 of those call sites sit
+    # inside ``_profile_runtime_scope``. So the FIRST lazy import freezes the
+    # snapshot to whichever profile happened to be mid-turn, and it stays wrong
+    # for the life of the process: after the scope exits and ``get_hermes_home()``
+    # is back to profile A, ``_hermes_home`` is still B and this function keeps
+    # returning B's config.
+    #
+    # Measured against a reconstructed two-profile sequence: imported under
+    # home B with the process home A, ``cli._hermes_home`` stayed B and
+    # ``load_cli_config()`` re-read the frozen constant rather than the live
+    # resolver.
+    #
+    # ``save_config_value`` (see the ``get_hermes_home()`` call and its comment
+    # further down this file) already resolves live for exactly this reason.
+    # This is the read side of the same rule: the value and the path that
+    # produced it must come from one resolver.
+    #
+    # An import is a call, and a LAZY import is a call at an arbitrary moment
+    # chosen by whoever touched the module first. (Wren, 2026-09-14.)
+    user_config_path = get_hermes_home() / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
 
     # --ignore-user-config: force-skip the user config.yaml (still honor project
