@@ -22,11 +22,15 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 class _Agent:
-    """Minimal stand-in: the gate only reads user_config and the source."""
+    """Minimal stand-in: the gate reads user_config and agent.platform.
 
-    def __init__(self, cfg, source=""):
+    `platform` (not `source`) is the attribute agent_init.py actually sets,
+    and it already holds the config key ("cli", "google_chat", ...).
+    """
+
+    def __init__(self, cfg, platform=""):
         self.user_config = cfg
-        self.source = source
+        self.platform = platform
 
 
 def test_default_is_on_when_unconfigured():
@@ -89,9 +93,37 @@ def test_broken_config_fails_open():
 
 def test_missing_source_attribute_is_safe():
     class Bare:
+        platform = "cli"
         user_config = {"display": {"memory_recall_indicator": False}}
 
     assert _recall_indicator_enabled(Bare()) is False
+
+
+def _guard_line_for(src: str, marker: str) -> str:
+    """Return the `if ext_prefetch_cache...` line governing `marker`.
+
+    ANCHORING DISCIPLINE (Wren, review of PR #6, generalising her lesson 42):
+    an anchor must be unique AND PROVE its uniqueness. My first version used
+    `re.search` on a substring and silently took the first of two matches —
+    it failed against correctly-patched code, which reads exactly like "the
+    fix doesn't work". Switching to `rfind` only picked the other end of the
+    same ambiguity.
+
+    So: split into lines, match whole stripped lines, and assert exactly one
+    candidate governs the marker. Ambiguity becomes a loud test error instead
+    of a silently wrong anchor.
+    """
+    lines = src.splitlines()
+    marker_idx = next(
+        (i for i, ln in enumerate(lines) if marker in ln), None
+    )
+    assert marker_idx is not None, f"marker not found: {marker!r}"
+    candidates = [
+        i for i, ln in enumerate(lines)
+        if i < marker_idx and ln.strip().startswith("if ext_prefetch_cache")
+    ]
+    assert candidates, f"no ext_prefetch_cache guard precedes {marker!r}"
+    return lines[candidates[-1]].strip()
 
 
 def test_call_site_is_actually_gated():
@@ -99,24 +131,11 @@ def test_call_site_is_actually_gated():
 
     A unit test of the helper cannot see that, so assert the wiring directly.
     This fails against pre-fix turn_context.py.
-
-    MATCH THE RIGHT SITE: `if ext_prefetch_cache:` appears twice. Line ~168
-    guards INJECTION of the memory block into the prompt and must stay
-    ungated — gating it would disable recall itself, not just the indicator.
-    The emitter is the one that calls describe_recall(), so anchor on that
-    rather than on the first textual match. My first version anchored on the
-    first `if ext_prefetch_cache` in the file and failed against correctly
-    patched code, which would have read as the fix not working.
     """
     src = (REPO / "agent" / "turn_context.py").read_text()
-    idx = src.find("describe_recall()")
-    assert idx != -1, "recall indicator emitter not found"
-    # The governing condition is the nearest preceding `if ext_prefetch_cache`.
-    guard = src.rfind("if ext_prefetch_cache", 0, idx)
-    assert guard != -1, "emitter is not guarded by ext_prefetch_cache at all"
-    line = src[guard:src.find(":", guard) + 1]
-    assert "_recall_indicator_enabled" in line, (
-        "recall indicator is emitted unconditionally — the gate is gone"
+    guard = _guard_line_for(src, "describe_recall()")
+    assert "_recall_indicator_enabled" in guard, (
+        f"recall indicator is emitted unconditionally — gate gone: {guard!r}"
     )
 
 
@@ -128,12 +147,43 @@ def test_injection_site_is_NOT_gated():
     while the config reads as a display preference.
     """
     src = (REPO / "agent" / "turn_context.py").read_text()
-    idx = src.find("build_memory_context_block(ext_prefetch_cache)")
-    assert idx != -1, "memory injection site not found"
-    guard = src.rfind("if ext_prefetch_cache", 0, idx)
-    line = src[guard:src.find(":", guard) + 1]
-    assert "_recall_indicator_enabled" not in line, (
-        "memory INJECTION must not depend on a display setting"
+    guard = _guard_line_for(src, "build_memory_context_block(ext_prefetch_cache)")
+    assert "_recall_indicator_enabled" not in guard, (
+        f"memory INJECTION must not depend on a display setting: {guard!r}"
+    )
+
+
+def test_the_two_sites_are_distinct():
+    """Wren's attack: is test_injection_site_is_NOT_gated load-bearing?
+
+    It only protects anything if the two guards are genuinely separate lines.
+    Were they ever merged into one, both tests above would read the SAME line
+    and the pair would be self-contradictory rather than protective — so pin
+    the structural fact they both depend on.
+    """
+    src = (REPO / "agent" / "turn_context.py").read_text()
+    emit = _guard_line_for(src, "describe_recall()")
+    inject = _guard_line_for(src, "build_memory_context_block(ext_prefetch_cache)")
+    assert emit != inject, (
+        "indicator and injection share one guard — gating the indicator would "
+        "also disable memory injection"
+    )
+
+
+def test_platform_key_reads_the_attribute_that_exists():
+    """Wren's point 4: `agent.source` is never set on an agent object.
+
+    Reading it first made the branch dead, and a SessionSource landing there
+    would silently break per-platform resolution while global still worked.
+    """
+    src = (REPO / "agent" / "turn_context.py").read_text()
+    start = src.find("def _recall_indicator_enabled")
+    end = src.find("\ndef ", start + 1)
+    body = src[start:end]
+    assert 'getattr(agent, "platform"' in body
+    assert 'getattr(agent, "source"' not in body, (
+        "agent.source is not an attribute of an agent; reading it silently "
+        "breaks per-platform resolution"
     )
 
 

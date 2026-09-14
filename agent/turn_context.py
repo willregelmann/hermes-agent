@@ -150,7 +150,18 @@ def _recall_indicator_enabled(agent: Any) -> bool:
     """
     try:
         cfg = getattr(agent, "user_config", None) or {}
-        platform = (getattr(agent, "source", "") or getattr(agent, "platform", "") or "")
+        # `agent.platform` IS the config key: agent_init.py sets it to "cli" /
+        # "telegram" / "google_chat" / ..., matching _platform_config_key's
+        # output including the LOCAL -> "cli" mapping.
+        #
+        # Do NOT fall back to `agent.source`. No agent object carries that
+        # attribute, so the branch was dead — but worse than dead: `source`
+        # elsewhere in the codebase is a SessionSource dataclass, not a string.
+        # If one ever landed here the per-platform lookup would silently miss
+        # and only the global key would work, which looks correct to anyone
+        # testing globally and fails for anyone using the per-platform form.
+        # (Caught by Wren in review.)
+        platform = getattr(agent, "platform", "") or ""
         try:
             from gateway.display_config import resolve_display_setting
 
