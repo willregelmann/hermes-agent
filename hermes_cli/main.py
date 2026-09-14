@@ -305,22 +305,39 @@ def _set_process_title() -> None:
 # that run *before* hermes_cli.config is importable. Mirrors the explicit
 # precedence used everywhere else: `--cli` always wins, then `--tui`/env, then
 # this config value. Cached so the multiple early callers don't re-parse YAML.
-_EARLY_INTERFACE_CACHE: "list | None" = None
+#
+# The cache is KEYED ON THE RESOLVED CONFIG PATH, not a bare global. This
+# function runs at import time (``_suppress_mouse_residue_early()`` below),
+# which is *before* ``_apply_profile_override()`` sets ``HERMES_HOME`` for
+# ``--profile X`` or a sticky ``active_profile``. An unkeyed global therefore
+# froze the ROOT profile's ``display.interface`` and served it to every later
+# caller under the profile's home -- in both directions, silently.
+_EARLY_INTERFACE_CACHE: "dict[str, str]" = {}
+
+
+def _early_interface_config_path() -> str:
+    """Resolve the config path the early interface read should use.
+
+    Deliberately dependency-free (no ``hermes_cli.config``) because this runs
+    before that module is importable, but it is the SAME resolver that
+    produces the cached value -- key and value must not come from two
+    different opinions about which home is active.
+    """
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        return os.path.join(home, "config.yaml")
+    return os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
 
 
 def _config_default_interface_early() -> str:
     """Return the configured default interface ("cli"/"tui") via a minimal
     YAML read. Best-effort: any error falls back to "cli" (legacy behavior)."""
-    global _EARLY_INTERFACE_CACHE
-    if _EARLY_INTERFACE_CACHE is not None:
-        return _EARLY_INTERFACE_CACHE[0]
+    cfg_path = _early_interface_config_path()
+    cached = _EARLY_INTERFACE_CACHE.get(cfg_path)
+    if cached is not None:
+        return cached
     value = "cli"
     try:
-        home = os.environ.get("HERMES_HOME")
-        if home:
-            cfg_path = os.path.join(home, "config.yaml")
-        else:
-            cfg_path = os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
         if os.path.exists(cfg_path):
             import yaml as _yaml_iface
 
@@ -335,7 +352,7 @@ def _config_default_interface_early() -> str:
                     value = "tui"
     except Exception:
         value = "cli"  # best-effort — default to classic REPL on any error
-    _EARLY_INTERFACE_CACHE = [value]
+    _EARLY_INTERFACE_CACHE[cfg_path] = value
     return value
 
 
