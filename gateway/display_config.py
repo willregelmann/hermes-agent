@@ -68,6 +68,12 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # (Slack's default), and costs no extra API calls — the existing typing
     # refresh cadence just renders different text.
     "live_status": "full",
+    # The "🧠 <provider> — recalled N memories" line emitted by
+    # agent/turn_context.py when a memory provider injected context this turn.
+    # On by default (unchanged behaviour); set false to suppress. Distinct from
+    # display.memory_notifications, which gates the background review's
+    # "💾 Self-improvement review" summary — a different emitter entirely.
+    "memory_recall_indicator": True,
 }
 
 # ---------------------------------------------------------------------------

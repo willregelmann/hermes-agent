@@ -128,6 +128,45 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
         return True
 
 
+def _recall_indicator_enabled(agent: Any) -> bool:
+    """Whether the "🧠 <provider> — recalled N memories" line should be emitted.
+
+    Config: ``display.memory_recall_indicator`` (bool, default True), with the
+    standard per-platform override at
+    ``display.platforms.<platform>.memory_recall_indicator``.
+
+    WHY THIS EXISTS: the indicator had no gate. ``display.memory_notifications``
+    reads like the setting that covers it, but that one gates the background
+    review's "💾 Self-improvement review" summary built in
+    ``agent/background_review.py`` — a different emitter on a different code
+    path. Setting it ``off`` silenced the review and left this line intact,
+    which is indistinguishable from the flag not working.
+
+    Resolution deliberately reuses ``gateway.display_config`` so this key
+    behaves like every other display setting (per-platform beats global beats
+    default). Failures fall back to True: a user who has not configured
+    anything keeps today's behaviour, and a broken lookup must not silently
+    disable a signal the user may be relying on.
+    """
+    try:
+        cfg = getattr(agent, "user_config", None) or {}
+        platform = (getattr(agent, "source", "") or getattr(agent, "platform", "") or "")
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            val = resolve_display_setting(
+                cfg, platform, "memory_recall_indicator", True
+            )
+        except Exception:
+            # No gateway (plain CLI) or resolver unavailable — read the flat key.
+            val = (cfg.get("display") or {}).get("memory_recall_indicator", True)
+        if isinstance(val, str):
+            return val.strip().lower() not in {"off", "false", "no", "0"}
+        return bool(val)
+    except Exception:
+        return True
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -1547,7 +1586,17 @@ def build_turn_context(
         # actually injected this turn, tell the user — don't rely on the model
         # to surface it. Rendered by Hermes (via _emit_status), so it always
         # shows and can't be silently dropped by the model.
-        if ext_prefetch_cache:
+        #
+        # Gated on display.memory_recall_indicator (default "on"). The
+        # indicator is useful while you are learning to trust a memory
+        # provider and pure noise once you do: on a chat platform it prepends
+        # a status line to EVERY non-trivial turn. It previously had no gate
+        # at all — display.memory_notifications looks like it should cover
+        # this, but that flag gates the background review summary in
+        # agent/background_review.py, a different code path with a different
+        # emitter, so setting it off left this line untouched and there was
+        # no supported way to turn it off.
+        if ext_prefetch_cache and _recall_indicator_enabled(agent):
             try:
                 _recall_indicator = agent._memory_manager.describe_recall()
                 if _recall_indicator:
