@@ -128,6 +128,71 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
         return True
 
 
+_RECALL_CFG_CACHE: Dict[Any, dict] = {}
+_RECALL_CFG_LOCK = threading.Lock()
+
+
+def _recall_indicator_cache_clear() -> None:
+    """Test hook — drop the config cache."""
+    _RECALL_CFG_CACHE.clear()
+
+
+def _recall_indicator_config() -> dict:
+    """The real user config, cached by (path, mtime, size).
+
+    ``_recall_indicator_enabled`` runs on every turn that recalls memory, so
+    this must not re-read config.yaml each time.
+
+    KEYED, NOT A BARE GLOBAL. The first version of this cached into a single
+    module global with no key. ``_load_gateway_config`` resolves its path
+    through ``get_config_path()``, which is profile-aware, so an unkeyed
+    global meant THE FIRST PROFILE TO RECALL MEMORY PINNED THE INDICATOR FOR
+    EVERY PROFILE until restart. Measured on the installed bytes before the
+    fix: off-then-on returned ``[False, False]`` and on-then-off returned
+    ``[True, True]``, against a cache-bypassed control of ``[False, True]``.
+    Latent rather than live only because ``profiles/`` is empty today.
+    (Found by Wren, 2026-09-13.)
+
+    The key follows the existing in-tree shape at
+    ``agent/skill_utils.py::_load_raw_config`` — (path, st_mtime_ns, st_size)
+    — which additionally means an edited config.yaml is picked up on the next
+    turn instead of requiring a restart.
+
+    ``agent/relay_runtime.py::_SEGMENTS_CONFIG`` still has the unkeyed shape
+    and leaks the same way; that is a separate fix with a separate subject.
+    """
+    key: Any
+    try:
+        from hermes_cli.config import get_config_path  # late import
+
+        p = get_config_path()
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+    except Exception:
+        # Cannot identify the config file — do not cache under a key that
+        # could collide with a different profile's. Fall back to loading
+        # fresh, which is slower and correct.
+        key = None
+
+    if key is not None:
+        hit = _RECALL_CFG_CACHE.get(key)
+        if hit is not None:
+            return hit
+
+    try:
+        from gateway.run import _load_gateway_config  # late import
+
+        cfg = _load_gateway_config() or {}
+    except Exception:
+        # No gateway on the path (plain CLI) or an unreadable config.
+        cfg = {}
+
+    if key is not None:
+        with _RECALL_CFG_LOCK:
+            _RECALL_CFG_CACHE[key] = cfg
+    return cfg
+
+
 def _recall_indicator_enabled(agent: Any) -> bool:
     """Whether the "🧠 <provider> — recalled N memories" line should be emitted.
 
@@ -149,7 +214,25 @@ def _recall_indicator_enabled(agent: Any) -> bool:
     disable a signal the user may be relying on.
     """
     try:
-        cfg = getattr(agent, "user_config", None) or {}
+        # NO AGENT OBJECT CARRIES ``user_config``. agent_init.py sets
+        # ``agent.platform`` (line 679) but never ``agent.user_config``, and a
+        # tree-wide grep finds the attribute assigned in exactly one place: the
+        # test fixture for this function. So the original ``getattr(...) or {}``
+        # resolved to ``{}`` on EVERY production turn and no config value could
+        # ever disable the indicator. The gate shipped inert.
+        #
+        # It passed review twice because both test suites constructed an agent
+        # with the attribute already set — reproducing a claim with the same
+        # fixture assumption reproduces the assumption, not the behaviour.
+        # (Found by Wren, 2026-09-13.)
+        #
+        # Read the real config the way the rest of agent/ does: late-import
+        # ``_load_gateway_config`` (see agent/relay_runtime.py:197) and cache it
+        # under a lock, because this runs once per turn. The getattr is kept
+        # FIRST so an explicitly injected config still wins.
+        cfg = getattr(agent, "user_config", None)
+        if not cfg:
+            cfg = _recall_indicator_config()
         # `agent.platform` IS the config key: agent_init.py sets it to "cli" /
         # "telegram" / "google_chat" / ..., matching _platform_config_key's
         # output including the LOCAL -> "cli" mapping.
