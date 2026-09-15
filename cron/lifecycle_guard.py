@@ -212,6 +212,98 @@ def _contains_launchctl_gateway_lifecycle(normalized_text: str) -> bool:
     )
 
 
+def _local_host_identities() -> frozenset:
+    """Names that provably denote THIS machine.
+
+    Used to decide whether an ``ssh <host> ... restart`` is self-targeting.
+    Deliberately small and concrete: hostname, its short form, the mDNS
+    ``.local`` variants, and the loopback spellings. Anything not in here is
+    treated as unproven rather than remote — see ``_ssh_target_is_remote``.
+    """
+    import socket
+
+    names = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        host = socket.gethostname().strip().casefold()
+    except Exception:
+        return frozenset(names)
+    if host:
+        names.add(host)
+        short = host.split(".", 1)[0]
+        names.add(short)
+        names.add(f"{short}.local")
+    try:
+        fqdn = socket.getfqdn().strip().casefold()
+        if fqdn:
+            names.add(fqdn)
+            names.add(fqdn.split(".", 1)[0])
+    except Exception:
+        pass
+    return frozenset(n for n in names if n)
+
+
+# An ssh invocation: `ssh [-opts [vals]] [user@]host <command...>`. Only the
+# destination matters here; option values are skipped by the scanner below.
+_SSH_OPTS_WITH_VALUE = frozenset(
+    {"-F", "-i", "-o", "-p", "-l", "-b", "-c", "-D", "-E", "-e", "-I",
+     "-J", "-L", "-m", "-O", "-Q", "-R", "-S", "-W", "-w"}
+)
+
+
+def _ssh_target_is_remote(segment: list) -> bool:
+    """True only when *segment* is an ssh command provably targeting another host.
+
+    FAILS CLOSED. Returns False — meaning "do not exempt, keep blocking" — for
+    anything it cannot prove: no ssh leader, no resolvable destination, a
+    destination that names this machine, or a destination built from a shell
+    variable (``ssh "$TARGET" ...``) whose value this guard cannot see.
+
+    WHY THIS EXEMPTION EXISTS. The guard's stated rationale is that the
+    gateway would SIGTERM its own child mid-restart, so the restart dies
+    before it completes. That is true for a LOCAL restart and false for a
+    remote one: nothing in this process tree dies when a DIFFERENT machine's
+    gateway restarts. Matching on content alone cannot tell those apart, so a
+    peer restart — the sanctioned way two agents deploy for each other — was
+    blocked by a guard whose reason did not apply to it.
+
+    Scope note: this exempts the *transport*, not the verb. A local
+    `systemctl restart hermes-gateway` is still blocked, and so is
+    `ssh localhost systemctl restart hermes-gateway`.
+    """
+    if not segment:
+        return False
+    leader = segment[0].strip().strip("\"'").casefold()
+    # Accept a path (`/usr/bin/ssh`) but not a lookalike (`myssh`).
+    if leader.rsplit("/", 1)[-1] != "ssh":
+        return False
+
+    i = 1
+    while i < len(segment):
+        tok = segment[i].strip().strip("\"'")
+        if not tok:
+            i += 1
+            continue
+        if tok.startswith("-"):
+            # `-oFoo=bar` carries its value inline; `-o Foo=bar` does not.
+            if tok in _SSH_OPTS_WITH_VALUE:
+                i += 2
+            else:
+                i += 1
+            continue
+        dest = tok
+        break
+    else:
+        return False
+
+    # A destination containing shell expansion is unknowable at scan time.
+    if any(m in dest for m in ("$", "`", "*", "?")):
+        return False
+    host = dest.rsplit("@", 1)[-1].strip().casefold()
+    if not host:
+        return False
+    return host not in _local_host_identities()
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern.
 
@@ -247,6 +339,21 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
     text = strip_inert_heredoc_bodies(text)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    # Target-aware exemption must be decided BEFORE the raw-text pass, not
+    # after. The raw pass matches the lifecycle verb anywhere in the string
+    # and returns immediately, so a check placed later in the segment loop is
+    # unreachable for every real ssh command — the predicate would be correct
+    # and inert, the shape of bug this codebase keeps producing (a shipped
+    # gate that never runs). Verified by test: the ALLOW cases failed until
+    # this moved above the raw pass.
+    #
+    # A command is exempt only when EVERY executable segment in it is a
+    # provably-remote ssh invocation. One local lifecycle segment anywhere
+    # (`systemctl restart hermes-gateway; ssh peer uptime`) keeps the whole
+    # command blocked.
+    segments = [s for s in _iter_command_segments(normalized) if s]
+    if segments and all(_ssh_target_is_remote(s) for s in segments):
+        return False
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
         return True
     # Profile-flag form (#78028): `hermes -p <profile> gateway restart|stop`
@@ -273,6 +380,16 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # from execute_code, where commas and brackets — not spaces — separate
     # the argv words the OS will actually see.
     for segment in _iter_command_segments(normalized):
+        # Target-aware exemption: a restart of ANOTHER machine's gateway is
+        # not the foot-gun this guard exists to prevent. The rationale in the
+        # block message — "the gateway would kill this command before it
+        # could complete (SIGTERM propagates to child processes)" — is a
+        # statement about THIS process tree. It does not hold for a peer, and
+        # blocking it prevented the sanctioned mutual-deploy path two agents
+        # use to restart each other. `_ssh_target_is_remote` fails closed on
+        # anything it cannot prove remote, so the default stays "block".
+        if _ssh_target_is_remote(segment):
+            continue
         joined = " ".join(segment)
         if joined and _GATEWAY_LIFECYCLE_PATTERN.search(joined):
             return True
