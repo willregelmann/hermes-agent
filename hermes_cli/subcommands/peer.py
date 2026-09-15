@@ -47,6 +47,11 @@ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
+# Accept-only sends wait for the peer to ENQUEUE the turn, not to finish it.
+# This is a genuine transport timeout: exceeding it means the peer did not
+# answer the socket, which is a different fact from "the peer is thinking".
+# Deliberately matched to LIST_TIMEOUT_S — both measure reachability, not work.
+ACCEPT_TIMEOUT_S = 30
 LIST_TIMEOUT_S = 30
 
 
@@ -414,13 +419,6 @@ def cmd_peer(args) -> int:
 
         try:
             session_id = _ensure_bot_chat(base, key)
-            result = _request(
-                f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat",
-                key,
-                method="POST",
-                body={"message": message},
-                timeout=DM_TIMEOUT_S,
-            )
         except urllib.error.HTTPError as exc:
             print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}", file=sys.stderr)
             return 1
@@ -428,8 +426,73 @@ def cmd_peer(args) -> int:
             print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
             return 1
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
+            # No session id yet, so there is nothing to point a recovery at.
+            print(f"Could not reach peer '{peer_name}' (resolving Bot Chat session): {exc}", file=sys.stderr)
             return 1
+
+        # From here on the session id is known, so EVERY failure message can
+        # name it. That is the difference between a reply that is lost and a
+        # reply that is merely late: a completed turn is persisted on the peer
+        # regardless of what happens to this socket, and the session id is the
+        # handle needed to go read it.
+        wait = not getattr(args, "no_wait", False)
+        timeout = DM_TIMEOUT_S if wait else ACCEPT_TIMEOUT_S
+        body = {"message": message}
+        if not wait:
+            # Ask the peer to enqueue the turn and answer immediately. Older
+            # peers ignore the flag and run the turn synchronously; that is
+            # why the timeout below is still honoured rather than assumed.
+            body["wait"] = False
+
+        try:
+            result = _request(
+                f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat",
+                key,
+                method="POST",
+                body=body,
+                timeout=timeout,
+            )
+        except urllib.error.HTTPError as exc:
+            print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}", file=sys.stderr)
+            print(f"session_id: {session_id}", file=sys.stderr)
+            return 1
+        except RuntimeError as exc:
+            print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
+            print(f"session_id: {session_id}", file=sys.stderr)
+            return 1
+        except TimeoutError as exc:
+            # DISTINCT from unreachable, and this distinction is the whole bug.
+            # The peer accepted the connection and is still working; the socket
+            # gave up first. The turn is running and its result will persist in
+            # the session named below. Reporting this as "could not reach peer"
+            # is what made completed work look like a dead host.
+            print(
+                f"Peer '{peer_name}' did not answer within {timeout}s — the turn is "
+                f"likely still running and its reply will persist in the session below. "
+                f"This is NOT an unreachable peer: {exc}",
+                file=sys.stderr,
+            )
+            print(f"session_id: {session_id}", file=sys.stderr)
+            return 3
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
+            print(f"session_id: {session_id}", file=sys.stderr)
+            return 1
+
+        if not wait:
+            payload = {
+                "peer": peer_name,
+                "profile": profile,
+                "session_id": result.get("session_id") or session_id,
+                "accepted": True,
+                "message_id": result.get("message_id") or result.get("id"),
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(payload))
+            else:
+                print(f"accepted by '{peer_name}' — reply will arrive as an inbound DM")
+                print(f"session_id: {payload['session_id']}")
+            return 0
 
         reply = ""
         msg = result.get("message")
@@ -498,6 +561,18 @@ def build_peer_parser(subparsers) -> None:
     )
     dm_p.add_argument(
         "--json", action="store_true", default=False, help="Emit a JSON result"
+    )
+    dm_p.add_argument(
+        "--no-wait",
+        action="store_true",
+        default=False,
+        dest="no_wait",
+        help=(
+            "Return as soon as the peer ACCEPTS the message instead of blocking "
+            "for its whole turn. The reply arrives later as an inbound DM. Use "
+            "this for anything that makes the peer actually work — a long turn "
+            "over a blocking send is indistinguishable from an unreachable host."
+        ),
     )
 
     run_p = peer_sub.add_parser(
