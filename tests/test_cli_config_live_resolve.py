@@ -1,8 +1,9 @@
 """load_cli_config() must read the LIVE home, not a module-body snapshot.
 
 THE DEFECT
-``cli.py`` assigns ``_hermes_home = get_hermes_home()`` in its module body and
-``load_cli_config()`` read that constant. Nothing in the gateway imports ``cli``
+``cli.py`` assigns an import-time home constant in its module body (named
+``_hermes_home`` when this suite was written, renamed ``_IMPORT_TIME_HERMES_HOME``
+by the #18 follow-up) and ``load_cli_config()`` read that constant. Nothing in the gateway imports ``cli``
 eagerly — every reference is a function-local lazy import — and on a multiplexed
 gateway ~30 of those call sites sit inside ``_profile_runtime_scope``. So the
 FIRST lazy import freezes the snapshot to whichever profile happened to be
@@ -114,7 +115,8 @@ SCOPED = """
 
     print("inside:", inside)
     print("after:", after)
-    print("snapshot:", str(cli._hermes_home))
+    print("snapshot:", str(getattr(cli, "_IMPORT_TIME_HERMES_HOME",
+                                   getattr(cli, "_hermes_home", "<NEITHER>"))))
     print("reload_model:", str(cli.load_cli_config().get("model", {}).get("default")))
 """ % {"A": HOME_A, "B": HOME_B}
 
@@ -162,6 +164,10 @@ check("B2 control also resolves A (A4 is not passing for an unrelated reason)",
 print("\nC. MUTANT — restore the snapshot read; A4 must die")
 
 src = Path(TREE, "cli.py").read_text(encoding="utf-8")
+# The import-time constant's NAME is not the subject of this suite; derive it
+# from the tree so a rename cannot silently make the mutant unapplied.
+SNAP_NAME = ("_IMPORT_TIME_HERMES_HOME" if "_IMPORT_TIME_HERMES_HOME =" in src
+             else "_hermes_home")
 ANCHOR = "    user_config_path = get_hermes_home() / 'config.yaml'"
 check("C0 the mutation anchor exists", ANCHOR in src,
       "the fix is not where this suite thinks it is — every case above is suspect")
@@ -177,7 +183,7 @@ if ANCHOR in src:
         except OSError:
             pass
     Path(mut_dir, "cli.py").write_text(
-        src.replace(ANCHOR, "    user_config_path = _hermes_home / 'config.yaml'", 1),
+        src.replace(ANCHOR, "    user_config_path = %s / 'config.yaml'" % SNAP_NAME, 1),
         encoding="utf-8",
     )
     env = {**os.environ, "PYTHONPATH": mut_dir}

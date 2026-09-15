@@ -25,7 +25,6 @@ class TestSaveConfigValueAtomic:
         # point HERMES_HOME at the temp dir (the _hermes_home import-time
         # constant is no longer consulted).
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setattr("cli._hermes_home", hermes_home)
         return config_path
 
     def test_calls_roundtrip_yaml_update(self, config_env, monkeypatch):
