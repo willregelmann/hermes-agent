@@ -221,7 +221,11 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    get_process_hermes_home,
+    display_hermes_home,
+)
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     is_browser_debug_ready,
@@ -231,14 +235,23 @@ from hermes_cli.browser_connect import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import base_url_host_matches, base_url_hostname, fast_safe_load
 
-# The home this module was IMPORTED under. Correct for import-time work only
-# (the dotenv load just below, which must happen once, at import, before any
-# profile scope exists). It is NOT the process home: nothing imports this
-# module eagerly, so on a multiplexed gateway the first lazy import can land
-# inside another profile's ``_profile_runtime_scope`` and freeze this to that
-# profile for the life of the process. Every RUNTIME reader must call
-# ``get_hermes_home()`` instead -- see #18 and the comment in load_cli_config().
-_IMPORT_TIME_HERMES_HOME = get_hermes_home()
+# The home that OWNS THIS PROCESS's global state.
+#
+# Deliberately ``get_process_hermes_home()``, NOT ``get_hermes_home()``: this
+# constant and the dotenv load below both write process-global state
+# (``os.environ``), and nothing imports this module eagerly -- every reference
+# in the gateway is a function-local lazy import, and on a multiplexed gateway
+# ~30 of those call sites sit inside ``_profile_runtime_scope``. Resolving the
+# context-local override here meant the FIRST lazy import decided, for the life
+# of the process, whose ``.env`` got hydrated into the shared environment: the
+# profile that happened to be mid-turn, not the profile that launched the
+# process. ``get_process_hermes_home()`` ignores the override by construction,
+# so import order cannot change the answer.
+#
+# Every RUNTIME reader must still call ``get_hermes_home()`` -- see #19 and the
+# comment in ``_load_cli_config_impl()``. This constant is for import-time,
+# process-global work only.
+_IMPORT_TIME_HERMES_HOME = get_process_hermes_home()
 _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_IMPORT_TIME_HERMES_HOME, project_env=_project_env)
 
@@ -418,7 +431,7 @@ def _parse_service_tier_config(raw: str) -> str | None:
     logger.warning("Unknown service_tier '%s', ignoring", raw)
     return None
 
-def _load_cli_config_impl() -> Tuple[Dict[str, Any], bool]:
+def _load_cli_config_impl(home: Optional[Path] = None) -> Tuple[Dict[str, Any], bool]:
     """
     Load CLI configuration from config files.
     
@@ -459,7 +472,11 @@ def _load_cli_config_impl() -> Tuple[Dict[str, Any], bool]:
     #
     # An import is a call, and a LAZY import is a call at an arbitrary moment
     # chosen by whoever touched the module first. (Wren, 2026-09-14.)
-    user_config_path = get_hermes_home() / 'config.yaml'
+    # ``home`` is pinned ONLY by the import-time call at the bottom of this
+    # module, which passes the process home so the one env-bridging load cannot
+    # be hijacked by an ambient profile scope. Every other caller passes
+    # nothing and gets the live resolver.
+    user_config_path = (home or get_hermes_home()) / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
 
     # --ignore-user-config: force-skip the user config.yaml (still honor project
@@ -847,9 +864,29 @@ def _export_config_to_env(defaults: Dict[str, Any], _file_has_terminal_config: b
 
 
 # Load configuration at module startup.  This is the ONE site that is allowed to
-# bridge config -> os.environ (#20): it runs at import, in the process that owns
-# the environment, before any per-profile home scope exists.
-CLI_CONFIG, _CLI_CONFIG_FILE_HAS_TERMINAL = _load_cli_config_impl()
+# bridge config -> os.environ (#20).
+#
+# PINNED TO THE PROCESS HOME. "It runs at import, before any per-profile home
+# scope exists" was an assumption, not a guarantee: this module is only ever
+# imported lazily, so the import can and does happen INSIDE
+# ``gateway/run.py::_profile_runtime_scope``. When it did, ``CLI_CONFIG`` froze
+# to that profile and its ``HERMES_SEARCH_SLOW_MS`` / ``HERMES_CJK_FTS`` /
+# ``HERMES_REDACT_SECRETS`` / ``TERMINAL_*`` were exported into the shared
+# environment and outlived the scope. Passing the process home makes the answer
+# independent of who imported first.
+_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME
+if str(get_hermes_home()) != str(_CLI_CONFIG_IMPORT_HOME):
+    # Detectable rather than silent: we are importing inside someone else's
+    # profile scope. The pin below makes it harmless, but it means some call
+    # path reaches cli.py from inside a scope, which is worth seeing.
+    logger.warning(
+        "cli.py imported inside a profile scope (%s) while the process home is "
+        "%s; pinning module-global config + env bridge to the process home",
+        get_hermes_home(), _CLI_CONFIG_IMPORT_HOME,
+    )
+CLI_CONFIG, _CLI_CONFIG_FILE_HAS_TERMINAL = _load_cli_config_impl(
+    home=_CLI_CONFIG_IMPORT_HOME
+)
 _export_config_to_env(CLI_CONFIG, _CLI_CONFIG_FILE_HAS_TERMINAL)
 
 

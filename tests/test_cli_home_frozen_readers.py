@@ -175,9 +175,20 @@ check("D1a the scope really entered profile B", inside.rstrip("/") == HOME_B.rst
       f"inside={inside}")
 check("D1b the scope really exited to profile A", after.rstrip("/") == HOME_A.rstrip("/"),
       f"after={after}")
-check("D2 the import-time constant IS still frozen to B (it is not supposed to move)",
-      snapshot.rstrip("/") == HOME_B.rstrip("/"),
-      f"snapshot={snapshot} -- if this moved, the rename deleted a real behaviour")
+# RE-POLARISED 2026-09-15 (Wren, #21).  "Frozen to B is not supposed to move"
+# was the #18/#19 contract: those PRs fixed the READERS and deliberately left
+# the constant wherever the first lazy import landed, on the reasoning that it
+# only feeds import-time work.  That reasoning had a hole -- the import-time
+# work it feeds (load_hermes_dotenv, and since #20 the os.environ bridge)
+# writes PROCESS-GLOBAL state that outlives the scope.  Freezing it to the
+# importing scope therefore leaked profile B's .env and settings into a process
+# owned by profile A.  It now resolves get_process_hermes_home(), which ignores
+# the context-local override by construction, so import ORDER cannot change it.
+check("D2 the import-time constant is the PROCESS home regardless of the "
+      "importing scope",
+      snapshot.rstrip("/") == HOME_A.rstrip("/"),
+      f"snapshot={snapshot} -- it followed the scope into B; that constant "
+      f"hydrates .env and the os.environ bridge into a shared process")
 check("D3 load_cli_config still resolves live (PR #11 not regressed)",
       loaded_from == "PROFILE-A", f"got {loaded_from!r}")
 check("D4 show_config displays profile A's config.yaml, the file the config came from",
@@ -209,9 +220,18 @@ for h in hits:
 check("E2a the constant still exists and is still assigned once",
       sum(1 for h in hits if h.startswith("_IMPORT_TIME_HERMES_HOME =")) == 1,
       f"hits={hits}")
-check("E2b its ONLY other use is the import-time dotenv load",
-      len(hits) == 2 and "load_hermes_dotenv(" in hits[1],
-      f"a runtime reader is still on the snapshot: {hits}")
+# WIDENED 2026-09-15 (#21): the invariant is "no RUNTIME reader", not "exactly
+# two lines".  #21 adds import-time uses (the pinned config load + its
+# divergence warning), so the check is now an allowlist of import-time shapes
+# -- anything else is a runtime reader and fails.  The non-vacuity arm is E2a:
+# if the constant vanished, hits would be empty and this would pass for free.
+_ALLOWED = ("_IMPORT_TIME_HERMES_HOME = ",
+            "load_hermes_dotenv(",
+            "_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME")
+_stray = [h for h in hits if not any(h.startswith(a) or a in h for a in _ALLOWED)]
+check("E2b every use is import-time; no runtime site reads the snapshot",
+      len(hits) >= 2 and not _stray,
+      f"a runtime reader is still on the snapshot: {_stray or hits}")
 check("E2c the old name is gone entirely (no reader left behind under it)",
       not re.search(r"(?<![\w.])_hermes_home(?![\w])", SRC),
       "a bare `_hermes_home` survives -- the rename was partial")
@@ -233,7 +253,19 @@ def mutate(anchor: str, replacement: str, label: str, expect_field: str, expect_
             os.symlink(os.path.join(TREE, entry), os.path.join(mut_dir, entry))
         except OSError:
             pass
-    Path(mut_dir, "cli.py").write_text(SRC.replace(anchor, replacement, 1), encoding="utf-8")
+    # TWO reverts, not one (#21).  With the constant pinned to the process
+    # home, restoring a snapshot READ alone still yields profile A and the
+    # mutant dies for the wrong reason.  A mutant is only evidence if it
+    # differs from the current subject by exactly the thing you mutated -- so
+    # reconstruct the whole pre-#21 world: snapshot follows the scope AND the
+    # reader is on the snapshot.
+    SNAP_ANCHOR = "_IMPORT_TIME_HERMES_HOME = get_process_hermes_home()"
+    check(f"{label}0b the snapshot revert anchor matches EXACTLY ONCE",
+          SRC.count(SNAP_ANCHOR) == 1,
+          f"anchor appears {SRC.count(SNAP_ANCHOR)} times -- mutant proves nothing")
+    mutated = SRC.replace(anchor, replacement, 1).replace(
+        SNAP_ANCHOR, "_IMPORT_TIME_HERMES_HOME = get_hermes_home()", 1)
+    Path(mut_dir, "cli.py").write_text(mutated, encoding="utf-8")
     rc_m, out_m = run(SCOPED, mut_dir)
     got = field(out_m, expect_field)
     print(f"    {label} mutant {expect_field}: {got}")
