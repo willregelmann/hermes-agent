@@ -132,6 +132,21 @@ async def wake(
             "wake %s deferred at gate 2: registry unavailable: %s", h.id, exc
         )
         raise WakeRefused(f"registry unavailable: {exc}", deferred) from exc
+    except Exception as exc:
+        # try_acquire_active_session does more than read the registry -- it
+        # takes a _FileLock and writes entries, so disk-full/permission/lock
+        # failures surface as OSError etc., not ActiveSessionRegistryError,
+        # and would otherwise re-create the exact dangling-open-row case
+        # above under a different exception type (Wren, PR #13 round 2,
+        # case G: "naming the specific exception you were shown, not the
+        # class of failure"). Kept as a second except so REGISTRY_UNAVAILABLE
+        # stays distinct from the generic GATE_ERROR label.
+        deferred = handoff_store.record(h.id, DEFERRED, reason=GATE_ERROR)
+        logger.warning(
+            "wake %s deferred at gate 2: unexpected error acquiring lease: %s",
+            h.id, exc,
+        )
+        raise WakeRefused(f"gate 2 raised: {exc}", deferred) from exc
 
     if refusal is not None:
         deferred = handoff_store.record(h.id, DEFERRED, reason=str(refusal.reason))
