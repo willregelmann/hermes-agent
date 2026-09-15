@@ -137,9 +137,22 @@ check("A1 the scope really entered profile B",
       inside.rstrip("/") == HOME_B.rstrip("/"), f"inside={inside}")
 check("A2 the scope really exited to profile A",
       after.rstrip("/") == HOME_A.rstrip("/"), f"after={after}")
-check("A3 the module snapshot IS still frozen to B (defect still present)",
-      snapshot.rstrip("/") == HOME_B.rstrip("/"),
-      f"snapshot={snapshot} — if this changed, the fix touched the wrong thing")
+# RE-POLARISED 2026-09-15 (Wren, #21).  This case used to assert
+# ``snapshot == HOME_B`` — "the defect is still present" — which was true when
+# #19 shipped, because #19 only fixed the READER and deliberately left the
+# import-time constant frozen to whoever imported first.  That constant is not
+# inert: it hydrates ``.env`` into the process environment and (via #20) it is
+# the value the one-shot env bridge exports.  So "frozen to whichever profile
+# was mid-turn" was still a live cross-profile leak, one layer below the one
+# #19 closed.  The constant now resolves ``get_process_hermes_home()``, which
+# ignores the context-local override by construction.
+#
+# A finding belongs in the journal; a CONTRACT belongs in a test.  The contract
+# is: the import-time constant is the PROCESS home, whoever imported first.
+check("A3 the import-time snapshot is the PROCESS home, not the importing scope",
+      snapshot.rstrip("/") == HOME_A.rstrip("/"),
+      f"snapshot={snapshot} — imported inside profile B and froze to it; "
+      f"that constant feeds load_hermes_dotenv() and the os.environ bridge")
 check("A4 load_cli_config() returns profile A's config, not the frozen B",
       reload_model == "PROFILE-A",
       f"got {reload_model!r}; pre-fix this returns 'PROFILE-B'")
@@ -168,11 +181,20 @@ src = Path(TREE, "cli.py").read_text(encoding="utf-8")
 # from the tree so a rename cannot silently make the mutant unapplied.
 SNAP_NAME = ("_IMPORT_TIME_HERMES_HOME" if "_IMPORT_TIME_HERMES_HOME =" in src
              else "_hermes_home")
-ANCHOR = "    user_config_path = get_hermes_home() / 'config.yaml'"
-check("C0 the mutation anchor exists", ANCHOR in src,
+# TWO anchors, because there are now two halves to the fix and a mutant that
+# reverts only one is not a mutant: with the snapshot pinned to the process
+# home, reverting the reader alone still yields PROFILE-A and the case dies
+# for the wrong reason (observed 2026-09-15).  A mutant is only evidence if it
+# differs from the current subject by exactly the thing you mutated.
+ANCHOR = "    user_config_path = (home or get_hermes_home()) / 'config.yaml'"
+ANCHOR_SNAP = "_IMPORT_TIME_HERMES_HOME = get_process_hermes_home()"
+check("C0 the reader mutation anchor exists", ANCHOR in src,
       "the fix is not where this suite thinks it is — every case above is suspect")
+check("C0b the snapshot mutation anchor exists", ANCHOR_SNAP in src,
+      "the import-time constant no longer resolves the process home — "
+      "A3's contract is unenforceable")
 
-if ANCHOR in src:
+if ANCHOR in src and ANCHOR_SNAP in src:
     mut_dir = tempfile.mkdtemp(prefix="clilive-mut-")
     # Mirror the tree by symlink, overriding only cli.py.
     for entry in os.listdir(TREE):
@@ -182,10 +204,12 @@ if ANCHOR in src:
             os.symlink(os.path.join(TREE, entry), os.path.join(mut_dir, entry))
         except OSError:
             pass
-    Path(mut_dir, "cli.py").write_text(
-        src.replace(ANCHOR, "    user_config_path = %s / 'config.yaml'" % SNAP_NAME, 1),
-        encoding="utf-8",
-    )
+    mutated = src.replace(
+        ANCHOR, "    user_config_path = %s / 'config.yaml'" % SNAP_NAME, 1)
+    # revert the snapshot too — this is the pre-#21 world
+    mutated = mutated.replace(
+        ANCHOR_SNAP, "_IMPORT_TIME_HERMES_HOME = get_hermes_home()", 1)
+    Path(mut_dir, "cli.py").write_text(mutated, encoding="utf-8")
     env = {**os.environ, "PYTHONPATH": mut_dir}
     env.pop("HERMES_HOME", None)
     p = subprocess.run([PY, "-c", textwrap.dedent(SCOPED)], capture_output=True,
@@ -199,6 +223,67 @@ if ANCHOR in src:
     check("C2 MUTANT returns the FROZEN profile B config (killed by A4)",
           mut_model == "PROFILE-B",
           f"mutant returned {mut_model!r}; expected the pre-fix behaviour")
+    MUT_DIR = mut_dir
+else:
+    MUT_DIR = None
+
+
+print("\nD. THE ENV BRIDGE — importing inside profile B must not export B's "
+      "settings into the shared environment")
+
+# The import-time bridge (_export_config_to_env, #20) writes ~20 values into
+# process-global os.environ and they OUTLIVE the scope that was active when the
+# import happened.  HERMES_SEARCH_SLOW_MS is the cheapest observable of that
+# bridge: it is a plain scalar copied straight out of sessions.search_slow_ms.
+for _h, _v in ((HOME_A, 111), (HOME_B, 999)):
+    _p = Path(_h, "config.yaml")
+    _p.write_text(_p.read_text(encoding="utf-8")
+                  + "sessions:\n  search_slow_ms: %d\n" % _v, encoding="utf-8")
+
+BRIDGE = """
+    import os
+    os.environ["HERMES_HOME"] = %(A)r
+    os.environ.pop("HERMES_SEARCH_SLOW_MS", None)
+    from hermes_constants import (set_hermes_home_override,
+                                  reset_hermes_home_override)
+    tok = set_hermes_home_override(%(B)r)
+    import cli                      # first import, inside profile B
+    reset_hermes_home_override(tok)
+    print("slow_ms:", os.environ.get("HERMES_SEARCH_SLOW_MS"))
+""" % {"A": HOME_A, "B": HOME_B}
+
+rc, out_d = child(BRIDGE)
+d_slow = field(out_d, "slow_ms")
+print(f"    exported slow_ms: {d_slow}")
+check("D0 the bridge child ran and the bridge fired at all (non-vacuity)",
+      rc == 0 and d_slow not in ("<MISSING>", "None"),
+      f"rc={rc} slow_ms={d_slow!r} out={out_d[-300:]} — an unset value here "
+      f"means the export never ran, so D1 would pass for free")
+check("D1 the exported value is profile A's (the process home), not B's",
+      d_slow == "111",
+      f"got {d_slow!r}; '999' means profile B's setting leaked into the "
+      f"shared environment and outlived its scope")
+
+
+print("\nE. MUTANT FOR D — the pre-#21 snapshot must leak B's setting")
+
+if MUT_DIR is None:
+    check("E0 a mutant tree was built (else D1 has no kill)", False,
+          "C section did not build a mutant; D1 is unfalsified")
+else:
+    _env = {**os.environ, "PYTHONPATH": MUT_DIR}
+    _env.pop("HERMES_HOME", None)
+    _p = subprocess.run([PY, "-c", textwrap.dedent(BRIDGE)], capture_output=True,
+                        text=True, env=_env, cwd=MUT_DIR, timeout=180)
+    _o = (_p.stdout or "") + (_p.stderr or "")
+    e_slow = field(_o, "slow_ms")
+    print(f"    mutant exported slow_ms: {e_slow}")
+    check("E0 the mutant bridge child ran", _p.returncode == 0 and e_slow != "<MISSING>",
+          f"rc={_p.returncode} out={_o[-300:]}")
+    check("E1 MUTANT exports profile B's 999 (so D1 has a real kill)",
+          e_slow == "999",
+          f"mutant exported {e_slow!r}; if this is 111 the mutation did not "
+          f"reach the bridge and D1 proves nothing")
 
 
 def test_cli_config_live_resolve() -> None:
