@@ -1512,6 +1512,12 @@ class APIServerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        # Strong references to in-flight accept-only turns. asyncio only holds
+        # a WEAK reference to a task, so a bare create_task can be collected
+        # mid-flight and the turn vanishes with no error logged anywhere —
+        # exactly the silent-loss shape the accept path exists to remove.
+        self._accepted_chat_tasks: set = set()
+        self._handoff_store_cached = None
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -4786,6 +4792,35 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
+        # --- ACCEPT-ONLY PATH -------------------------------------------------
+        # body {"wait": false} means: enqueue this turn and answer NOW.
+        #
+        # WHY: the caller's POST otherwise blocks for this entire agent turn.
+        # A ten-minute turn is indistinguishable from a dead host at the call
+        # site, so `hermes peer dm` reported completed work as "Could not reach
+        # peer" while the reply sat persisted here, unread (issue #3).
+        #
+        # THE RESPONSE CONTRACT, and it is load-bearing (PR #17): an accept
+        # response MUST NOT carry assistant content. The sender decides whether
+        # a turn completed by looking at the SHAPE of what came back — content
+        # present means finished, absent means genuinely enqueued. That is what
+        # lets an old sender talk to a new peer and vice versa without a
+        # version probe. Putting a placeholder string in `message.content` here
+        # would make every accept look like a finished turn.
+        if body.get("wait") is False:
+            return await self._enqueue_session_chat(
+                session_id=session_id,
+                user_message=user_message,
+                system_prompt=system_prompt,
+                gateway_session_key=gateway_session_key,
+                route=route,
+                session_model=session_model,
+                runtime_request=runtime_request,
+                lock_active=lock_active,
+                agent_overrides=agent_overrides,
+                requesting_user=str(body.get("from") or body.get("peer") or "peer"),
+            )
+
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -4832,6 +4867,129 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             headers=headers,
         )
+
+    async def _enqueue_session_chat(
+        self,
+        *,
+        session_id: str,
+        user_message: Any,
+        system_prompt: Any,
+        gateway_session_key: Any,
+        route: Any,
+        session_model: Any,
+        runtime_request: Dict[str, Any],
+        lock_active: bool,
+        agent_overrides: Dict[str, Any],
+        requesting_user: str,
+    ) -> "web.Response":
+        """Run the turn in the background; answer the caller immediately.
+
+        Returns a response with NO assistant content — see the contract note at
+        the call site. The turn's result is persisted to the session exactly as
+        a synchronous turn would persist it, so a caller that later reads the
+        session sees the same bytes it would have seen by waiting.
+
+        AN ACCEPTED TURN THAT NEVER ANSWERS MUST BE DETECTABLE. The blocking
+        POST was (badly) serving as that guarantee: if it returned, the work
+        happened. Returning early removes it, so an `open` handoff row takes
+        its place — `HandoffStore.stale()` then answers "what was accepted and
+        never finished". Without this the change trades a loud false failure
+        for a silent real one, which is the trade every other defect in this
+        area has made.
+        """
+        from gateway.handoff import DEFERRED, DELIVERED, HandoffStore
+
+        store = self._handoff_store()
+        handoff = None
+        if store is not None:
+            try:
+                handoff = store.open_handoff(
+                    from_session=str(requesting_user),
+                    to_session=session_id,
+                    requesting_user=str(requesting_user),
+                    intent=str(user_message)[:2000],
+                )
+            except Exception:
+                # A record failure must not swallow the work, but it MUST be
+                # visible: without the row there is no staleness signal, so
+                # log loudly rather than proceeding quietly.
+                logger.exception(
+                    "peer accept: could not open a handoff row for session %s — "
+                    "this turn will run UNTRACKED", session_id,
+                )
+
+        async def _run_and_record() -> None:
+            try:
+                history = await self._conversation_history_for_session(session_id)
+                await self._run_agent(
+                    user_message=user_message,
+                    conversation_history=history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
+                    session_model=session_model,
+                    requested_runtime=runtime_request.get("requested") or {},
+                    route_source=runtime_request.get("route_source") or "global",
+                    confirmed_runtime_lock=lock_active,
+                    **agent_overrides,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "peer accept: background turn failed for session %s", session_id
+                )
+                if store is not None and handoff is not None:
+                    try:
+                        store.record(handoff.id, DEFERRED, reason=f"TURN_FAILED: {exc}"[:300])
+                    except Exception:
+                        logger.exception("peer accept: could not record turn failure")
+                return
+            if store is not None and handoff is not None:
+                try:
+                    store.record(handoff.id, DELIVERED)
+                except Exception:
+                    logger.exception("peer accept: could not record completion")
+
+        task = asyncio.create_task(_run_and_record())
+        # Hold a reference. A bare create_task can be garbage-collected
+        # mid-flight, which would drop the turn with no error anywhere — the
+        # same silent-loss shape this whole change exists to remove.
+        self._accepted_chat_tasks.add(task)
+        task.add_done_callback(self._accepted_chat_tasks.discard)
+
+        payload: Dict[str, Any] = {
+            "object": "hermes.session.chat.accepted",
+            "session_id": session_id,
+            "accepted": True,
+        }
+        if handoff is not None:
+            payload["handoff_id"] = handoff.id
+        headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response(payload, status=202, headers=headers)
+
+    def _handoff_store(self):
+        """The shared handoff record, or None if it cannot be opened.
+
+        None is a degraded mode, never a silent one: the caller logs when a row
+        cannot be written so an untracked turn is visible in the log even
+        though it is absent from the record.
+        """
+        cached = getattr(self, "_handoff_store_cached", None)
+        if cached is not None:
+            return cached
+        try:
+            from gateway.handoff import HandoffStore
+            from hermes_constants import get_hermes_home
+
+            path = os.path.join(str(get_hermes_home()), "handoffs.jsonl")
+            store = HandoffStore(path, author="api_server")
+        except Exception:
+            logger.exception("peer accept: handoff store unavailable")
+            return None
+        self._handoff_store_cached = store
+        return store
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
