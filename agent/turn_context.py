@@ -158,8 +158,9 @@ def _recall_indicator_config() -> dict:
     — which additionally means an edited config.yaml is picked up on the next
     turn instead of requiring a restart.
 
-    ``agent/relay_runtime.py::_SEGMENTS_CONFIG`` still has the unkeyed shape
-    and leaks the same way; that is a separate fix with a separate subject.
+    ``agent/relay_runtime.py::_SEGMENTS_CONFIG_CACHE`` had the identical
+    unkeyed shape and leaked the same way; fixed with the same key shape
+    (Ash, 2026-09-15).
     """
     key: Any
     try:

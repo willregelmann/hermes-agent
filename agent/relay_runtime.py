@@ -181,45 +181,72 @@ class RelaySession:
 # scope lifecycle is byte-identical to the pre-segmentation behavior.
 # ---------------------------------------------------------------------------
 
-_SEGMENTS_CONFIG: dict[str, Any] | None = None
+_SEGMENTS_CONFIG_CACHE: dict[Any, dict[str, Any]] = {}
 _SEGMENTS_CONFIG_LOCK = threading.Lock()
 
 
 def _segments_config() -> dict[str, Any]:
-    """Resolve session-segmentation settings; inert defaults when unset."""
-    global _SEGMENTS_CONFIG
-    if _SEGMENTS_CONFIG is None:
-        with _SEGMENTS_CONFIG_LOCK:
-            if _SEGMENTS_CONFIG is None:
-                on_compaction = False
-                max_turns = 0
-                try:
-                    from gateway.run import _load_gateway_config  # late import
+    """Resolve session-segmentation settings; inert defaults when unset.
 
-                    telemetry = (
-                        (_load_gateway_config().get("gateway") or {}).get(
-                            "telemetry"
-                        )
-                        or {}
-                    )
-                    segments = telemetry.get("session_segments") or {}
-                    on_compaction = bool(segments.get("on_compaction", False))
-                    try:
-                        max_turns = max(0, int(segments.get("max_turns", 0) or 0))
-                    except (TypeError, ValueError):
-                        max_turns = 0
-                except Exception:  # noqa: BLE001 - config absence must not crash
-                    pass
-                _SEGMENTS_CONFIG = {
-                    "on_compaction": on_compaction,
-                    "max_turns": max_turns,
-                }
-    return _SEGMENTS_CONFIG
+    KEYED, NOT A BARE GLOBAL — same fix as
+    ``agent/turn_context.py::_recall_indicator_config`` (Wren, 2026-09-13),
+    applied here because this cache has the identical unkeyed shape and the
+    same profile-bleed hazard: ``_load_gateway_config`` resolves its path
+    through a per-turn profile-aware lookup, so a bare module global would
+    let the first profile to rotate segments pin the setting for every other
+    profile until restart. Keyed by (path, st_mtime_ns, st_size), matching
+    ``agent/skill_utils.py::_load_raw_config``. Latent rather than live today
+    only because ``profiles/`` is empty on this box.
+    """
+    key: Any
+    try:
+        from hermes_cli.config import get_config_path  # late import
+
+        p = get_config_path()
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+    except Exception:
+        key = None
+
+    if key is not None:
+        hit = _SEGMENTS_CONFIG_CACHE.get(key)
+        if hit is not None:
+            return hit
+
+    on_compaction = False
+    max_turns = 0
+    try:
+        from gateway.run import _load_gateway_config  # late import
+
+        telemetry = (
+            (_load_gateway_config().get("gateway") or {}).get(
+                "telemetry"
+            )
+            or {}
+        )
+        segments = telemetry.get("session_segments") or {}
+        on_compaction = bool(segments.get("on_compaction", False))
+        try:
+            max_turns = max(0, int(segments.get("max_turns", 0) or 0))
+        except (TypeError, ValueError):
+            max_turns = 0
+    except Exception:  # noqa: BLE001 - config absence must not crash
+        pass
+
+    result = {
+        "on_compaction": on_compaction,
+        "max_turns": max_turns,
+    }
+
+    if key is not None:
+        with _SEGMENTS_CONFIG_LOCK:
+            _SEGMENTS_CONFIG_CACHE[key] = result
+    return result
 
 
 def _reset_segments_config_for_tests() -> None:
-    global _SEGMENTS_CONFIG
-    _SEGMENTS_CONFIG = None
+    with _SEGMENTS_CONFIG_LOCK:
+        _SEGMENTS_CONFIG_CACHE.clear()
 
 
 class RelayOperationLease:
