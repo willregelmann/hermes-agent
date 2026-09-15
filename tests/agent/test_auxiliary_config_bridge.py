@@ -24,9 +24,9 @@ def _run_auxiliary_bridge(config_dict, monkeypatch):
     # Clear env vars
     for key in (
         "AUXILIARY_VISION_PROVIDER", "AUXILIARY_VISION_MODEL",
-        "AUXILIARY_VISION_BASE_URL", "AUXILIARY_VISION_API_KEY",
+        "AUXILIARY_VISION_BASE_URL",
         "AUXILIARY_APPROVAL_PROVIDER", "AUXILIARY_APPROVAL_MODEL",
-        "AUXILIARY_APPROVAL_BASE_URL", "AUXILIARY_APPROVAL_API_KEY",
+        "AUXILIARY_APPROVAL_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -40,13 +40,11 @@ def _run_auxiliary_bridge(config_dict, monkeypatch):
                 "provider": "AUXILIARY_VISION_PROVIDER",
                 "model": "AUXILIARY_VISION_MODEL",
                 "base_url": "AUXILIARY_VISION_BASE_URL",
-                "api_key": "AUXILIARY_VISION_API_KEY",
             },
             "approval": {
                 "provider": "AUXILIARY_APPROVAL_PROVIDER",
                 "model": "AUXILIARY_APPROVAL_MODEL",
                 "base_url": "AUXILIARY_APPROVAL_BASE_URL",
-                "api_key": "AUXILIARY_APPROVAL_API_KEY",
             },
         }
         for task_key, env_map in aux_task_env.items():
@@ -56,15 +54,12 @@ def _run_auxiliary_bridge(config_dict, monkeypatch):
             prov = str(task_cfg.get("provider", "")).strip()
             model = str(task_cfg.get("model", "")).strip()
             base_url = str(task_cfg.get("base_url", "")).strip()
-            api_key = str(task_cfg.get("api_key", "")).strip()
             if prov and prov != "auto":
                 os.environ[env_map["provider"]] = prov
             if model:
                 os.environ[env_map["model"]] = model
             if base_url:
                 os.environ[env_map["base_url"]] = base_url
-            if api_key:
-                os.environ[env_map["api_key"]] = api_key
 
 
 # ── Config bridging tests ────────────────────────────────────────────────────
@@ -141,7 +136,9 @@ class TestGatewayBridgeCodeParity:
         assert 'f"AUXILIARY_{_upper}_PROVIDER"' in content
         assert 'f"AUXILIARY_{_upper}_MODEL"' in content
         assert 'f"AUXILIARY_{_upper}_BASE_URL"' in content
-        assert 'f"AUXILIARY_{_upper}_API_KEY"' in content
+        # No API_KEY writer: AUXILIARY_{TASK}_API_KEY had no reader anywhere
+        # in the tree and was removed 2026-09-15 along with its doc entry.
+        assert 'f"AUXILIARY_{_upper}_API_KEY"' not in content
         # Built-in bridged keys present
         assert "_aux_bridged_keys" in content
         assert '"vision"' in content
@@ -243,3 +240,27 @@ class TestCLIDefaultsHaveAuxiliaryKeys:
         assert "auxiliary_config = defaults.get(\"auxiliary\"" in source
         assert "AUXILIARY_VISION_PROVIDER" in source
         assert "AUXILIARY_VISION_MODEL" in source
+
+    def test_cli_bridge_has_no_api_key_writer(self):
+        """cli.py's half of the same removal, asserted the way run.py's half
+        is (see test_gateway_has_auxiliary_bridge's api_key check).
+
+        The gateway/run.py bridge's own suite asserted no API-key writer was
+        re-added there; nothing in this file executed or inspected cli.py's
+        bridge at all, so re-adding the writer here was invisible to the
+        whole suite (Wren, PR review). Reads the region by its own
+        delimiters and strips comments, so the explanatory NOTE that names
+        the variable does not self-trip, and a dynamically assembled
+        "AUXILIARY_" + task.upper() + "_API_KEY" is still caught.
+        """
+        import cli as _cli_mod
+        content = Path(_cli_mod.__file__).read_text(encoding="utf-8")
+        start = content.index("auxiliary_task_env = {")
+        end = content.index("# Security settings", start)
+        code = "\n".join(
+            line for line in content[start:end].splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "api_key" not in code.lower(), (
+            "cli.py auxiliary bridge must not read or write api_key"
+        )

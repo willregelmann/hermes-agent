@@ -2660,6 +2660,12 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         except Exception:
             return "bot-chat delivery failed: hermes CLI not resolvable"
 
+    # Deliberately a full os.environ.copy(), not build_subprocess_env(scrub_secrets=True):
+    # this child is a full agent invocation and needs real provider credentials
+    # (ANTHROPIC_API_KEY etc.) to run at all. Scrubbing here breaks every
+    # bot-chat cron delivery — measured, not theoretical. See writers PR
+    # 2026-09-15 for the sibling case this comment was promised alongside
+    # (removal of the dead AUXILIARY_*_API_KEY env writers).
     env = os.environ.copy()
     if profile:
         argv += ["-p", profile]

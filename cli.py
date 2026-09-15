@@ -755,13 +755,11 @@ def load_cli_config() -> Dict[str, Any]:
             "provider": "AUXILIARY_VISION_PROVIDER",
             "model": "AUXILIARY_VISION_MODEL",
             "base_url": "AUXILIARY_VISION_BASE_URL",
-            "api_key": "AUXILIARY_VISION_API_KEY",
         },
         "approval": {
             "provider": "AUXILIARY_APPROVAL_PROVIDER",
             "model": "AUXILIARY_APPROVAL_MODEL",
             "base_url": "AUXILIARY_APPROVAL_BASE_URL",
-            "api_key": "AUXILIARY_APPROVAL_API_KEY",
         },
     }
     
@@ -772,15 +770,21 @@ def load_cli_config() -> Dict[str, Any]:
         prov = str(task_cfg.get("provider", "")).strip()
         model = str(task_cfg.get("model", "")).strip()
         base_url = str(task_cfg.get("base_url", "")).strip()
-        api_key = str(task_cfg.get("api_key", "")).strip()
         if prov and prov != "auto":
             os.environ[env_map["provider"]] = prov
         if model:
             os.environ[env_map["model"]] = model
         if base_url:
             os.environ[env_map["base_url"]] = base_url
-        if api_key:
-            os.environ[env_map["api_key"]] = api_key
+        # NOTE: no api_key writer here. AUXILIARY_{TASK}_API_KEY has never had a
+        # reader in agent/auxiliary_client.py or elsewhere in the tree — the
+        # per-task api_key config value never left config.yaml. Removed
+        # 2026-09-15 (writer + doc entry) rather than adding a reader nobody
+        # asked for. Correction (Wren, PR review): AUXILIARY_{TASK}_BASE_URL and
+        # _PROVIDER have no getenv reader either — only _MODEL does. There is
+        # no live 'credential path' bridged through these env vars at all; the
+        # actual auxiliary credential resolution is in auxiliary_client.py,
+        # keyed off config.yaml directly.
     
     # Security settings
     security_config = defaults.get("security", {})
