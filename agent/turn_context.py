@@ -128,13 +128,21 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
         return True
 
 
-_RECALL_CFG_CACHE: Dict[Any, dict] = {}
-_RECALL_CFG_LOCK = threading.Lock()
+# path -> (st_mtime_ns, st_size, cfg). ONE ENTRY PER CONFIG FILE, not one per
+# edit: the freshness stamp lives in the VALUE, so re-reading an edited
+# config.yaml REPLACES its entry instead of adding a second one. The previous
+# shape put st_mtime_ns in the KEY, which is correct for staleness and
+# unbounded in edits. RLock, not Lock: the loader is called with the lock held
+# (that is what makes it load once) and it imports gateway.run, so a re-entrant
+# call must degrade to a redundant load rather than deadlock.
+_RECALL_CFG_CACHE: Dict[str, tuple] = {}
+_RECALL_CFG_LOCK = threading.RLock()
 
 
 def _recall_indicator_cache_clear() -> None:
     """Test hook — drop the config cache."""
-    _RECALL_CFG_CACHE.clear()
+    with _RECALL_CFG_LOCK:
+        _RECALL_CFG_CACHE.clear()
 
 
 def _recall_indicator_config() -> dict:
@@ -160,38 +168,53 @@ def _recall_indicator_config() -> dict:
 
     ``agent/relay_runtime.py::_SEGMENTS_CONFIG_CACHE`` had the identical
     unkeyed shape and leaked the same way; fixed with the same key shape
-    (Ash, 2026-09-15).
+    (Ash, 2026-09-15), and both sites carry the same bound and the same
+    load-under-lock discipline (Wren, 2026-09-16).
     """
-    key: Any
+    path_key: str | None
+    stamp: tuple
     try:
         from hermes_cli.config import get_config_path  # late import
 
         p = get_config_path()
         st = p.stat()
-        key = (str(p), st.st_mtime_ns, st.st_size)
+        path_key = str(p)
+        stamp = (st.st_mtime_ns, st.st_size)
     except Exception:
         # Cannot identify the config file — do not cache under a key that
         # could collide with a different profile's. Fall back to loading
         # fresh, which is slower and correct.
-        key = None
+        path_key = None
+        stamp = ()
 
-    if key is not None:
-        hit = _RECALL_CFG_CACHE.get(key)
-        if hit is not None:
-            return hit
+    if path_key is not None:
+        hit = _RECALL_CFG_CACHE.get(path_key)
+        if hit is not None and hit[:2] == stamp:
+            return hit[2]
 
-    try:
-        from gateway.run import _load_gateway_config  # late import
+    def _load() -> dict:
+        try:
+            from gateway.run import _load_gateway_config  # late import
 
-        cfg = _load_gateway_config() or {}
-    except Exception:
-        # No gateway on the path (plain CLI) or an unreadable config.
-        cfg = {}
+            return _load_gateway_config() or {}
+        except Exception:
+            # No gateway on the path (plain CLI) or an unreadable config.
+            return {}
 
-    if key is not None:
-        with _RECALL_CFG_LOCK:
-            _RECALL_CFG_CACHE[key] = cfg
-    return cfg
+    if path_key is None:
+        return _load()
+
+    # LOAD UNDER THE LOCK, re-checking first: keyed and loaded-once are
+    # separate properties. Storing under the lock but loading outside it means
+    # N concurrent first-callers each run the loader and the last write wins —
+    # idempotent, but N redundant config reads on a cold start.
+    with _RECALL_CFG_LOCK:
+        hit = _RECALL_CFG_CACHE.get(path_key)
+        if hit is not None and hit[:2] == stamp:
+            return hit[2]
+        cfg = _load()
+        _RECALL_CFG_CACHE[path_key] = (stamp[0], stamp[1], cfg)
+        return cfg
 
 
 def _recall_indicator_enabled(agent: Any) -> bool:

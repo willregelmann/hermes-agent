@@ -181,8 +181,11 @@ class RelaySession:
 # scope lifecycle is byte-identical to the pre-segmentation behavior.
 # ---------------------------------------------------------------------------
 
-_SEGMENTS_CONFIG_CACHE: dict[Any, dict[str, Any]] = {}
-_SEGMENTS_CONFIG_LOCK = threading.Lock()
+# path -> (st_mtime_ns, st_size, cfg). ONE ENTRY PER CONFIG FILE, not one per
+# edit — see agent/turn_context.py::_RECALL_CFG_CACHE for the same bound and
+# the same reason. RLock because the loader runs with the lock held.
+_SEGMENTS_CONFIG_CACHE: dict[str, tuple] = {}
+_SEGMENTS_CONFIG_LOCK = threading.RLock()
 
 
 def _segments_config() -> dict[str, Any]:
@@ -198,50 +201,64 @@ def _segments_config() -> dict[str, Any]:
     ``agent/skill_utils.py::_load_raw_config``. Latent rather than live today
     only because ``profiles/`` is empty on this box.
     """
-    key: Any
+    path_key: str | None
+    stamp: tuple
     try:
         from hermes_cli.config import get_config_path  # late import
 
         p = get_config_path()
         st = p.stat()
-        key = (str(p), st.st_mtime_ns, st.st_size)
+        path_key = str(p)
+        stamp = (st.st_mtime_ns, st.st_size)
     except Exception:
-        key = None
+        path_key = None
+        stamp = ()
 
-    if key is not None:
-        hit = _SEGMENTS_CONFIG_CACHE.get(key)
-        if hit is not None:
-            return hit
+    if path_key is not None:
+        hit = _SEGMENTS_CONFIG_CACHE.get(path_key)
+        if hit is not None and hit[:2] == stamp:
+            return hit[2]
 
-    on_compaction = False
-    max_turns = 0
-    try:
-        from gateway.run import _load_gateway_config  # late import
-
-        telemetry = (
-            (_load_gateway_config().get("gateway") or {}).get(
-                "telemetry"
-            )
-            or {}
-        )
-        segments = telemetry.get("session_segments") or {}
-        on_compaction = bool(segments.get("on_compaction", False))
+    def _load() -> dict[str, Any]:
+        on_compaction = False
+        max_turns = 0
         try:
-            max_turns = max(0, int(segments.get("max_turns", 0) or 0))
-        except (TypeError, ValueError):
-            max_turns = 0
-    except Exception:  # noqa: BLE001 - config absence must not crash
-        pass
+            from gateway.run import _load_gateway_config  # late import
 
-    result = {
-        "on_compaction": on_compaction,
-        "max_turns": max_turns,
-    }
+            telemetry = (
+                (_load_gateway_config().get("gateway") or {}).get(
+                    "telemetry"
+                )
+                or {}
+            )
+            segments = telemetry.get("session_segments") or {}
+            on_compaction = bool(segments.get("on_compaction", False))
+            try:
+                max_turns = max(0, int(segments.get("max_turns", 0) or 0))
+            except (TypeError, ValueError):
+                max_turns = 0
+        except Exception:  # noqa: BLE001 - config absence must not crash
+            pass
+        return {
+            "on_compaction": on_compaction,
+            "max_turns": max_turns,
+        }
 
-    if key is not None:
-        with _SEGMENTS_CONFIG_LOCK:
-            _SEGMENTS_CONFIG_CACHE[key] = result
-    return result
+    if path_key is None:
+        return _load()
+
+    # LOAD UNDER THE LOCK, re-checking first. The pre-keying version was
+    # double-checked locking and DID load once; keying it moved the load out
+    # from under the lock, so N concurrent first-callers each read config.yaml
+    # and the last write won. Idempotent, but the load-once property was a
+    # property, and it is restored here.
+    with _SEGMENTS_CONFIG_LOCK:
+        hit = _SEGMENTS_CONFIG_CACHE.get(path_key)
+        if hit is not None and hit[:2] == stamp:
+            return hit[2]
+        result = _load()
+        _SEGMENTS_CONFIG_CACHE[path_key] = (stamp[0], stamp[1], result)
+        return result
 
 
 def _reset_segments_config_for_tests() -> None:
