@@ -43,7 +43,7 @@ from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Mapping
+from typing import List, Dict, Any, Optional, Mapping, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -418,7 +418,7 @@ def _parse_service_tier_config(raw: str) -> str | None:
     logger.warning("Unknown service_tier '%s', ignoring", raw)
     return None
 
-def load_cli_config() -> Dict[str, Any]:
+def _load_cli_config_impl() -> Tuple[Dict[str, Any], bool]:
     """
     Load CLI configuration from config files.
     
@@ -680,6 +680,40 @@ def load_cli_config() -> Dict[str, Any]:
     elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)
     
+    return defaults, _file_has_terminal_config
+
+
+def load_cli_config() -> Dict[str, Any]:
+    """Resolve the CLI config for the CURRENT hermes home.  Pure read.
+
+    #20: this used to also export ~20 values into process-global ``os.environ``.
+    It no longer does.  Since #19 the loader resolves ``get_hermes_home()`` on
+    every call, so calling it from inside another profile's home scope is a
+    normal and correct thing to do -- and it must not leave that profile's
+    settings behind in the shared environment.  The env bridge now lives in
+    ``_export_config_to_env()`` and runs exactly once, at import.
+    """
+    return _load_cli_config_impl()[0]
+
+
+def _export_config_to_env(defaults: Dict[str, Any], _file_has_terminal_config: bool = False) -> None:
+    """Bridge resolved config values into process-global ``os.environ``.
+
+    Split out of ``load_cli_config()`` for #20.  This is the ONLY part of the
+    loader that writes process-global state, and it must stay that way: the
+    loader resolves ``get_hermes_home()`` live (#19), so a caller running under
+    another profile's home scope would otherwise export THAT profile's
+    ``HERMES_CJK_FTS`` / ``HERMES_SEARCH_SLOW_MS`` / ``HERMES_REDACT_SECRETS`` /
+    ``TERMINAL_*`` into the shared environment — and they persist after the
+    scope exits.  Call this exactly once, at import time, from the process that
+    owns the environment.  Everything else calls ``load_cli_config()``, which
+    is now a pure read.
+    """
+    # ``load_cli_config()`` normalized this in place -- ``terminal_config`` is the
+    # same object as ``defaults["terminal"]``, backend/env_type and cwd already
+    # resolved.
+    terminal_config = defaults.get("terminal", {})
+
     env_mappings = {
         "env_type": "TERMINAL_ENV",
         "degraded_mode": "TERMINAL_DEGRADED_MODE",
@@ -810,10 +844,13 @@ def load_cli_config() -> Dict[str, Any]:
                 sessions_config["search_slow_ms"]
             )
 
-    return defaults
 
-# Load configuration at module startup
-CLI_CONFIG = load_cli_config()
+
+# Load configuration at module startup.  This is the ONE site that is allowed to
+# bridge config -> os.environ (#20): it runs at import, in the process that owns
+# the environment, before any per-profile home scope exists.
+CLI_CONFIG, _CLI_CONFIG_FILE_HAS_TERMINAL = _load_cli_config_impl()
+_export_config_to_env(CLI_CONFIG, _CLI_CONFIG_FILE_HAS_TERMINAL)
 
 
 # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
