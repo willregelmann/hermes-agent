@@ -2769,7 +2769,6 @@ if _config_path.exists():
                 _prov = str(_task_cfg.get("provider", "")).strip()
                 _model = str(_task_cfg.get("model", "")).strip()
                 _base_url = str(_task_cfg.get("base_url", "")).strip()
-                _api_key = str(_task_cfg.get("api_key", "")).strip()
                 _upper = _task_key.upper()
                 if _prov and _prov != "auto":
                     os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
@@ -2777,8 +2776,9 @@ if _config_path.exists():
                     os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
                 if _base_url:
                     os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
-                if _api_key:
-                    os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
+                # NOTE: no AUXILIARY_{TASK}_API_KEY writer here — nothing in
+                # the tree ever reads it (see cli.py's mirror of this bridge
+                # for the full note). Removed 2026-09-15.
         # config.yaml is the documented, authoritative source for these
         # settings — it unconditionally wins over .env values. Previously
         # the guards below read `if X not in os.environ` and let stale

@@ -1597,14 +1597,13 @@ If you use Codex OAuth as your main model provider, vision works automatically �
 
 ### Environment Variables (legacy)
 
-Auxiliary models can also be configured via environment variables. However, `config.yaml` is the preferred method — it's easier to manage and supports all options including `base_url` and `api_key`.
+Auxiliary models can also be configured via environment variables for `provider`/`model`/`base_url`. However, `config.yaml` is the preferred method — it's the only way to set `api_key` (there is no `AUXILIARY_*_API_KEY` env var).
 
 | Setting | Environment Variable |
 |---------|---------------------|
 | Vision provider | `AUXILIARY_VISION_PROVIDER` |
 | Vision model | `AUXILIARY_VISION_MODEL` |
 | Vision endpoint | `AUXILIARY_VISION_BASE_URL` |
-| Vision API key | `AUXILIARY_VISION_API_KEY` |
 
 Compression and fallback model settings are config.yaml-only. (`AUXILIARY_WEB_EXTRACT_*` variables are obsolete — web extraction no longer uses an auxiliary LLM.)
 
