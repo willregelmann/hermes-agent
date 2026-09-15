@@ -480,11 +480,49 @@ def cmd_peer(args) -> int:
             return 1
 
         if not wait:
+            # THE PEER DECIDES WHETHER wait:false MEANT ANYTHING. An older
+            # peer -- which today is EVERY peer, the receiver half of issue #3
+            # is not built -- ignores the unknown key, runs the whole turn
+            # synchronously, and returns the finished reply in THIS response.
+            # Announcing "reply will arrive as an inbound DM" there discards a
+            # completed answer and promises a message that will never be sent:
+            # the same lost-reply bug this flag exists to fix, with the sender
+            # rather than the socket doing the losing.
+            #
+            # The response shape is the evidence, and it is unambiguous: an
+            # ACCEPTED turn has no assistant content yet, a COMPLETED one does.
+            # No capability probe, no version check -- the answer in hand
+            # outranks anything the peer says about itself.
+            completed = ""
+            msg = result.get("message")
+            if isinstance(msg, dict):
+                completed = str(msg.get("content") or "")
+            if completed.strip():
+                payload = {
+                    "peer": peer_name,
+                    "profile": profile,
+                    "session_id": result.get("session_id") or session_id,
+                    "accepted": True,
+                    "honored_no_wait": False,
+                    "reply": completed,
+                }
+                if getattr(args, "json", False):
+                    print(json.dumps(payload))
+                else:
+                    print(completed)
+                    print(
+                        f"Note: peer '{peer_name}' does not support --no-wait and ran "
+                        f"the turn synchronously; the reply above is the whole answer "
+                        f"and no inbound DM is coming.",
+                        file=sys.stderr,
+                    )
+                return 0
             payload = {
                 "peer": peer_name,
                 "profile": profile,
                 "session_id": result.get("session_id") or session_id,
                 "accepted": True,
+                "honored_no_wait": True,
                 "message_id": result.get("message_id") or result.get("id"),
             }
             if getattr(args, "json", False):
