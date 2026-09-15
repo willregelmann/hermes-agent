@@ -37,8 +37,23 @@ def case(name, ok, detail=""):
 
 
 HOST = socket.gethostname().split(".", 1)[0]
+
+#  Lesson (ash862, PR #24 review): a fixture that hardcodes a peer NAME is
+#  silently host-bound. The predicate under test derives remoteness from
+#  socket.gethostname() on whichever box runs it, so a literal peer name is
+#  a peer on one box and is SELF on the other -- and every exemption case
+#  then reads as refused against a perfectly correct guard.
+#  Two destinations, deliberately distinct:
+#    SYNTH -- constructed FROM this host, so it can never equal it. Used for
+#             the exemption-positive cases: host-independent by construction.
+#    PEER  -- the real other box, resolved per-host, so one case still pins
+#             the actual name used in production.
+REAL_BOXES = ("ha-pi", "will-MS-7B93")
+_others = [b for b in REAL_BOXES if b != HOST]
+PEER = f"{_others[0]}.local"
+SYNTH = f"not-{HOST}-peer.local"
 SSH = ("ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 "
-       "-i /home/will/.ssh/id_ed25519 will@will-MS-7B93.local")
+       f"-i /home/will/.ssh/id_ed25519 will@{SYNTH}")
 
 print("=== MUST STILL BLOCK (the guard's actual job) ===")
 case("local systemctl restart is blocked",
@@ -60,26 +75,26 @@ case("VARIABLE destination is blocked (unknowable at scan time)",
 case("backtick destination is blocked",
      blocked("ssh `cat host.txt` systemctl --user restart hermes-gateway") is True)
 case("ssh-lookalike leader is blocked (myssh is not ssh)",
-     blocked("myssh will-MS-7B93.local systemctl --user restart hermes-gateway") is True)
+     blocked(f"myssh {SYNTH} systemctl --user restart hermes-gateway") is True)
 case("no-ssh remote-looking prose is still blocked",
-     blocked("will-MS-7B93.local: systemctl --user restart hermes-gateway") is True)
+     blocked(f"{SYNTH}: systemctl --user restart hermes-gateway") is True)
 
 print()
 print("=== MUST NOW ALLOW (the peer-restart path) ===")
 case("plain ssh to a PEER host is allowed",
-     blocked("ssh will-MS-7B93.local systemctl --user restart hermes-gateway") is False,
+     blocked(f"ssh {SYNTH} systemctl --user restart hermes-gateway") is False,
      "still blocked")
 case("ssh with user@peer is allowed",
-     blocked("ssh will@will-MS-7B93.local systemctl --user restart hermes-gateway") is False,
+     blocked(f"ssh will@{SYNTH} systemctl --user restart hermes-gateway") is False,
      "still blocked")
 case("ssh with the real option soup I actually use is allowed",
      blocked(f"{SSH} 'systemctl --user restart hermes-gateway'") is False,
      "still blocked")
 case("absolute-path ssh binary is allowed",
-     blocked("/usr/bin/ssh will-MS-7B93.local systemctl --user restart hermes-gateway") is False,
+     blocked(f"/usr/bin/ssh {SYNTH} systemctl --user restart hermes-gateway") is False,
      "still blocked")
 case("peer hermes gateway restart is allowed",
-     blocked("ssh will-MS-7B93.local hermes gateway restart") is False,
+     blocked(f"ssh {PEER} hermes gateway restart") is False,
      "still blocked")
 
 print()
@@ -89,19 +104,25 @@ print("=== NON-VACUITY: these cases must be able to fail ===")
 from cron.lifecycle_guard import _ssh_target_is_remote  # noqa: E402
 
 case("predicate says peer host IS remote",
-     _ssh_target_is_remote(["ssh", "will-MS-7B93.local", "systemctl"]) is True)
+     _ssh_target_is_remote(["ssh", SYNTH, "systemctl"]) is True)
 case("predicate says localhost is NOT remote",
      _ssh_target_is_remote(["ssh", "localhost", "systemctl"]) is False)
 case("predicate says own hostname is NOT remote",
      _ssh_target_is_remote(["ssh", HOST, "systemctl"]) is False)
+case("FIXTURE non-vacuity: neither destination is this host",
+     SYNTH.split(".", 1)[0] != HOST and PEER.split(".", 1)[0] != HOST,
+     f"fixture picked its own host ({HOST}); the exemption cases are vacuous")
+case("FIXTURE non-vacuity: this box is a known real box",
+     HOST in REAL_BOXES,
+     f"HOST={HOST} matches neither real box; PEER={PEER} is a guess")
 case("predicate fails closed on empty segment",
      _ssh_target_is_remote([]) is False)
 case("predicate fails closed on non-ssh leader",
-     _ssh_target_is_remote(["scp", "will-MS-7B93.local", "x"]) is False)
+     _ssh_target_is_remote(["scp", SYNTH, "x"]) is False)
 case("predicate skips option VALUES when finding the destination",
      _ssh_target_is_remote(
          ["ssh", "-i", "/home/will/.ssh/id_ed25519", "-o", "BatchMode=yes",
-          "will-MS-7B93.local", "systemctl"]) is True,
+          SYNTH, "systemctl"]) is True,
      "an option value was mistaken for the host")
 case("predicate does not mistake an option value FOR a host",
      _ssh_target_is_remote(["ssh", "-F", "/dev/null", "localhost", "x"]) is False,
