@@ -30,10 +30,16 @@ held and releases it on refusal.
 
 RECORD, NEVER REFUSES: gateway.handoff.HandoffStore. The WAKE refuses; the record
 never does. Every attempt gets an ``open`` row. Gate 2 refusal -> deferred with its
-own .reason. Gate 3 True -> deferred with reason=COMPRESSION_IN_FLIGHT (lease
-released first — a refused wake must not hold a lease it never used). Delivery
-success -> delivered. Delivery failure (deliver_wake raises) -> deferred with
-reason=DELIVERY_FAILED, lease released, exception re-raised so the caller sees it.
+own .reason. Gate 2 RAISING (damaged registry, track_liveness=True's one
+return-to-raise branch) -> deferred with reason=REGISTRY_UNAVAILABLE, re-raised as
+WakeRefused. Gate 3 True -> deferred with reason=COMPRESSION_IN_FLIGHT (lease
+released first — a refused wake must not hold a lease it never used). Gate 3
+RAISING (its internal fail-safe covers only the two sources it wraps) -> deferred
+with reason=GATE_ERROR, re-raised as WakeRefused. Delivery success -> delivered.
+Delivery failure (deliver_wake raises) -> deferred with reason=DELIVERY_FAILED,
+lease released, exception re-raised so the caller sees it. No path leaves a row
+dangling at ``open`` (Wren, PR #13 review, cases C/D) — every exit either
+transitions the row or the row was never opened.
 
 DESIGN INVARIANT, unchanged from the original review that started this work: wake
 takes (session_id, prompt) — an INTENT for the target session to act on, never a
@@ -51,6 +57,7 @@ from gateway.handoff import DELIVERED, DEFERRED, Handoff, HandoffStore
 from gateway.wake import deliver_wake
 from hermes_cli.active_sessions import (
     ActiveSessionLease,
+    ActiveSessionRegistryError,
     try_acquire_active_session,
 )
 
@@ -62,6 +69,12 @@ logger = logging.getLogger(__name__)
 COMPRESSION_IN_FLIGHT = "COMPRESSION_IN_FLIGHT"
 #: The delivery step (gateway.wake.deliver_wake) raised after both gates passed.
 DELIVERY_FAILED = "DELIVERY_FAILED"
+#: Gate 2 (try_acquire_active_session, track_liveness=True) raised instead of
+#: refusing — a damaged registry, not a normal ownership conflict.
+REGISTRY_UNAVAILABLE = "REGISTRY_UNAVAILABLE"
+#: Gate 3 (_session_has_compression_in_flight) raised instead of returning
+#: True/False — its internal fail-safe only covers the two sources it wraps.
+GATE_ERROR = "GATE_ERROR"
 
 
 class WakeRefused(RuntimeError):
@@ -102,12 +115,24 @@ async def wake(
     )
 
     # --- GATE 2: session lease (per-session exclusivity, unconditional) ----
-    lease, refusal = try_acquire_active_session(
-        session_id=to_session,
-        surface=surface,
-        config=config,
-        track_liveness=True,
-    )
+    # track_liveness=True is the one branch where a damaged registry RAISES
+    # ActiveSessionRegistryError instead of returning a refusal (Wren,
+    # PR #13 review) — catch it here so the open row still transitions
+    # instead of dangling at OPEN forever.
+    try:
+        lease, refusal = try_acquire_active_session(
+            session_id=to_session,
+            surface=surface,
+            config=config,
+            track_liveness=True,
+        )
+    except ActiveSessionRegistryError as exc:
+        deferred = handoff_store.record(h.id, DEFERRED, reason=REGISTRY_UNAVAILABLE)
+        logger.warning(
+            "wake %s deferred at gate 2: registry unavailable: %s", h.id, exc
+        )
+        raise WakeRefused(f"registry unavailable: {exc}", deferred) from exc
+
     if refusal is not None:
         deferred = handoff_store.record(h.id, DEFERRED, reason=str(refusal.reason))
         logger.info(
@@ -119,7 +144,24 @@ async def wake(
 
     try:
         # --- GATE 3: compression in flight (fail-safe: errors -> True) ----
-        in_flight = await runner._session_has_compression_in_flight(to_session)
+        # _session_has_compression_in_flight is fail-safe only for the two
+        # sources it wraps internally; anything else escaping (e.g. through
+        # _lookup_session_id_under_store_lock) must still transition the
+        # handoff row rather than leave it dangling at OPEN (Wren, PR #13
+        # review, case D).
+        try:
+            in_flight = await runner._session_has_compression_in_flight(to_session)
+        except WakeRefused:
+            raise
+        except Exception as exc:
+            deferred = handoff_store.record(h.id, DEFERRED, reason=GATE_ERROR)
+            logger.warning(
+                "wake %s deferred at gate 3: gate raised instead of returning: %s",
+                h.id,
+                exc,
+            )
+            raise WakeRefused(f"gate 3 raised: {exc}", deferred) from exc
+
         if in_flight:
             deferred = handoff_store.record(
                 h.id, DEFERRED, reason=COMPRESSION_IN_FLIGHT
