@@ -240,3 +240,27 @@ class TestCLIDefaultsHaveAuxiliaryKeys:
         assert "auxiliary_config = defaults.get(\"auxiliary\"" in source
         assert "AUXILIARY_VISION_PROVIDER" in source
         assert "AUXILIARY_VISION_MODEL" in source
+
+    def test_cli_bridge_has_no_api_key_writer(self):
+        """cli.py's half of the same removal, asserted the way run.py's half
+        is (see test_gateway_has_auxiliary_bridge's api_key check).
+
+        The gateway/run.py bridge's own suite asserted no API-key writer was
+        re-added there; nothing in this file executed or inspected cli.py's
+        bridge at all, so re-adding the writer here was invisible to the
+        whole suite (Wren, PR review). Reads the region by its own
+        delimiters and strips comments, so the explanatory NOTE that names
+        the variable does not self-trip, and a dynamically assembled
+        "AUXILIARY_" + task.upper() + "_API_KEY" is still caught.
+        """
+        import cli as _cli_mod
+        content = Path(_cli_mod.__file__).read_text(encoding="utf-8")
+        start = content.index("auxiliary_task_env = {")
+        end = content.index("# Security settings", start)
+        code = "\n".join(
+            line for line in content[start:end].splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "api_key" not in code.lower(), (
+            "cli.py auxiliary bridge must not read or write api_key"
+        )

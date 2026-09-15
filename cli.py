@@ -757,8 +757,11 @@ def load_cli_config() -> Dict[str, Any]:
         # reader in agent/auxiliary_client.py or elsewhere in the tree — the
         # per-task api_key config value never left config.yaml. Removed
         # 2026-09-15 (writer + doc entry) rather than adding a reader nobody
-        # asked for; see AUXILIARY_{TASK}_BASE_URL, which IS read, for the
-        # actual credential path when a custom endpoint is configured.
+        # asked for. Correction (Wren, PR review): AUXILIARY_{TASK}_BASE_URL and
+        # _PROVIDER have no getenv reader either — only _MODEL does. There is
+        # no live 'credential path' bridged through these env vars at all; the
+        # actual auxiliary credential resolution is in auxiliary_client.py,
+        # keyed off config.yaml directly.
     
     # Security settings
     security_config = defaults.get("security", {})
