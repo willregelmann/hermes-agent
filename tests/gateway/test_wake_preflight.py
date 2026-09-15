@@ -278,3 +278,18 @@ def test_gate3_raising_defers_and_releases_lease(collab, store):
     rows = s.all_latest()
     assert rows[0].status == DEFERRED
     assert collab["released"] == ["will"], "lease must be released even when the gate itself threw"
+
+
+# --- Wren's PR review case: the collab fixture monkeypatches WP's own
+# ActiveSessionRegistryError to make the raising cases work above, which
+# means no case in this file notices if wake_preflight ever caught a class
+# hermes_cli.active_sessions doesn't actually raise. A fake standing in for
+# the linkage cannot test the linkage -- so this one case takes no fixture
+# on purpose and checks the real symbol identity.
+
+def test_gate2_catches_the_class_active_sessions_actually_raises():
+    """collab monkeypatches WP.ActiveSessionRegistryError, so no other case
+    can notice if wake_preflight catches a class active_sessions never
+    raises. This case takes no fixture on purpose."""
+    import hermes_cli.active_sessions as real_as
+    assert WP.ActiveSessionRegistryError is real_as.ActiveSessionRegistryError
