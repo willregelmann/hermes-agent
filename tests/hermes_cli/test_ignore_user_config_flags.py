@@ -66,9 +66,16 @@ class TestIgnoreUserConfigEnvGate:
         (tmp_path / "config.yaml").write_text(config_yaml)
 
     def _reload_cli(self, monkeypatch, tmp_path):
-        """Point cli._hermes_home at tmp_path and return a fresh load_cli_config."""
+        """Point the LIVE hermes home at tmp_path and return load_cli_config.
+
+        ``load_cli_config()`` resolves ``get_hermes_home()`` on every call, so
+        the home is moved by the environment, not by patching a module
+        constant. (Patching ``cli._hermes_home`` stopped working when #11 made
+        the loader live; the constant is now ``_IMPORT_TIME_HERMES_HOME`` and
+        no runtime reader consults it.)
+        """
         import cli
-        monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         return cli.load_cli_config
 
     def test_user_config_loaded_when_flag_unset(self, tmp_path, monkeypatch):

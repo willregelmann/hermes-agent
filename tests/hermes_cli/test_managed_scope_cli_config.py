@@ -31,15 +31,19 @@ def homes(tmp_path, monkeypatch):
 def _load_cli_config(home):
     """Call cli.py's standalone loader fresh.
 
-    cli.py binds ``_hermes_home = get_hermes_home()`` at import time (module
-    singleton), so monkeypatching HERMES_HOME after import doesn't move it.
-    Point the module's cached home at the test's home for the duration of the
-    call. (In real use cli is imported once per process with the real home, so
-    this only matters for tests that swap HERMES_HOME.)
+    ``load_cli_config()`` resolves ``get_hermes_home()`` on every call (#11), so
+    the ``homes`` fixture's ``HERMES_HOME`` is enough to move it -- no module
+    constant needs patching. ``home`` is accepted so call sites read the same
+    and is asserted against the live resolver, which is what the loader will
+    actually use.
     """
     import cli
+    from hermes_constants import get_hermes_home
 
-    cli._hermes_home = home
+    assert str(get_hermes_home()) == str(home), (
+        "the live home is not the test home; this case would measure the wrong "
+        "config file"
+    )
     return cli.load_cli_config()
 
 

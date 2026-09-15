@@ -231,9 +231,16 @@ from hermes_cli.browser_connect import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import base_url_host_matches, base_url_hostname, fast_safe_load
 
-_hermes_home = get_hermes_home()
+# The home this module was IMPORTED under. Correct for import-time work only
+# (the dotenv load just below, which must happen once, at import, before any
+# profile scope exists). It is NOT the process home: nothing imports this
+# module eagerly, so on a multiplexed gateway the first lazy import can land
+# inside another profile's ``_profile_runtime_scope`` and freeze this to that
+# profile for the life of the process. Every RUNTIME reader must call
+# ``get_hermes_home()`` instead -- see #18 and the comment in load_cli_config().
+_IMPORT_TIME_HERMES_HOME = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+load_hermes_dotenv(hermes_home=_IMPORT_TIME_HERMES_HOME, project_env=_project_env)
 
 
 _REASONING_TAGS = (
@@ -353,7 +360,7 @@ def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
         return []
     path = Path(file_path).expanduser()
     if not path.is_absolute():
-        path = _hermes_home / path
+        path = get_hermes_home() / path
     if not path.exists():
         logger.warning("Prefill messages file not found: %s", path)
         return []
@@ -431,17 +438,17 @@ def load_cli_config() -> Dict[str, Any]:
     # Check user config first ({HERMES_HOME}/config.yaml)
     # RESOLVE LIVE, NOT FROM THE MODULE-BODY SNAPSHOT.
     #
-    # ``_hermes_home`` is assigned once in the module body. Nothing in the
+    # ``_IMPORT_TIME_HERMES_HOME`` is assigned once in the module body. Nothing in the
     # gateway imports this module eagerly — every reference is a function-local
     # lazy import — and on a multiplexed gateway ~30 of those call sites sit
     # inside ``_profile_runtime_scope``. So the FIRST lazy import freezes the
     # snapshot to whichever profile happened to be mid-turn, and it stays wrong
     # for the life of the process: after the scope exits and ``get_hermes_home()``
-    # is back to profile A, ``_hermes_home`` is still B and this function keeps
+    # is back to profile A, the import-time constant is still B and this function keeps
     # returning B's config.
     #
     # Measured against a reconstructed two-profile sequence: imported under
-    # home B with the process home A, ``cli._hermes_home`` stayed B and
+    # home B with the process home A, ``cli._IMPORT_TIME_HERMES_HOME`` stayed B and
     # ``load_cli_config()`` re-read the frozen constant rather than the live
     # resolver.
     #
@@ -5066,7 +5073,7 @@ def save_config_value(key_path: str, value: any) -> bool:
     """
     # Runtime persistence ALWAYS targets the user's HERMES_HOME config.yaml,
     # creating it if needed. Resolve HERMES_HOME live (not the import-time
-    # _hermes_home constant) so profile switches and test isolation land right.
+    # constant) so profile switches and test isolation land right.
     #
     # We deliberately do NOT fall back to the repo's project cli-config.yaml:
     # that file is a shipped default/template, and most config readers
@@ -5712,7 +5719,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         
         # History file for persistent input recall across sessions
-        self._history_file = _hermes_home / ".hermes_history"
+        self._history_file = get_hermes_home() / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttle UI repaints
         self._app = None
 
@@ -10135,7 +10142,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         terminal_cwd = os.getenv("TERMINAL_CWD", os.getcwd())
         terminal_timeout = os.getenv("TERMINAL_TIMEOUT", "60")
         
-        user_config_path = _hermes_home / 'config.yaml'
+        user_config_path = get_hermes_home() / 'config.yaml'
         project_config_path = Path(__file__).parent / 'cli-config.yaml'
         if user_config_path.exists():
             config_path = user_config_path
@@ -15102,7 +15109,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if not is_seen(CLI_CONFIG, TOOL_PROGRESS_FLAG):
                             self._long_tool_hint_fired = True
                             _cprint(f"  {_DIM}{tool_progress_hint_cli()}{_RST}")
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                            mark_seen(get_hermes_home() / "config.yaml", TOOL_PROGRESS_FLAG)
                             CLI_CONFIG.setdefault("onboarding", {}).setdefault("seen", {})[TOOL_PROGRESS_FLAG] = True
                 except Exception:
                     pass
@@ -17356,7 +17363,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             self._clear_active_overlays_for_interrupt()
                             # Debug: log to file (stdout may be devnull from redirect_stdout)
                             try:
-                                _dbg = _hermes_home / "interrupt_debug.log"
+                                _dbg = get_hermes_home() / "interrupt_debug.log"
                                 with open(_dbg, "a", encoding="utf-8") as _f:
                                     _f.write(f"{time.strftime('%H:%M:%S')} interrupt fired: msg={str(interrupt_msg)[:60]!r}, "
                                              f"children={len(self.agent._active_children)}, "
@@ -18759,7 +18766,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # follow-ups, or a turn that finished in the race.
                             self._interrupt_queue.put(payload)
                             try:
-                                _dbg = _hermes_home / "interrupt_debug.log"
+                                _dbg = get_hermes_home() / "interrupt_debug.log"
                                 with open(_dbg, "a", encoding="utf-8") as _f:
                                     _f.write(f"{time.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
                                              f"agent_running={self._agent_running}\n")
@@ -18780,7 +18787,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if not is_seen(CLI_CONFIG, BUSY_INPUT_FLAG):
                             _hint_mode = "redirect" if redirected else _effective_mode
                             _cprint(f"  {_DIM}{busy_input_hint_cli(_hint_mode)}{_RST}")
-                            mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+                            mark_seen(get_hermes_home() / "config.yaml", BUSY_INPUT_FLAG)
                             CLI_CONFIG.setdefault("onboarding", {}).setdefault("seen", {})[BUSY_INPUT_FLAG] = True
                     except Exception:
                         pass
@@ -19710,7 +19717,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 chars_hit = char_threshold > 0 and len(pasted_text) >= char_threshold
                 if (lines_hit or chars_hit) and not buf.text.strip().startswith('/'):
                     _paste_counter[0] += 1
-                    paste_dir = _hermes_home / "pastes"
+                    paste_dir = get_hermes_home() / "pastes"
                     paste_dir.mkdir(parents=True, exist_ok=True)
                     paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
                     paste_file.write_text(pasted_text, encoding="utf-8")
@@ -19881,7 +19888,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             chars_hit = char_threshold > 0 and len(text) >= char_threshold
             if (lines_hit or chars_hit) and is_paste and not text.startswith('/'):
                 _paste_counter[0] += 1
-                paste_dir = _hermes_home / "pastes"
+                paste_dir = get_hermes_home() / "pastes"
                 paste_dir.mkdir(parents=True, exist_ok=True)
                 paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
                 paste_file.write_text(text, encoding="utf-8")
