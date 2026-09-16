@@ -57,7 +57,14 @@ def test_apikey_providers_cache_key_function_reads_hermes_home(monkeypatch, tmp_
 
 def test_two_profiles_do_not_pin_each_other(monkeypatch, tmp_path):
     """Regression for the actual bug: calling under profile A then profile B
-    must not return profile A's cached list for B."""
+    must not return profile A's cached list for B.
+
+    Goes through doctor._apikey_providers_for_home() — the SAME accessor
+    run_doctor() calls — rather than re-deriving the key/cache-write logic
+    inline. A suite that reimplements the lookup can pass while the real
+    call site regresses (e.g. a stray `global` reintroduced); binding to
+    the real accessor closes that gap (wren393 CHANGES_REQUESTED, 2026-09-16).
+    """
     from hermes_cli import doctor
 
     doctor._reset_apikey_providers_cache_for_tests()
@@ -74,16 +81,10 @@ def test_two_profiles_do_not_pin_each_other(monkeypatch, tmp_path):
     fake_home_b = tmp_path / "profile_b"
 
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: fake_home_a)
-    key_a = doctor._apikey_providers_cache_key()
-    if key_a not in doctor._APIKEY_PROVIDERS_CACHE:
-        doctor._APIKEY_PROVIDERS_CACHE[key_a] = doctor._build_apikey_providers_list()
-    result_a = doctor._APIKEY_PROVIDERS_CACHE[key_a]
+    result_a = doctor._apikey_providers_for_home()
 
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: fake_home_b)
-    key_b = doctor._apikey_providers_cache_key()
-    if key_b not in doctor._APIKEY_PROVIDERS_CACHE:
-        doctor._APIKEY_PROVIDERS_CACHE[key_b] = doctor._build_apikey_providers_list()
-    result_b = doctor._APIKEY_PROVIDERS_CACHE[key_b]
+    result_b = doctor._apikey_providers_for_home()
 
     assert result_a != result_b, (
         "profile B was served profile A's cached provider list — the bare "
@@ -97,10 +98,31 @@ def test_two_profiles_do_not_pin_each_other(monkeypatch, tmp_path):
 
     # Non-vacuity: calling under profile A again must NOT rebuild (still cached).
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: fake_home_a)
-    key_a2 = doctor._apikey_providers_cache_key()
-    if key_a2 not in doctor._APIKEY_PROVIDERS_CACHE:
-        doctor._APIKEY_PROVIDERS_CACHE[key_a2] = doctor._build_apikey_providers_list()
+    doctor._apikey_providers_for_home()
     assert len(calls) == 2, "re-lookup under the same profile must be served from cache"
+
+
+def test_run_doctor_call_site_uses_the_real_accessor(monkeypatch, tmp_path):
+    """MUTANT-KILLING CASE for the exact hole wren393 found: if run_doctor()
+    stopped calling _apikey_providers_for_home() (e.g. someone reintroduces
+    an inline `global _APIKEY_PROVIDERS_CACHE` read at the call site that
+    bypasses the keyed accessor), this must fail even though the OTHER
+    cases above — which call the accessor directly — would still pass."""
+    from hermes_cli import doctor
+    import inspect
+
+    src = inspect.getsource(doctor.run_doctor)
+    assert "_apikey_providers_for_home()" in src, (
+        "run_doctor() must read the API-key provider list through the keyed "
+        "accessor _apikey_providers_for_home(), not by touching "
+        "_APIKEY_PROVIDERS_CACHE directly — a direct read/write at the call "
+        "site can drift out of sync with the accessor's key resolution and "
+        "silently reintroduce the pinning bug this suite exists to catch."
+    )
+    assert "global _APIKEY_PROVIDERS_CACHE" not in src, (
+        "run_doctor() must not declare _APIKEY_PROVIDERS_CACHE global — that "
+        "was the pre-fix bare-global shape."
+    )
 
 
 def test_mutant_bare_global_would_pin(monkeypatch, tmp_path):

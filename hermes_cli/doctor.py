@@ -967,6 +967,22 @@ def _reset_apikey_providers_cache_for_tests() -> None:
     _APIKEY_PROVIDERS_CACHE.clear()
 
 
+def _apikey_providers_for_home() -> list:
+    """The single accessor run_doctor() uses to read the keyed cache.
+
+    Extracted so tests can bind to the REAL lookup instead of re-deriving
+    the key/cache logic inline — a suite that reimplements the lookup can
+    pass while the production call site regresses (e.g. a stray `global`
+    reintroduced, or the cache read/written under a different key than the
+    one this function resolves). Every caller, test or production, goes
+    through this one function.
+    """
+    _key = _apikey_providers_cache_key()
+    if _key not in _APIKEY_PROVIDERS_CACHE:
+        _APIKEY_PROVIDERS_CACHE[_key] = _build_apikey_providers_list()
+    return _APIKEY_PROVIDERS_CACHE[_key]
+
+
 def _build_apikey_providers_list() -> list:
     """Build the API-key provider health-check list once and cache it.
 
@@ -3131,10 +3147,7 @@ def run_doctor(args):
     _probes.append(("OpenRouter API", _probe_openrouter))
     _probes.append(("Anthropic API", _probe_anthropic))
 
-    _apikey_cache_key = _apikey_providers_cache_key()
-    if _apikey_cache_key not in _APIKEY_PROVIDERS_CACHE:
-        _APIKEY_PROVIDERS_CACHE[_apikey_cache_key] = _build_apikey_providers_list()
-    for _entry in _APIKEY_PROVIDERS_CACHE[_apikey_cache_key]:
+    for _entry in _apikey_providers_for_home():
         _pname, _env_vars, _default_url, _base_env, _supports = _entry
         # Capture loop vars by binding default args — without this, all closures
         # would share the final iteration's values and every probe would hit
