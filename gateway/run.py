@@ -28059,6 +28059,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "avoid an unroutable retry loop: keys=%s", sorted(evt)
             )
             return True  # unroutable forever; requeueing would spin
+
+        # ROUTE FIRST. `session_id` names the session on THIS box that produced
+        # the text — delivering there sends the answer to ourselves. When the
+        # sender declared a return address, the reply belongs on the sender's
+        # box and goes back over the peer channel.
+        reply_to = evt.get("reply_to")
+        if isinstance(reply_to, dict) and (reply_to.get("agent") or "").strip():
+            try:
+                ok = await self._return_peer_completion(reply_to, text, evt)
+            except Exception:
+                logger.exception(
+                    "peer completion return-to-sender failed for %s", reply_to
+                )
+                return False
+            if ok:
+                self._close_peer_handoff(evt)
+            return bool(ok)
+
         try:
             ok = await self._inject_peer_completion_turn(session_id, text, evt)
         except Exception:
@@ -28085,6 +28103,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         handoff_id,
                     )
         return bool(ok)
+
+    def _close_peer_handoff(self, evt: dict) -> None:
+        """Close the handoff row after a delivery that actually happened.
+
+        Failure to close is logged and swallowed: the reply DID reach its
+        destination, so an open row means "looks owed when it isn't", which is
+        the safe direction. The reverse — closing a row for an undelivered
+        reply — is the silent failure this whole path exists to prevent.
+        """
+        handoff_id = evt.get("handoff_id")
+        if not handoff_id:
+            return
+        try:
+            from gateway.handoff import DELIVERED, HandoffStore
+            from hermes_constants import get_hermes_home
+            import os as _os
+
+            store = HandoffStore(
+                _os.path.join(str(get_hermes_home()), "handoffs.jsonl"),
+                author="peer_completion_watcher",
+            )
+            store.record(handoff_id, DELIVERED)
+        except Exception:
+            logger.exception(
+                "delivered peer completion but could not close handoff %s",
+                handoff_id,
+            )
+
+    async def _return_peer_completion(
+        self, reply_to: dict, text: str, evt: dict
+    ) -> bool:
+        """Send a finished turn back to the peer that asked for it.
+
+        Uses `hermes peer dm` WITHOUT --no-wait deliberately. A reply is short
+        and terminal: the far side records it and does not answer, so blocking
+        for its accept costs nothing and gets a real success/failure. Using
+        --no-wait here would make a returned reply that itself went missing
+        indistinguishable from one that landed.
+
+        Returns False on any failure so the caller requeues and the handoff
+        row stays open.
+        """
+        agent = str(reply_to.get("agent") or "").strip()
+        if not agent:
+            return False
+        import asyncio as _asyncio
+        import shutil as _shutil
+
+        exe = _shutil.which("hermes")
+        if not exe:
+            logger.error("cannot return peer completion: no hermes on PATH")
+            return False
+        body = f"[reply from {evt.get('peer') or 'peer'}]\n\n{text}"
+        try:
+            proc = await _asyncio.create_subprocess_exec(
+                exe, "peer", "dm", agent, body,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            _out, err = await _asyncio.wait_for(proc.communicate(), timeout=120)
+        except Exception:
+            logger.exception("returning peer completion to %s raised", agent)
+            return False
+        if proc.returncode != 0:
+            logger.error(
+                "returning peer completion to %s failed rc=%s: %s",
+                agent, proc.returncode, (err or b"").decode()[:300],
+            )
+            return False
+        return True
 
     async def _inject_peer_completion_turn(
         self, session_id: str, text: str, evt: dict
