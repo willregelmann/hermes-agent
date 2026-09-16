@@ -4919,9 +4919,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         async def _run_and_record() -> None:
+            result = None
             try:
                 history = await self._conversation_history_for_session(session_id)
-                await self._run_agent(
+                result, _usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
@@ -4945,10 +4946,43 @@ class APIServerAdapter(BasePlatformAdapter):
                         logger.exception("peer accept: could not record turn failure")
                 return
             if store is not None and handoff is not None:
-                try:
-                    store.record(handoff.id, DELIVERED)
-                except Exception:
-                    logger.exception("peer accept: could not record completion")
+                # DO NOT close the row here. The turn finishing is not the
+                # reply arriving. Closing on completion would make an
+                # undelivered reply look delivered, and staleness would go
+                # quiet about the exact case it exists to report. The
+                # peer-completion watcher closes it after real delivery.
+                pass
+            # Publish the completion so the watcher can deliver it. Without
+            # this the watcher is correct and idle: it drains a queue nothing
+            # ever writes to, which reads like a working feature.
+            try:
+                text = ""
+                if isinstance(result, dict):
+                    text = (result.get("final_response") or "").strip()
+                if not text:
+                    # A turn that produced no text has nothing to deliver.
+                    # Say so rather than publishing an empty event the watcher
+                    # would have to decide about.
+                    logger.info(
+                        "peer accept: turn for %s produced no final_response; "
+                        "nothing to deliver", session_id,
+                    )
+                    return
+                from tools.process_registry import process_registry as _pr
+
+                _pr.completion_queue.put({
+                    "type": "peer_completion",
+                    "session_id": session_id,
+                    "text": text,
+                    "peer": str(requesting_user),
+                    "handoff_id": handoff.id if handoff is not None else None,
+                })
+            except Exception:
+                logger.exception(
+                    "peer accept: turn finished but the completion event could "
+                    "not be published for %s — the reply is persisted in the "
+                    "session but will not be delivered", session_id,
+                )
 
         task = asyncio.create_task(_run_and_record())
         # Hold a reference. A bare create_task can be garbage-collected
