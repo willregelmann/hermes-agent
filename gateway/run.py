@@ -28066,6 +28066,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # box and goes back over the peer channel.
         reply_to = evt.get("reply_to")
         if isinstance(reply_to, dict) and (reply_to.get("agent") or "").strip():
+            # VALIDATE BEFORE DISPATCH. The check lives here, in the router,
+            # not inside _return_peer_completion — a guard inside the method
+            # that performs the action can be bypassed by anything that
+            # replaces that method, including a test fake, which is exactly
+            # how I first wrote it and exactly why F1 failed against my own
+            # fixture. Validation belongs on the path every caller takes.
+            if not self._reply_to_is_trustworthy(reply_to, evt):
+                return True  # wrong forever; requeueing would spin
             try:
                 ok = await self._return_peer_completion(reply_to, text, evt)
             except Exception:
@@ -28103,6 +28111,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         handoff_id,
                     )
         return bool(ok)
+
+    def _reply_to_is_trustworthy(self, reply_to: dict, evt: dict) -> bool:
+        """Is this remote-supplied return address safe to deliver to?
+
+        THE ADDRESS ARRIVES FROM THE NETWORK. `agent` goes straight into argv
+        of a peer send, so an event that arrived FROM `wren` carrying
+        reply_to={"agent": "someone-else"} would otherwise deliver the reply
+        there, report success, and close the handoff row. Loud success, wrong
+        destination — a silent misroute, which is the class this whole change
+        exists to close, one level up. Found by Ash attacking PR #32.
+
+        Not a shell-injection risk (create_subprocess_exec takes a list). The
+        defect is granting a property that is never checked.
+
+        This is checkable precisely BECAUSE the address is an agent NAME: a
+        name can be compared against who actually sent the turn and against
+        what this box already knows. An opaque session id could only be taken
+        on faith.
+        """
+        agent = str(reply_to.get("agent") or "").strip()
+        sender = str(evt.get("peer") or "").strip()
+        if sender and agent != sender:
+            logger.error(
+                "peer completion declared reply_to.agent=%r but the turn came "
+                "from peer=%r — refusing to deliver to an unverified third "
+                "party; dropping (handoff stays open)", agent, sender,
+            )
+            return False
+
+        # `host` was collected, carried and never read (Ash's C1). An unused
+        # field invites the assumption that it is validated, so compare it
+        # against what identity.json already records for that peer.
+        declared_host = str(reply_to.get("host") or "").strip().casefold()
+        if not declared_host:
+            return True
+        known_host = ""
+        try:
+            import json as _json
+            import os as _os
+
+            from hermes_constants import get_hermes_home
+
+            with open(
+                _os.path.join(str(get_hermes_home()), "identity.json"),
+                encoding="utf-8",
+            ) as fh:
+                peers = _json.load(fh).get("peers") or {}
+            known_host = str(
+                (peers.get(agent) or {}).get("host") or ""
+            ).strip().casefold()
+        except Exception:
+            known_host = ""
+        if known_host and declared_host != known_host:
+            logger.error(
+                "peer completion from %r declared host %r but this box knows "
+                "%r as %r — refusing; dropping (handoff stays open)",
+                sender, declared_host, agent, known_host,
+            )
+            return False
+        return True
 
     def _close_peer_handoff(self, evt: dict) -> None:
         """Close the handoff row after a delivery that actually happened.

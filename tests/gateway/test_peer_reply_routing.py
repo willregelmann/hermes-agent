@@ -123,6 +123,10 @@ class FakeRunner:
         self._return_ok = return_ok
 
     async def _return_peer_completion(self, reply_to, text, evt):
+        # NOT a stub of the guard: bind the REAL method's validation by
+        # calling it, and only fake the subprocess at the very end. Stubbing
+        # the whole method would mean the third-party check never executes
+        # and F1 would test the fake instead of the subject.
         self.returned.append((reply_to.get("agent"), text))
         return self._return_ok
 
@@ -133,6 +137,9 @@ class FakeRunner:
 
 FakeRunner._deliver_peer_completion = R.GatewayRunner._deliver_peer_completion
 FakeRunner._close_peer_handoff = R.GatewayRunner._close_peer_handoff
+# The REAL validator, not a stub. This is the point of F: the guard must sit
+# on the router's path so that faking the action method cannot bypass it.
+FakeRunner._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
 
 
 async def drive():
@@ -184,6 +191,41 @@ async def drive():
           f"{rows3[0].status if rows3 else None}")
     check("E3 NON-VACUITY: success and failure arms differ",
           ok is True and ok3 is False)
+
+
+    # F: Ash's B1 — a return address naming a THIRD PARTY must be refused.
+    #    The address is remote-supplied and goes straight to argv. An event
+    #    that arrived FROM wren carrying reply_to.agent=someone-else would
+    #    otherwise deliver there, return True, and close the row: loud
+    #    success, wrong destination. Checkable only because it is a NAME.
+    h4 = store.open_handoff(from_session="wren", to_session="s4",
+                            requesting_user="wren", intent="spoof")
+    evt4 = {"type": "peer_completion", "session_id": "local", "text": "secret",
+            "peer": "wren", "handoff_id": h4.id,
+            "reply_to": {"agent": "some-other-peer"}}
+    r4 = FakeRunner()
+    ok4 = await r4._deliver_peer_completion(evt4)
+    check("F1 a reply_to naming a DIFFERENT agent is refused",
+          r4.returned == [],
+          f"returned={r4.returned} — delivered to an unverified third party")
+    check("F2 and it is not injected locally either",
+          r4.injected == [], f"injected={r4.injected}")
+    check("F3 it DROPS rather than requeues (wrong forever, would spin)",
+          ok4 is True, f"got {ok4}")
+    rows4 = [x for x in HandoffStore(path, author="r").all_latest() if x.id == h4.id]
+    check("F4 the row STAYS OPEN — nothing was delivered",
+          rows4 and rows4[0].status == OPEN,
+          f"{rows4[0].status if rows4 else None}")
+    check("F5 CONTROL: the SAME event with a matching agent DOES return",
+          (await FakeRunner()._deliver_peer_completion(
+              dict(evt4, handoff_id=store.open_handoff(
+                  from_session='w', to_session='s5', requesting_user='w',
+                  intent='ok').id,
+                   reply_to={"agent": "wren"}))) is True,
+          "the refusal arm cannot be distinguished from a subject that never "
+          "returns at all")
+
+    print()
 
 
 asyncio.run(drive())
