@@ -359,6 +359,96 @@ print("V=" + repr(F()._reply_to_is_trustworthy(
               f"trusting here delivers a real reply somewhere nobody asked "
               f"for and closes the row saying it went home")
 
+    # ---- I: THE HOST HALF, AND THE LOG DISTINCTION ASH ASKED FOR
+    # Found by mutating my own subject after the H arms went green (round 4):
+    #   34E  delete the host-mismatch branch entirely   -> SURVIVED
+    #   34B  delete the "cannot verify" branch entirely -> SURVIVED
+    # 34E is a plain coverage hole: the host comparison has been in this
+    # predicate since #32 and NOTHING here ever asserted it, so a later edit
+    # could delete it with every arm green. I1/I2 close it.
+    #
+    # 34B is subtler and is the more interesting of the two. Deleting the
+    # unverifiable branch does not change any RETURN VALUE — an empty peers
+    # map falls through to `agent not in known` and refuses anyway. It is
+    # equivalent on the verdict and NOT equivalent on the thing Ash actually
+    # asked for: "abstained because unverifiable" and "policy says no" must
+    # not produce the same line, or the next person debugging cannot tell
+    # which happened. I3 asserts the two refusals are DISTINGUISHABLE in the
+    # log, which is the only place that distinction exists.
+    probe2_src = f'''import logging, os, sys
+os.environ["HERMES_HOME"] = {jail2!r}
+sys.path.insert(0, {TREE!r})
+logging.basicConfig(level=logging.ERROR, format="LOG:%(message)s")
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+f = F()
+print("HOSTBAD=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "attacker.example"}}, {{"peer": "peer"}})))
+print("HOSTGOOD=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "will-ms-7b93.local"}}, {{"peer": "peer"}})))
+print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    pp2 = os.path.join(jail2, "probe_host.py")
+    with open(pp2, "w", encoding="utf-8") as fh:
+        fh.write(probe2_src)
+    hr = _sp2.run([sys.executable, pp2], capture_output=True, text=True,
+                  timeout=180)
+    check("I1 a KNOWN agent declaring the WRONG HOST is REFUSED",
+          "HOSTBAD=False" in hr.stdout,
+          f"stdout={hr.stdout.strip()!r} stderr={hr.stderr[-200:]!r} — the "
+          f"host comparison has been unasserted since #32; mutant 34E "
+          f"deleted it and every other arm stayed green")
+    check("I2 NON-VACUITY: the SAME agent with the RIGHT host is TRUSTED",
+          "HOSTGOOD=True" in hr.stdout,
+          f"stdout={hr.stdout.strip()!r} — without this I1 passes against a "
+          f"predicate that refuses everything")
+
+    # I3: the two refusals must not be the same line. Home with no policy
+    # (H-shape) vs home with a policy that says no (G3-shape).
+    nopolicy = tempfile.mkdtemp(prefix="wren-logdist-")
+    with open(os.path.join(nopolicy, "identity.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"agent": "wren", "peers": {}}')
+    probe3_src = f'''import logging, os, sys
+os.environ["HERMES_HOME"] = {nopolicy!r}
+sys.path.insert(0, {TREE!r})
+logging.basicConfig(level=logging.ERROR, format="LOG:%(message)s")
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+print("V=" + repr(F()._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    pp3 = os.path.join(nopolicy, "p.py")
+    with open(pp3, "w", encoding="utf-8") as fh:
+        fh.write(probe3_src)
+    nr = _sp2.run([sys.executable, pp3], capture_output=True, text=True,
+                  timeout=180)
+    nopolicy_log = "".join(
+        l for l in (nr.stderr + nr.stdout).splitlines(True) if "LOG:" in l)
+    knownhome_log = "".join(
+        l for l in (hr.stderr + hr.stdout).splitlines(True)
+        if "LOG:" in l and "known peer" in l)
+    check("I3 'cannot verify' and 'not a known peer' are DIFFERENT log lines",
+          ("cannot verify" in nopolicy_log
+           and "known peer" in knownhome_log
+           and "cannot verify" not in knownhome_log),
+          f"nopolicy={nopolicy_log.strip()[:200]!r} "
+          f"knownhome={knownhome_log.strip()[:200]!r} — both refuse, so the "
+          f"verdict cannot tell them apart; the log is the only place the "
+          f"distinction exists and Ash asked for it explicitly")
+
     check("H5 DISCRIMINATION: G3(known home)=False and H1(no home)=False are "
           "reached by DIFFERENT branches, and G4 proves the predicate still "
           "says True somewhere",
