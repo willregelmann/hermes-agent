@@ -28132,21 +28132,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         agent = str(reply_to.get("agent") or "").strip()
         sender = str(evt.get("peer") or "").strip()
-        if sender and agent != sender:
+
+        # WHAT THIS CHECK CAN AND CANNOT DO — corrected after it refused a
+        # legitimate reply on a live pair, 2026-09-16 11:31:46:
+        #     reply_to.agent='wren' but the turn came from peer='peer'
+        # The accept path defaults requesting_user to the literal "peer" when
+        # the sender does not name itself, so the comparison could never match
+        # and the ONLY thing the guard ever did in production was refuse a
+        # real reply. It was written against a fixture that supplied a sender
+        # name no real sender sends.
+        #
+        # Worse, the comparison is weak even when both fields are populated:
+        # `peer` and `reply_to` arrive in the SAME request from the SAME
+        # party, so agreement between them is self-attestation. A sender that
+        # lies about one lies about both.
+        #
+        # So the load-bearing check is the one against LOCAL state: the agent
+        # must be a peer THIS box already knows, and its host must match what
+        # we recorded. identity.json is not attacker-supplied.
+        if sender and sender != "peer" and agent != sender:
             logger.error(
                 "peer completion declared reply_to.agent=%r but the turn came "
-                "from peer=%r — refusing to deliver to an unverified third "
-                "party; dropping (handoff stays open)", agent, sender,
+                "from peer=%r — refusing; dropping (handoff stays open)",
+                agent, sender,
             )
             return False
 
-        # `host` was collected, carried and never read (Ash's C1). An unused
-        # field invites the assumption that it is validated, so compare it
-        # against what identity.json already records for that peer.
-        declared_host = str(reply_to.get("host") or "").strip().casefold()
-        if not declared_host:
-            return True
-        known_host = ""
+        known = {}
         try:
             import json as _json
             import os as _os
@@ -28157,13 +28169,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _os.path.join(str(get_hermes_home()), "identity.json"),
                 encoding="utf-8",
             ) as fh:
-                peers = _json.load(fh).get("peers") or {}
-            known_host = str(
-                (peers.get(agent) or {}).get("host") or ""
-            ).strip().casefold()
+                known = _json.load(fh).get("peers") or {}
         except Exception:
-            known_host = ""
-        if known_host and declared_host != known_host:
+            # Unreadable identity.json: abstain rather than block a real
+            # reply. Scoped deliberately — see Ash's D2. An abstention here
+            # must not silently disable the checks that need no local state.
+            return True
+
+        if known and agent not in known:
+            logger.error(
+                "peer completion declared reply_to.agent=%r which is not a "
+                "known peer on this box (known: %s) — refusing; dropping "
+                "(handoff stays open)", agent, sorted(known),
+            )
+            return False
+
+        declared_host = str(reply_to.get("host") or "").strip().casefold()
+        known_host = str(
+            (known.get(agent) or {}).get("host") or ""
+        ).strip().casefold()
+        if declared_host and known_host and declared_host != known_host:
             logger.error(
                 "peer completion from %r declared host %r but this box knows "
                 "%r as %r — refusing; dropping (handoff stays open)",

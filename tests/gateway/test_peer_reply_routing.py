@@ -225,6 +225,68 @@ async def drive():
           "the refusal arm cannot be distinguished from a subject that never "
           "returns at all")
 
+    # ---- G: THE LIVE SHAPE. Every case above supplied a sender name that no
+    # real sender sends. The accept path defaults requesting_user to the
+    # literal "peer", so on the live pair the guard refused the ONLY kind of
+    # reply that actually occurs:
+    #     11:31:46 reply_to.agent='wren' but the turn came from peer='peer'
+    # A fixture that supplies a value production never supplies tests a
+    # different system. These cases use the real defaulted string.
+    h6 = store.open_handoff(from_session="peer", to_session="s6",
+                            requesting_user="peer", intent="live shape")
+    evt6 = {"type": "peer_completion", "session_id": "local", "text": "ack",
+            "peer": "peer", "handoff_id": h6.id,
+            "reply_to": {"agent": "ash", "host": "will-ms-7b93.local"}}
+    r6 = FakeRunner()
+    ok6 = await r6._deliver_peer_completion(evt6)
+    check("G1 THE LIVE SHAPE: peer='peer' + a KNOWN agent DELIVERS",
+          r6.returned == [("ash", "ack")],
+          f"returned={r6.returned} — this is the exact event the live guard "
+          f"refused at 11:31:46; if this fails the chain is still broken")
+    check("G2 and the row closes on that delivery", ok6 is True, f"got {ok6}")
+
+    # G3/G4 need a REAL identity.json — without one the abstention path fires
+    # and the unknown-agent check never runs, which is precisely the failure
+    # my own control caught. Point HERMES_HOME at a temp home containing a
+    # known-peers file, in a child so nothing leaks.
+    import subprocess as _sp2
+
+    jail2 = tempfile.mkdtemp(prefix="wren-known-")
+    with open(os.path.join(jail2, "identity.json"), "w", encoding="utf-8") as fh:
+        json.dump({"agent": "wren", "host": "ha-pi.local",
+                   "peers": {"ash": {"host": "will-ms-7b93.local"}}}, fh)
+    probe_src = f'''import os, sys
+os.environ["HERMES_HOME"] = {jail2!r}
+sys.path.insert(0, {TREE!r})
+import gateway.run as R
+
+
+class F:
+    def __init__(self):
+        self.returned = []
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+f = F()
+print("KNOWN=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "will-ms-7b93.local"}}, {{"peer": "peer"}})))
+print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    probe_path = os.path.join(jail2, "probe.py")
+    with open(probe_path, "w", encoding="utf-8") as fh:
+        fh.write(probe_src)
+    pr = _sp2.run([sys.executable, probe_path], capture_output=True,
+                  text=True, timeout=180)
+    out = pr.stdout
+    check("G3 CONTROL: with a real identity.json, an UNKNOWN agent is REFUSED",
+          "UNKNOWN=False" in out,
+          f"stdout={out[-300:]!r} stderr={pr.stderr[-200:]!r} — the fix must "
+          f"not be 'stop checking'")
+    check("G4 NON-VACUITY: the KNOWN agent is still trusted in the same run",
+          "KNOWN=True" in out,
+          f"stdout={out[-300:]!r} — if both arms agree the predicate is inert")
+
     print()
 
 
