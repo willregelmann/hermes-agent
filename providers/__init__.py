@@ -36,21 +36,62 @@ import importlib
 import importlib.util
 import logging
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 
 from providers.base import ProviderProfile
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Scoping (wren:i24, final member).
+#
+# ``_REGISTRY``/``_ALIASES`` hold BUNDLED + pip-entry-point + legacy
+# ``providers/<name>.py`` profiles. Those are process-global by construction:
+# the bundled directory and the installed package are the same for every
+# profile in a multiplex gateway, so sharing them is correct, not a bug.
+#
+# ``$HERMES_HOME/plugins/model-providers/`` and the flat
+# ``$HERMES_HOME/plugins/<name>/`` (kind: model-provider) directories are
+# NOT process-global — they are per-profile by definition. Before this fix,
+# ``register_provider()`` wrote every registration into the same global
+# ``_REGISTRY`` regardless of source, so the first profile discovered in a
+# process silently pinned every other profile's user-plugin providers
+# (including overrides of a bundled name) until restart. A second bug rode
+# alongside it: ``_import_plugin_dir``'s ``sys.modules`` skip-guard for user
+# plugins was keyed by plugin dirname only, so a second profile with a
+# same-named but DIFFERENT ``$HERMES_HOME/plugins/model-providers/<name>/``
+# directory was never imported at all — its registration silently vanished.
+#
+# Fix: user/installed plugin imports run with ``_CURRENT_SCOPE`` set to the
+# resolved-home key for that discovery pass (see ``_discover_providers``).
+# ``register_provider()`` reads it and files the registration into a
+# per-home layer when set, global otherwise. Lookups merge the current
+# home's layer over the global one (home wins on name collision — same
+# override semantics as before, just correctly isolated). The user-plugin
+# import guard is keyed by (home, dirname) so two profiles' distinct plugin
+# trees are never conflated.
+_CURRENT_SCOPE: ContextVar[str | None] = ContextVar("_CURRENT_SCOPE", default=None)
+
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
-_PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
+_SCOPED_REGISTRY: dict[str, dict[str, ProviderProfile]] = {}
+_SCOPED_ALIASES: dict[str, dict[str, str]] = {}
+_PROVIDER_LIST_CACHE: dict[str, list[ProviderProfile]] = {}
 _discovered = False
+_discovered_homes: set[str] = set()
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
 )
+
+
+def _scope_key() -> str:
+    """Return the resolved-home key for the calling profile's discovery pass."""
+    from hermes_constants import hermes_home_key
+
+    return hermes_home_key()
 
 
 def register_provider(profile: ProviderProfile) -> None:
@@ -59,27 +100,38 @@ def register_provider(profile: ProviderProfile) -> None:
     Later registrations with the same name replace earlier ones — so user
     plugins under ``$HERMES_HOME/plugins/model-providers/`` can override
     bundled profiles without editing repo code.
+
+    Filed into the per-home layer (see module docstring) when called during
+    a user/installed-plugin import; into the global layer otherwise (bundled,
+    pip entry point, legacy ``providers/<name>.py``).
     """
     global _PROVIDER_LIST_CACHE
-    _REGISTRY[profile.name] = profile
+    scope = _CURRENT_SCOPE.get()
+    registry = _REGISTRY if scope is None else _SCOPED_REGISTRY.setdefault(scope, {})
+    aliases = _ALIASES if scope is None else _SCOPED_ALIASES.setdefault(scope, {})
+    registry[profile.name] = profile
     for alias in profile.aliases:
-        _ALIASES[alias] = profile.name
-    _PROVIDER_LIST_CACHE = None
+        aliases[alias] = profile.name
+    _PROVIDER_LIST_CACHE = {}
 
 
 def get_provider_profile(name: str) -> ProviderProfile | None:
     """Look up a provider profile by name or alias.
 
     Returns None if the provider has no profile (falls back to generic).
+    Checks the calling profile's home-scoped overrides before the global
+    (bundled/pip/legacy) registry.
     """
-    if not _discovered:
-        _discover_providers()
-    canonical = _ALIASES.get(name, name)
-    profile = _REGISTRY.get(canonical)
+    _ensure_discovered()
+    home = _scope_key()
+    scoped_aliases = _SCOPED_ALIASES.get(home, {})
+    scoped_registry = _SCOPED_REGISTRY.get(home, {})
+    canonical = scoped_aliases.get(name) or _ALIASES.get(name, name)
+    profile = scoped_registry.get(canonical) or _REGISTRY.get(canonical)
     # Named custom routes share the generic wire policy unless a plugin
     # explicitly registered that route. Other names retain exact lookup.
     if profile is None and isinstance(name, str) and name.lower().startswith("custom:"):
-        profile = _REGISTRY.get("custom")
+        profile = scoped_registry.get("custom") or _REGISTRY.get("custom")
     return profile
 
 
@@ -111,21 +163,26 @@ def routed_model_rejects_vision_tool_messages(provider: str, model: str) -> bool
 
 
 def list_providers() -> list[ProviderProfile]:
-    """Return all registered provider profiles (one per canonical name)."""
-    global _PROVIDER_LIST_CACHE
-    if not _discovered:
-        _discover_providers()
-    if _PROVIDER_LIST_CACHE is not None:
-        return list(_PROVIDER_LIST_CACHE)
-    # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
+    """Return all registered provider profiles (one per canonical name),
+    the calling profile's home-scoped plugins overlaid on the global set."""
+    _ensure_discovered()
+    home = _scope_key()
+    cached = _PROVIDER_LIST_CACHE.get(home)
+    if cached is not None:
+        return list(cached)
+    # Home-scoped entries win on name collision (mirrors get_provider_profile).
+    merged: dict[str, ProviderProfile] = dict(_REGISTRY)
+    merged.update(_SCOPED_REGISTRY.get(home, {}))
+    # Deduplicate: canonical-name dict may still alias the same object twice
+    # via _ALIASES-derived entries; keep first-seen by identity.
     seen: set[int] = set()
     result: list[ProviderProfile] = []
-    for profile in _REGISTRY.values():
+    for profile in merged.values():
         pid = id(profile)
         if pid not in seen:
             seen.add(pid)
             result.append(profile)
-    _PROVIDER_LIST_CACHE = result
+    _PROVIDER_LIST_CACHE[home] = result
     return list(result)
 
 
@@ -191,28 +248,43 @@ def _declares_model_provider_kind(plugin_dir: Path) -> bool:
     return False
 
 
-def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
+def _import_plugin_dir(plugin_dir: Path, source: str, *, home: str | None = None) -> None:
     """Import a single plugin directory so it self-registers.
 
-    ``source`` is "bundled" or "user", used only for log messages.
+    ``source`` is "bundled" or "user", used only for log messages. ``home``
+    is the resolved ``HERMES_HOME`` key this plugin directory belongs to
+    (only meaningful for ``source="user"``; bundled plugins are shared).
+
+    The ``sys.modules`` skip-guard was previously keyed by dirname alone
+    (``_hermes_user_provider_<name>``), so two profiles with DIFFERENT
+    directories of the same plugin name (e.g. two ``$HERMES_HOME``s each
+    with their own ``model-providers/acme/``) collided: the second profile's
+    import was silently skipped as "already imported" and its provider was
+    never registered under that profile at all. User-plugin module names now
+    include the home key so distinct directories never alias.
     """
     init_file = plugin_dir / "__init__.py"
     if not init_file.exists():
         return
 
     # Give bundled plugins a stable import path (``plugins.model_providers.<name>``)
-    # so relative imports within the plugin work. User plugins load via
-    # ``importlib.util.spec_from_file_location`` with a unique module name so
-    # multiple HERMES_HOME profiles don't alias each other.
+    # so relative imports within the plugin work — one copy, shared globally.
+    # User plugins load via ``importlib.util.spec_from_file_location`` with a
+    # module name unique per (home, dirname) so distinct HERMES_HOME plugin
+    # trees of the same plugin name never alias each other's module object.
     safe_name = plugin_dir.name.replace("-", "_")
     if source == "bundled":
         module_name = f"plugins.model_providers.{safe_name}"
     else:
-        module_name = f"_hermes_user_provider_{safe_name}"
+        home_tag = (home or "").replace("/", "_").replace("\\", "_").replace(":", "_")
+        module_name = f"_hermes_user_provider_{home_tag}_{safe_name}"
 
     if module_name in sys.modules:
         return  # already imported
 
+    scope_token = None
+    if source != "bundled":
+        scope_token = _CURRENT_SCOPE.set(home or _scope_key())
     try:
         spec = importlib.util.spec_from_file_location(
             module_name, init_file, submodule_search_locations=[str(plugin_dir)]
@@ -227,6 +299,9 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
             "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc
         )
         sys.modules.pop(module_name, None)
+    finally:
+        if scope_token is not None:
+            _CURRENT_SCOPE.reset(scope_token)
 
 
 def _discover_entry_point_providers() -> None:
@@ -351,15 +426,29 @@ def _requires_arguments(fn) -> bool:
     return False
 
 
+def _ensure_discovered() -> None:
+    """Run global discovery once, then this profile's home-scoped discovery
+    once. Safe to call on every lookup — both steps are idempotent guards."""
+    if not _discovered:
+        _discover_providers()
+    home = _scope_key()
+    if home not in _discovered_homes:
+        _discover_home_providers(home)
+
+
 def _discover_providers() -> None:
-    """Populate the registry by importing every provider plugin.
+    """Populate the GLOBAL registry: sources shared by every profile.
 
     Order:
+      0. Pip-installed plugins (entry points)
       1. Bundled plugins at ``<repo>/plugins/model-providers/<name>/``
-      2. User plugins at ``$HERMES_HOME/plugins/model-providers/<name>/``
-      2b. Plugins installed by ``hermes plugins install`` at
-          ``$HERMES_HOME/plugins/<name>/`` that declare ``kind: model-provider``
       3. Legacy per-file modules at ``providers/<name>.py`` (back-compat)
+
+    These are process-wide by construction — the installed package and the
+    bundled directory are identical for every ``HERMES_HOME`` in the process,
+    so one discovery pass correctly serves all of them. Per-``HERMES_HOME``
+    sources (steps "2"/"2b" in the old single-pass design) are handled
+    separately by :func:`_discover_home_providers`, once per home seen.
 
     Each step imports its plugins, which call ``register_provider()`` at
     module-level. Later steps win on name collision.
@@ -392,35 +481,6 @@ def _discover_providers() -> None:
                 continue
             _import_plugin_dir(child, "bundled")
 
-    # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
-    #    These can override any bundled profile of the same name (last-writer-wins
-    #    in register_provider()).
-    user_dir = _user_plugins_dir()
-    if user_dir is not None:
-        for child in sorted(user_dir.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
-                continue
-            _import_plugin_dir(child, "user")
-
-    # 2b. Plugins installed by ``hermes plugins install`` / the plugin index.
-    #     Those clone into $HERMES_HOME/plugins/<name>/ — flat, NOT under
-    #     model-providers/ — so step 2 never sees them. PluginManager does not
-    #     import them either: it classifies ``kind: model-provider`` and routes
-    #     it here on purpose. Without this step the documented install path
-    #     silently half-works — the CLI reports success and the provider does
-    #     not exist. Only manifests declaring that kind are imported; every
-    #     other plugin in this directory belongs to PluginManager.
-    installed_dir = _installed_plugins_dir()
-    if installed_dir is not None:
-        for child in sorted(installed_dir.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
-                continue
-            if child.name == "model-providers":
-                continue  # handled by step 2
-            if not _declares_model_provider_kind(child):
-                continue
-            _import_plugin_dir(child, "user")
-
     # 3. Legacy single-file profiles at providers/<name>.py. Kept for
     #    back-compat — if someone drops a ``providers/foo.py`` into an
     #    editable install, it still works without the plugin layout.
@@ -444,6 +504,53 @@ def _discover_providers() -> None:
     # (Pip entry-point providers are discovered in step 0, before the
     # filesystem plugins, so first-party profiles always win on name
     # collision — see _discover_entry_point_providers.)
+
+
+def _discover_home_providers(home: str) -> None:
+    """Populate ``home``'s scoped registry from its ``$HERMES_HOME`` plugin dirs.
+
+    Order (mirrors the old steps 2/2b of the single-pass design):
+      2. User plugins at ``$HERMES_HOME/plugins/model-providers/<name>/``
+      2b. Plugins installed by ``hermes plugins install`` at
+          ``$HERMES_HOME/plugins/<name>/`` that declare ``kind: model-provider``
+
+    Runs once per resolved home (tracked in ``_discovered_homes``), the same
+    guarantee ``_discover_providers`` gives the global sources. ``home`` is
+    threaded through explicitly (rather than re-resolved per plugin dir) so
+    every registration and the ``sys.modules`` import guard agree on which
+    profile they belong to even if ``$HERMES_HOME``/context changes between
+    calls on the same thread.
+    """
+    _discovered_homes.add(home)
+
+    # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
+    #    These can override any bundled profile of the same name (last-writer-wins
+    #    in register_provider(), scoped to this home).
+    user_dir = _user_plugins_dir()
+    if user_dir is not None:
+        for child in sorted(user_dir.iterdir()):
+            if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            _import_plugin_dir(child, "user", home=home)
+
+    # 2b. Plugins installed by ``hermes plugins install`` / the plugin index.
+    #     Those clone into $HERMES_HOME/plugins/<name>/ — flat, NOT under
+    #     model-providers/ — so step 2 never sees them. PluginManager does not
+    #     import them either: it classifies ``kind: model-provider`` and routes
+    #     it here on purpose. Without this step the documented install path
+    #     silently half-works — the CLI reports success and the provider does
+    #     not exist. Only manifests declaring that kind are imported; every
+    #     other plugin in this directory belongs to PluginManager.
+    installed_dir = _installed_plugins_dir()
+    if installed_dir is not None:
+        for child in sorted(installed_dir.iterdir()):
+            if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            if child.name == "model-providers":
+                continue  # handled by step 2
+            if not _declares_model_provider_kind(child):
+                continue
+            _import_plugin_dir(child, "user", home=home)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
