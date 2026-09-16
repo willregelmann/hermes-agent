@@ -92,7 +92,8 @@ async def main() -> None:
     print("=== receiver: accept-only chat ===")
 
     # --- A: accept returns BEFORE the turn finishes ----------------------
-    store_path = os.path.join(tmp, "a.jsonl")
+    os.environ["HERMES_HOME"] = tmp
+    store_path = os.path.join(tmp, "handoffs.jsonl")
     ad = FakeAdapter(store_path)
     t0 = time.time()
     resp = await ad._enqueue_session_chat(
@@ -129,15 +130,46 @@ async def main() -> None:
     case("D an accepted-but-unfinished turn is visible as stale",
          len(stale) == 1, f"stale={stale}")
 
-    # --- E: completion transitions the row -------------------------------
+    # --- E: the turn finishing is NOT the reply arriving ------------------
+    #     The row deliberately stays OPEN when the turn completes (commit
+    #     9301898b70): closing on completion would make an undelivered reply
+    #     look delivered. Completion PUBLISHES a peer_completion event; the
+    #     watcher closes the row after delivery actually happens.
     await asyncio.wait_for(ad.turn_finished.wait(), timeout=TURN_SECONDS + 5)
     await asyncio.sleep(0.2)
     rows = HandoffStore(store_path, author="r").all_latest()
-    case("E row transitions to DELIVERED when the turn completes",
-         rows[0].status == DELIVERED, f"status={rows[0].status}")
-    case("E nothing is stale once delivered",
-         HandoffStore(store_path, author="r").stale(older_than_s=0.0) == [],
-         "still stale after delivery")
+    case("E a completed-but-undelivered turn leaves the row OPEN",
+         rows[0].status == OPEN, f"status={rows[0].status}")
+    case("E an undelivered reply is still visible as stale",
+         len(HandoffStore(store_path, author="r").stale(older_than_s=0.0)) == 1,
+         "completion silently cleared staleness")
+
+    from tools.process_registry import process_registry as _pr
+    published = []
+    while True:
+        try:
+            published.append(_pr.completion_queue.get_nowait())
+        except Exception:
+            break
+    mine = [e for e in published if e.get("session_id") == "sess-1"]
+    case("E completion publishes exactly one peer_completion event",
+         len(mine) == 1 and mine[0].get("type") == "peer_completion",
+         f"published={published}")
+    if mine:
+        case("E the event carries the turn text",
+             mine[0].get("text") == "done thinking", f"evt={mine[0]}")
+        case("E the event names the row so delivery can close it",
+             mine[0].get("handoff_id") == rows[0].id, f"evt={mine[0]}")
+
+        # THE TETHER: drive the REAL closer, not a reimplementation of it.
+        from gateway.run import GatewayRunner
+        GatewayRunner._close_peer_handoff(object.__new__(GatewayRunner), mine[0])
+        rows = HandoffStore(store_path, author="r").all_latest()
+        case("E delivery (real _close_peer_handoff) closes the row",
+             rows[0].status == DELIVERED, f"status={rows[0].status}")
+        case("E nothing is stale once actually delivered",
+             HandoffStore(store_path, author="r").stale(older_than_s=0.0) == [],
+             "still stale after delivery")
 
     # --- F: a FAILING turn must not leave the row at open ----------------
     #     Ash's finding on the wake primitive, same shape: an exception is a
