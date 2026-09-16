@@ -106,10 +106,34 @@ check("B4 no identity -> None, NOT a fabricated address",
       f"while the send still looks successful")
 
 # ---- C: routing, driven on the real method ---------------------------
+# Tests run against the REAL production identity.json unless told otherwise,
+# and #34's fix means a box with no known peers refuses every address. That is
+# correct behaviour, but it would make the in-process arms (C/D/E/G1) depend on
+# THIS machine's peer list, which is not their subject. Give them a jailed home
+# with a known peer so they measure ROUTING; the H arms below own the
+# no-policy question and each use their own home.
+_home_jail = tempfile.mkdtemp(prefix="wren-testhome-")
+with open(os.path.join(_home_jail, "identity.json"), "w", encoding="utf-8") as _fh:
+    json.dump({"agent": "wren", "host": "ha-pi.local",
+               "peers": {"ash": {"host": "will-ms-7b93.local"},
+                         "wren": {"host": "ha-pi.local"}}}, _fh)
+os.environ["HERMES_HOME"] = _home_jail
+
 import gateway.run as R  # noqa: E402
 from gateway.handoff import DELIVERED, OPEN, HandoffStore  # noqa: E402
 
+# ONE HOME, ONE STORE. The production closer resolves the handoff store from
+# HERMES_HOME, so if the test reads a store at a DIFFERENT path than the
+# subject writes, C3 goes red against correct code — the test half and the
+# production half never touch the same file. That is the untethered-by-data-
+# location defect, and it cost me a red C3 here.
+# The same home also needs a peers map, because #34 refuses any address it
+# cannot verify. The H arms below use their own throwaway homes.
 tmp = tempfile.mkdtemp(prefix="wren-route-")
+with open(os.path.join(tmp, "identity.json"), "w", encoding="utf-8") as _fh:
+    json.dump({"agent": "wren", "host": "ha-pi.local",
+               "peers": {"ash": {"host": "will-ms-7b93.local"},
+                         "wren": {"host": "ha-pi.local"}}}, _fh)
 os.environ["HERMES_HOME"] = tmp
 path = os.path.join(tmp, "handoffs.jsonl")
 
@@ -286,6 +310,61 @@ print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
     check("G4 NON-VACUITY: the KNOWN agent is still trusted in the same run",
           "KNOWN=True" in out,
           f"stdout={out[-300:]!r} — if both arms agree the predicate is inert")
+
+    # ---- H: "NO POLICY AVAILABLE" IS NOT "POLICY SAYS YES" (Ash, #34 review)
+    # In #32 the identity read was scoped to the host half, so a damaged file
+    # disabled only the host comparison. Moving it above the known-peer check
+    # with `return True` on failure widened the hole to the WHOLE predicate,
+    # and H3/H4 reach it with NO file damage: `if known and ...` short-circuits
+    # on a missing or empty peers map. Every G arm stays green throughout,
+    # which is why only a differential probe finds it.
+    #
+    # THE DISCRIMINATING PAIR IS G3 vs H1, and it is Ash's: the SAME event and
+    # the SAME predicate in two different homes must give OPPOSITE verdicts.
+    # A single-home arm cannot tell "refuses correctly" from "refuses
+    # everything", which is the vacuous control he caught in his own review.
+    homes = {
+        "H1 no identity.json at all": None,
+        "H2 corrupt identity.json": "{ not json",
+        "H3 valid json, NO peers key": '{"agent": "wren"}',
+        "H4 valid json, EMPTY peers map": '{"agent": "wren", "peers": {}}',
+    }
+    for label, content in homes.items():
+        hj = tempfile.mkdtemp(prefix="wren-nopolicy-")
+        if content is not None:
+            with open(os.path.join(hj, "identity.json"), "w", encoding="utf-8") as fh:
+                fh.write(content)
+        src = f'''import os, sys
+os.environ["HERMES_HOME"] = {hj!r}
+sys.path.insert(0, {TREE!r})
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+print("V=" + repr(F()._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+        pp = os.path.join(hj, "p.py")
+        with open(pp, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        rr = _sp2.run([sys.executable, pp], capture_output=True, text=True,
+                      timeout=180)
+        check(f"{label} -> an unverifiable address is REFUSED",
+              "V=False" in rr.stdout,
+              f"stdout={rr.stdout.strip()!r} stderr={rr.stderr[-160:]!r} — "
+              f"trusting here delivers a real reply somewhere nobody asked "
+              f"for and closes the row saying it went home")
+
+    check("H5 DISCRIMINATION: G3(known home)=False and H1(no home)=False are "
+          "reached by DIFFERENT branches, and G4 proves the predicate still "
+          "says True somewhere",
+          "KNOWN=True" in out,
+          "if the predicate refused everything, every H arm would pass "
+          "vacuously; G4 is what rules that out")
 
     print()
 

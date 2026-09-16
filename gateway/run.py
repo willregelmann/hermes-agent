@@ -28159,6 +28159,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         known = {}
+        identity_readable = False
         try:
             import json as _json
             import os as _os
@@ -28170,13 +28171,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 encoding="utf-8",
             ) as fh:
                 known = _json.load(fh).get("peers") or {}
+            identity_readable = True
         except Exception:
-            # Unreadable identity.json: abstain rather than block a real
-            # reply. Scoped deliberately — see Ash's D2. An abstention here
-            # must not silently disable the checks that need no local state.
-            return True
+            identity_readable = False
 
-        if known and agent not in known:
+        # "NO POLICY AVAILABLE" IS NOT "POLICY SAYS YES" — Ash's H1-H4 on #34.
+        # In #32 the identity read was scoped to the host half, so a damaged
+        # file disabled only the host comparison and the known-peer check
+        # survived (his D2 asserted exactly that). Moving the read above the
+        # known-peer check and returning True on failure widened the hole from
+        # one comparison to the whole predicate, and H3/H4 reach it with NO
+        # file damage at all: `if known and ...` short-circuits whenever the
+        # peers map is missing or empty, leaving nothing checking the address
+        # while every G arm stays green.
+        #
+        # So an unverifiable address is REFUSED, not trusted. A box that
+        # cannot read its own peer list cannot know where a reply belongs —
+        # the same reason _self_origin() returns None rather than guessing on
+        # the sending side. The row stays open and the reply stays
+        # recoverable; trusting instead would deliver it somewhere nobody
+        # asked for and close the row saying it went home.
+        if not identity_readable or not known:
+            logger.error(
+                "peer completion declared reply_to.agent=%r but this box "
+                "cannot verify it (identity_readable=%s, known_peers=%d) — "
+                "refusing; dropping (handoff stays open)",
+                agent, identity_readable, len(known),
+            )
+            return False
+
+        if agent not in known:
             logger.error(
                 "peer completion declared reply_to.agent=%r which is not a "
                 "known peer on this box (known: %s) — refusing; dropping "
