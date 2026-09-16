@@ -4819,6 +4819,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 lock_active=lock_active,
                 agent_overrides=agent_overrides,
                 requesting_user=str(body.get("from") or body.get("peer") or "peer"),
+                reply_to=body.get("reply_to") if isinstance(body.get("reply_to"), dict) else None,
             )
 
         history = await self._conversation_history_for_session(session_id)
@@ -4881,6 +4882,7 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_active: bool,
         agent_overrides: Dict[str, Any],
         requesting_user: str,
+        reply_to: "Optional[Dict[str, Any]]" = None,
     ) -> "web.Response":
         """Run the turn in the background; answer the caller immediately.
 
@@ -4976,6 +4978,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "text": text,
                     "peer": str(requesting_user),
                     "handoff_id": handoff.id if handoff is not None else None,
+                    # WHERE THE REPLY GOES, which is not where the turn ran.
+                    # session_id above is LOCAL — it names the session on THIS
+                    # box that produced the text. Delivering to it sends the
+                    # answer back to ourselves, which is exactly what happened
+                    # on a live pair on 2026-09-16. reply_to is the sender's
+                    # declared return address and is None for a local or
+                    # old-sender turn, in which case local delivery is right.
+                    "reply_to": reply_to,
                 })
             except Exception:
                 logger.exception(

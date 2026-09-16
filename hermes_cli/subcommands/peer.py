@@ -55,6 +55,53 @@ ACCEPT_TIMEOUT_S = 30
 LIST_TIMEOUT_S = 30
 
 
+def _self_origin() -> "dict | None":
+    """Where a reply to THIS agent should be delivered, or None if unknowable.
+
+    Returns ``{"agent": <name>, "host": <hostname>}`` read from
+    ``identity.json``. Returns None rather than guessing: a fabricated return
+    address is worse than none, because the peer would deliver a real reply to
+    a place nobody reads and the send would still look successful.
+
+    Deliberately NOT a session id. Which session a reply belongs in is the
+    receiving gateway's business — it already resolves a peer's long-lived Bot
+    Chat session by title. Sending a session id would also let one box name a
+    session on another box, which is the shape of thing that should stay
+    impossible.
+    """
+    import json as _json
+    import os as _os
+    import socket as _socket
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = _os.path.join(str(get_hermes_home()), "identity.json")
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+    except Exception:
+        return None
+
+    agent = data.get("agent")
+    if isinstance(agent, dict):
+        agent = agent.get("name")
+    agent = (str(agent or "")).strip()
+    if not agent:
+        # No declared identity: say nothing rather than invent one.
+        return None
+
+    host = (str(data.get("host") or "")).strip()
+    if not host:
+        try:
+            host = _socket.gethostname()
+        except Exception:
+            host = ""
+    origin = {"agent": agent}
+    if host:
+        origin["host"] = host
+    return origin
+
+
 def _peer_key_env(name: str) -> str:
     return f"HERMES_PEER_{name.upper().replace('-', '_')}_KEY"
 
@@ -443,6 +490,22 @@ def cmd_peer(args) -> int:
             # peers ignore the flag and run the turn synchronously; that is
             # why the timeout below is still honoured rather than assumed.
             body["wait"] = False
+            # A RETURN ADDRESS, and without it --no-wait delivers nowhere.
+            #
+            # Measured 2026-09-16 on a live pair: the peer's watcher took the
+            # completion event's `session_id` — which the producer set to the
+            # session the TURN RAN IN, i.e. a session on the PEER's box — and
+            # faithfully delivered the reply back into the peer's own
+            # transcript. Both halves behaved correctly and the reply never
+            # crossed the network. The sender is the only party that knows
+            # where the answer should go, so the sender has to say.
+            #
+            # `reply_to` is a hint, not a command: a peer that does not
+            # understand it ignores an unknown key, exactly as older peers
+            # ignore `wait`. Nothing here assumes the far side is new.
+            origin = _self_origin()
+            if origin:
+                body["reply_to"] = origin
 
         try:
             result = _request(

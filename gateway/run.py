@@ -28059,6 +28059,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "avoid an unroutable retry loop: keys=%s", sorted(evt)
             )
             return True  # unroutable forever; requeueing would spin
+
+        # ROUTE FIRST. `session_id` names the session on THIS box that produced
+        # the text — delivering there sends the answer to ourselves. When the
+        # sender declared a return address, the reply belongs on the sender's
+        # box and goes back over the peer channel.
+        reply_to = evt.get("reply_to")
+        if isinstance(reply_to, dict) and (reply_to.get("agent") or "").strip():
+            # VALIDATE BEFORE DISPATCH. The check lives here, in the router,
+            # not inside _return_peer_completion — a guard inside the method
+            # that performs the action can be bypassed by anything that
+            # replaces that method, including a test fake, which is exactly
+            # how I first wrote it and exactly why F1 failed against my own
+            # fixture. Validation belongs on the path every caller takes.
+            if not self._reply_to_is_trustworthy(reply_to, evt):
+                return True  # wrong forever; requeueing would spin
+            try:
+                ok = await self._return_peer_completion(reply_to, text, evt)
+            except Exception:
+                logger.exception(
+                    "peer completion return-to-sender failed for %s", reply_to
+                )
+                return False
+            if ok:
+                self._close_peer_handoff(evt)
+            return bool(ok)
+
         try:
             ok = await self._inject_peer_completion_turn(session_id, text, evt)
         except Exception:
@@ -28085,6 +28111,136 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         handoff_id,
                     )
         return bool(ok)
+
+    def _reply_to_is_trustworthy(self, reply_to: dict, evt: dict) -> bool:
+        """Is this remote-supplied return address safe to deliver to?
+
+        THE ADDRESS ARRIVES FROM THE NETWORK. `agent` goes straight into argv
+        of a peer send, so an event that arrived FROM `wren` carrying
+        reply_to={"agent": "someone-else"} would otherwise deliver the reply
+        there, report success, and close the handoff row. Loud success, wrong
+        destination — a silent misroute, which is the class this whole change
+        exists to close, one level up. Found by Ash attacking PR #32.
+
+        Not a shell-injection risk (create_subprocess_exec takes a list). The
+        defect is granting a property that is never checked.
+
+        This is checkable precisely BECAUSE the address is an agent NAME: a
+        name can be compared against who actually sent the turn and against
+        what this box already knows. An opaque session id could only be taken
+        on faith.
+        """
+        agent = str(reply_to.get("agent") or "").strip()
+        sender = str(evt.get("peer") or "").strip()
+        if sender and agent != sender:
+            logger.error(
+                "peer completion declared reply_to.agent=%r but the turn came "
+                "from peer=%r — refusing to deliver to an unverified third "
+                "party; dropping (handoff stays open)", agent, sender,
+            )
+            return False
+
+        # `host` was collected, carried and never read (Ash's C1). An unused
+        # field invites the assumption that it is validated, so compare it
+        # against what identity.json already records for that peer.
+        declared_host = str(reply_to.get("host") or "").strip().casefold()
+        if not declared_host:
+            return True
+        known_host = ""
+        try:
+            import json as _json
+            import os as _os
+
+            from hermes_constants import get_hermes_home
+
+            with open(
+                _os.path.join(str(get_hermes_home()), "identity.json"),
+                encoding="utf-8",
+            ) as fh:
+                peers = _json.load(fh).get("peers") or {}
+            known_host = str(
+                (peers.get(agent) or {}).get("host") or ""
+            ).strip().casefold()
+        except Exception:
+            known_host = ""
+        if known_host and declared_host != known_host:
+            logger.error(
+                "peer completion from %r declared host %r but this box knows "
+                "%r as %r — refusing; dropping (handoff stays open)",
+                sender, declared_host, agent, known_host,
+            )
+            return False
+        return True
+
+    def _close_peer_handoff(self, evt: dict) -> None:
+        """Close the handoff row after a delivery that actually happened.
+
+        Failure to close is logged and swallowed: the reply DID reach its
+        destination, so an open row means "looks owed when it isn't", which is
+        the safe direction. The reverse — closing a row for an undelivered
+        reply — is the silent failure this whole path exists to prevent.
+        """
+        handoff_id = evt.get("handoff_id")
+        if not handoff_id:
+            return
+        try:
+            from gateway.handoff import DELIVERED, HandoffStore
+            from hermes_constants import get_hermes_home
+            import os as _os
+
+            store = HandoffStore(
+                _os.path.join(str(get_hermes_home()), "handoffs.jsonl"),
+                author="peer_completion_watcher",
+            )
+            store.record(handoff_id, DELIVERED)
+        except Exception:
+            logger.exception(
+                "delivered peer completion but could not close handoff %s",
+                handoff_id,
+            )
+
+    async def _return_peer_completion(
+        self, reply_to: dict, text: str, evt: dict
+    ) -> bool:
+        """Send a finished turn back to the peer that asked for it.
+
+        Uses `hermes peer dm` WITHOUT --no-wait deliberately. A reply is short
+        and terminal: the far side records it and does not answer, so blocking
+        for its accept costs nothing and gets a real success/failure. Using
+        --no-wait here would make a returned reply that itself went missing
+        indistinguishable from one that landed.
+
+        Returns False on any failure so the caller requeues and the handoff
+        row stays open.
+        """
+        agent = str(reply_to.get("agent") or "").strip()
+        if not agent:
+            return False
+        import asyncio as _asyncio
+        import shutil as _shutil
+
+        exe = _shutil.which("hermes")
+        if not exe:
+            logger.error("cannot return peer completion: no hermes on PATH")
+            return False
+        body = f"[reply from {evt.get('peer') or 'peer'}]\n\n{text}"
+        try:
+            proc = await _asyncio.create_subprocess_exec(
+                exe, "peer", "dm", agent, body,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            _out, err = await _asyncio.wait_for(proc.communicate(), timeout=120)
+        except Exception:
+            logger.exception("returning peer completion to %s raised", agent)
+            return False
+        if proc.returncode != 0:
+            logger.error(
+                "returning peer completion to %s failed rc=%s: %s",
+                agent, proc.returncode, (err or b"").decode()[:300],
+            )
+            return False
+        return True
 
     async def _inject_peer_completion_turn(
         self, session_id: str, text: str, evt: dict
