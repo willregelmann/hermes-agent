@@ -22,6 +22,12 @@ changes, and does not regrow one entry per lookup for the same key.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import sys
+import types
+from argparse import Namespace
+
 
 def test_apikey_providers_cache_is_keyed_not_a_bare_global():
     from hermes_cli import doctor
@@ -102,26 +108,103 @@ def test_two_profiles_do_not_pin_each_other(monkeypatch, tmp_path):
     assert len(calls) == 2, "re-lookup under the same profile must be served from cache"
 
 
-def test_run_doctor_call_site_uses_the_real_accessor(monkeypatch, tmp_path):
-    """MUTANT-KILLING CASE for the exact hole wren393 found: if run_doctor()
-    stopped calling _apikey_providers_for_home() (e.g. someone reintroduces
-    an inline `global _APIKEY_PROVIDERS_CACHE` read at the call site that
-    bypasses the keyed accessor), this must fail even though the OTHER
-    cases above — which call the accessor directly — would still pass."""
-    from hermes_cli import doctor
-    import inspect
+# ---------------------------------------------------------------------------
+# THE CALL SITE, BOUND BEHAVIOURALLY (2026-09-17).
+#
+# This replaces test_run_doctor_call_site_uses_the_real_accessor, which was an
+# inspect.getsource() substring check.  MEASURED: a mutant that reintroduces an
+# unkeyed inline read at the call site AND leaves the accessor name in the
+# function under `if False:` reproduces the pinning bug and PASSES that check.
+# The name being present and the call site using it are different facts, and a
+# substring check reads only the first.
+#
+# These arms drive run_doctor() twice under two HERMES_HOME values with the
+# provider-list builder faked to one network-free provider named after the
+# resolved home, and assert on the labels it PRINTED plus the build order.
+# ---------------------------------------------------------------------------
+_PROVIDER_ENV = (
+    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
+    "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "KIMI_API_KEY", "KIMI_CN_API_KEY",
+    "ARCEEAI_API_KEY", "DEEPSEEK_API_KEY", "HF_TOKEN", "DASHSCOPE_API_KEY",
+    "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY", "AI_GATEWAY_API_KEY", "KILOCODE_API_KEY",
+    "OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY", "XIAOMI_API_KEY", "GMI_API_KEY",
+)
 
-    src = inspect.getsource(doctor.run_doctor)
-    assert "_apikey_providers_for_home()" in src, (
-        "run_doctor() must read the API-key provider list through the keyed "
-        "accessor _apikey_providers_for_home(), not by touching "
-        "_APIKEY_PROVIDERS_CACHE directly — a direct read/write at the call "
-        "site can drift out of sync with the accessor's key resolution and "
-        "silently reintroduce the pinning bug this suite exists to catch."
+
+def _doctor_output_under(doctor_mod, monkeypatch, home, project, label):
+    """Run run_doctor() with HERMES_HOME=home and return its stdout."""
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    return buf.getvalue()
+
+
+def test_run_doctor_call_site_serves_the_current_profile(monkeypatch, tmp_path):
+    from hermes_cli import doctor as doctor_mod
+
+    doctor_mod._reset_apikey_providers_cache_for_tests()
+
+    project = tmp_path / "project"
+    project.mkdir()
+    homes = {}
+    for name in ("profile_a", "profile_b"):
+        h = tmp_path / name
+        h.mkdir()
+        (h / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+        (h / ".env").write_text("", encoding="utf-8")
+        homes[name] = h
+
+    for env_name in _PROVIDER_ENV:
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("WREN_FAKE_PROVIDER_KEY", "k")
+
+    monkeypatch.setitem(sys.modules, "model_tools", types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    ))
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    import hermes_constants
+
+    builds = []
+
+    def fake_build():
+        # One distinct, network-free provider per HERMES_HOME.
+        name = hermes_constants.get_hermes_home().name
+        builds.append(name)
+        return [(f"WrenProbe-{name}", ["WREN_FAKE_PROVIDER_KEY"],
+                 "https://example.invalid/v1/models", "", False)]
+
+    monkeypatch.setattr(doctor_mod, "_build_apikey_providers_list", fake_build)
+
+    out_a = _doctor_output_under(doctor_mod, monkeypatch, homes["profile_a"], project, "a")
+    assert "WrenProbe-profile_a" in out_a, (
+        "non-vacuity: profile A's own provider must be probed and printed"
     )
-    assert "global _APIKEY_PROVIDERS_CACHE" not in src, (
-        "run_doctor() must not declare _APIKEY_PROVIDERS_CACHE global — that "
-        "was the pre-fix bare-global shape."
+
+    out_b = _doctor_output_under(doctor_mod, monkeypatch, homes["profile_b"], project, "b")
+    assert "WrenProbe-profile_b" in out_b, (
+        "run_doctor under profile B served a provider list that is not B's — "
+        "the call site is reading the cache under the wrong key (or no key)"
+    )
+    assert "WrenProbe-profile_a" not in out_b, (
+        "run_doctor under profile B still printed profile A's provider — the "
+        "pinning bug is back at the call site"
+    )
+
+    out_a2 = _doctor_output_under(doctor_mod, monkeypatch, homes["profile_a"], project, "a2")
+    assert "WrenProbe-profile_a" in out_a2
+    assert builds == ["profile_a", "profile_b"], (
+        f"the call site must memoize per profile; builds={builds}"
     )
 
 
