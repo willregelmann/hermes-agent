@@ -38,6 +38,7 @@ the source: no runtime site may reference the import-time constant.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -211,30 +212,99 @@ check("E1c control prefill is A", field(out_c, "prefill") == "PROFILE-A",
 
 SRC = Path(TREE, "cli.py").read_text(encoding="utf-8")
 
-print("\nE2. WHOLE-CLASS INVARIANT -- no runtime site reads the import-time constant")
+print("\nE2. WHOLE-CLASS INVARIANT -- no runtime site reads the import-time home")
+# ALIAS-AWARE (2026-09-17, wren:i27 round 6).  The previous version grepped for
+# the NAME ``_IMPORT_TIME_HERMES_HOME``.  Measured: rebinding a runtime reader to
+# ``_CLI_CONFIG_IMPORT_HOME`` -- a module-level alias of the SAME VALUE, added by
+# #21 -- reproduced the exact frozen-profile defect and this invariant did not
+# see it (3 mutants survived: _history_file, paste_dir, onboarding mark_seen).
+# THE NAME AND THE VALUE ARE DIFFERENT FACTS.  So the population is now derived
+# from the AST: every module-level name transitively bound to the constant, and
+# the allowlist applies to all of them.
+def _alias_names(src: str) -> set[str]:
+    tree = ast.parse(src)
+    names = {"_IMPORT_TIME_HERMES_HOME"}
+    changed = True
+    while changed:
+        changed = False
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Name)
+                    and node.value.id in names):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id not in names:
+                        names.add(t.id)
+                        changed = True
+    return names
+
+
+_NAMES = _alias_names(SRC)
 code_lines = [l for l in SRC.splitlines() if not l.lstrip().startswith("#")]
-hits = [l.strip() for l in code_lines
-        if re.search(r"(?<![\w.])_IMPORT_TIME_HERMES_HOME(?![\w])", l)]
+_pat = re.compile(r"(?<![\w.])(" + "|".join(sorted(_NAMES)) + r")(?![\w])")
+hits = [l.strip() for l in code_lines if _pat.search(l)]
+print(f"    tracked names: {sorted(_NAMES)}")
 for h in hits:
     print(f"    {h}")
 check("E2a the constant still exists and is still assigned once",
       sum(1 for h in hits if h.startswith("_IMPORT_TIME_HERMES_HOME =")) == 1,
       f"hits={hits}")
-# WIDENED 2026-09-15 (#21): the invariant is "no RUNTIME reader", not "exactly
-# two lines".  #21 adds import-time uses (the pinned config load + its
-# divergence warning), so the check is now an allowlist of import-time shapes
-# -- anything else is a runtime reader and fails.  The non-vacuity arm is E2a:
-# if the constant vanished, hits would be empty and this would pass for free.
+check("E2a2 the alias derivation is not vacuous (it found the #21 alias too)",
+      len(_NAMES) >= 2,
+      f"only {_NAMES} -- if #21's _CLI_CONFIG_IMPORT_HOME is gone, re-check the allowlist")
+# the allowlist is a list of IMPORT-TIME shapes; anything else is a runtime reader.
 _ALLOWED = ("_IMPORT_TIME_HERMES_HOME = ",
             "load_hermes_dotenv(",
-            "_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME")
+            "_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME",
+            "if str(get_hermes_home()) != str(_CLI_CONFIG_IMPORT_HOME)",
+            "get_hermes_home(), _CLI_CONFIG_IMPORT_HOME,",
+            "home=_CLI_CONFIG_IMPORT_HOME")
 _stray = [h for h in hits if not any(h.startswith(a) or a in h for a in _ALLOWED)]
-check("E2b every use is import-time; no runtime site reads the snapshot",
+check("E2b no runtime site reads the import-time home under ANY of its names",
       len(hits) >= 2 and not _stray,
       f"a runtime reader is still on the snapshot: {_stray or hits}")
 check("E2c the old name is gone entirely (no reader left behind under it)",
       not re.search(r"(?<![\w.])_hermes_home(?![\w])", SRC),
       "a bare `_hermes_home` survives -- the rename was partial")
+
+
+print("\nG. THE #21 PIN -- module CLI_CONFIG and the config->env bridge")
+# #21 pinned the module-body config load to the PROCESS home so that importing
+# cli.py inside another profile's scope could not freeze CLI_CONFIG (and export
+# that profile's HERMES_SEARCH_SLOW_MS / TERMINAL_* into the shared environment,
+# where it OUTLIVES the scope).  Nothing asserted it: measured 2026-09-17, a
+# mutant reverting the pin to get_hermes_home() survived all 24 cases.  These
+# two arms read the module global and the exported env var from the same child
+# that D/E already run under.
+_G_PROBE = """
+    import os
+    os.environ["HERMES_HOME"] = %(A)r
+    from hermes_constants import (get_hermes_home, set_hermes_home_override,
+                                  reset_hermes_home_override)
+    tok = set_hermes_home_override(%(B)r)
+    import cli
+    reset_hermes_home_override(tok)
+    print("module_config:", cli.CLI_CONFIG.get("model", {}).get("default"))
+    print("env_bridge:", os.environ.get("HERMES_SEARCH_SLOW_MS"))
+"""
+# distinguishable, per-home value for the env bridge
+for _h, _v in ((HOME_A, "907"), (HOME_B, "111")):
+    Path(_h, "config.yaml").write_text(
+        "model:\n  default: %s\nsessions:\n  search_slow_ms: %s\n"
+        % ("PROFILE-A" if _h == HOME_A else "PROFILE-B", _v), encoding="utf-8")
+
+rc_g, out_g = run(_G_PROBE % {"A": HOME_A, "B": HOME_B}, TREE)
+_mc, _eb = field(out_g, "module_config"), field(out_g, "env_bridge")
+print(f"    module CLI_CONFIG : {_mc}")
+print(f"    exported env      : HERMES_SEARCH_SLOW_MS={_eb}")
+check("G0 the pin child ran", rc_g == 0 and _mc != "<MISSING>",
+      f"rc={rc_g} out={out_g[-400:]}")
+check("G1 module CLI_CONFIG is pinned to the PROCESS home, not the importing scope",
+      _mc == "PROFILE-A", f"got {_mc!r}; pre-#21 this is PROFILE-B")
+check("G2 the config->env bridge exported the PROCESS home's value",
+      _eb == "907", f"got {_eb!r}; pre-#21 this is 111, and it outlives the scope")
+# restore the D/E fixture content for anything downstream
+for _h, _m in ((HOME_A, "PROFILE-A"), (HOME_B, "PROFILE-B")):
+    Path(_h, "config.yaml").write_text("model:\n  default: %s\n" % _m, encoding="utf-8")
+
 
 print("\nF. MUTANTS -- restore the snapshot read, one site at a time")
 
