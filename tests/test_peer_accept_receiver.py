@@ -87,6 +87,285 @@ from gateway.platforms.api_server import APIServerAdapter  # noqa: E402
 FakeAdapter._enqueue_session_chat = APIServerAdapter._enqueue_session_chat
 
 
+
+# ---------------------------------------------------------------------------
+# I / J / K / L: added 2026-09-17 after a mutation audit of merged PR #21.
+# 17 mutants against the accept-only receiver; the six original cases killed
+# six. Eight of the eleven survivors were real holes (two more, M2 and M10/M11,
+# are killed by the suites on open PRs #44 and #45 — cross-checked, not
+# assumed). Each case below names the mutant it exists to kill.
+# ---------------------------------------------------------------------------
+
+async def drive_gate():
+    """I: the wait=false GATE, on the real entry point.
+
+    Every case above calls _enqueue_session_chat DIRECTLY, so the line that
+    DECIDES to enqueue had no arm at all. M1 widened `body.get("wait") is
+    False` to `is not True` and passed all 19: an ordinary synchronous chat,
+    which sends no wait key, then returns 202 with no assistant content and
+    the caller reads a finished turn as enqueued — the #17 contract violated
+    from the other side.
+
+    The handler is wrapped by _admit_api_agent_request. Satisfy the gate
+    rather than reaching past it via __wrapped__: the point of driving the
+    entry point is that nothing upstream returns first.
+    """
+    import types
+    import gateway.platforms.api_server as A
+
+    async def once(body_extra):
+        cap = {"enqueued": False, "ran_sync": False}
+
+        class FakeAdapter:
+            _model_name = "virtual"
+            _pending_agent_requests = 0
+
+            def _room_grant_token(self, request): return None
+            def _check_auth(self, request): return None
+            def _draining_response(self): return None
+            def _parse_session_key_header(self, request): return ("k", None)
+            async def _get_existing_session_or_404(self, sid): return ({"id": sid}, None)
+            async def _read_json_body(self, request):
+                return (dict({"message": "hi"}, **body_extra), None)
+            def _effective_session_runtime_request(self, session=None, body=None): return {}
+            def _runtime_lock_error(self, rr): return None
+            def _persist_session_runtime_lock(self, sid, rr): return True
+            def _stored_session_model(self, session): return None
+            def _resolve_route(self, alias): return None
+            def _request_route_conflict_error(self, **kw): return None
+
+            async def _enqueue_session_chat(self, **kw):
+                cap["enqueued"] = True
+                cap.update(kw)
+                return "ACCEPTED"
+
+            async def _conversation_history_for_session(self, sid): return []
+
+            async def _run_agent(self, **kw):
+                cap["ran_sync"] = True
+                return ({"final_response": "sync answer", "session_id": "s-local"}, {})
+
+        FakeAdapter._handle_session_chat = A.APIServerAdapter._handle_session_chat
+        req = types.SimpleNamespace(match_info={"session_id": "s-local"},
+                                    path="/api/sessions/s-local/chat", headers={})
+        try:
+            out = await FakeAdapter()._handle_session_chat(req)
+        except Exception as exc:  # a sync turn needs more of the adapter than
+            out = f"<raised {type(exc).__name__}>"  # we fake; the flags decide
+        return out, cap
+
+    _, c_false = await once({"wait": False})
+    case("I1 wait=false takes the accept path", c_false["enqueued"] is True,
+         f"cap={ {k: c_false[k] for k in ('enqueued', 'ran_sync')} }")
+    _, c_absent = await once({})
+    case("I2 NO wait key is a SYNCHRONOUS turn, not an accept (kills M1)",
+         c_absent["enqueued"] is False,
+         "a widened gate turns every ordinary chat into a 202 with no content, "
+         "so the sender reads a finished turn as merely enqueued (#17 contract)")
+    _, c_true = await once({"wait": True})
+    case("I3 wait=true is synchronous too (kills M1)",
+         c_true["enqueued"] is False, f"enqueued={c_true['enqueued']}")
+    case("I4 NON-VACUITY: the synchronous branch was actually reached",
+         c_absent["ran_sync"] is True or c_true["ran_sync"] is True,
+         "if neither sync call reached _run_agent, I2/I3 would pass for a "
+         "handler that returned early for an unrelated reason")
+
+
+async def drive_store(tmpdir):
+    """J: the REAL _handoff_store. Every case above fakes it wholesale, so the
+    method that resolves the record's PATH was untested surface (R13b).
+
+    M14 changed "handoffs.jsonl" to "handoff.jsonl" and passed all 19: the
+    receiver would write every row to a file no other reader of the record
+    ever opens, and staleness — the whole replacement for the blocking POST —
+    goes permanently quiet while looking healthy.
+    """
+    import gateway.platforms.api_server as A
+
+    home = os.path.join(tmpdir, "store-home")
+    os.makedirs(home, exist_ok=True)
+    prev_home = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = home
+    try:
+        adapter = object.__new__(A.APIServerAdapter)
+        store = A.APIServerAdapter._handoff_store(adapter)
+        case("J1 the real store resolves (non-vacuity for J2/J3)",
+             store is not None, "store came back None")
+        if store is None:
+            return
+        h = store.open_handoff(from_session="wren", to_session="s-j",
+                               requesting_user="wren", intent="probe")
+        canonical = os.path.join(home, "handoffs.jsonl")
+        reader = HandoffStore(canonical, author="independent")
+        ids = [r.id for r in reader.all_latest()]
+        case("J2 rows land where every OTHER reader looks (kills M14)",
+             h.id in ids,
+             f"an independent reader of {canonical} saw {ids}; a receiver "
+             f"writing to a private path leaves staleness permanently silent")
+        second = A.APIServerAdapter._handoff_store(adapter)
+        case("J3 the store is memoised, not rebuilt per turn (kills M15)",
+             second is store, "a fresh store per accept re-reads the whole "
+                              "record on every peer turn")
+    finally:
+        if prev_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = prev_home
+
+
+async def drive_degraded(tmpdir):
+    """K: the two ways the record can be unusable.
+
+    The docstring on _handoff_store says None is "a degraded mode, never a
+    silent one", and the except-clause around open_handoff says "a record
+    failure must not swallow the work". Both are prose invariants with no arm
+    (lesson 73). M16 (`if store is not None` -> `if True`) and M17 (re-raise
+    instead of log) each passed all 19 cases, and each turns a missing ROW
+    into a lost TURN.
+    """
+    class NoStoreAdapter(FakeAdapter):
+        def _handoff_store(self):
+            return None
+
+    class RaisingStore:
+        def open_handoff(self, **kw):
+            raise OSError("record is read-only")
+
+    class BadStoreAdapter(FakeAdapter):
+        def _handoff_store(self):
+            return RaisingStore()
+
+    ad_none = NoStoreAdapter(os.path.join(tmpdir, "unused-none.jsonl"))
+    resp = await ad_none._enqueue_session_chat(
+        session_id="sess-k1", user_message="x", system_prompt=None,
+        gateway_session_key="k", route=None, session_model=None,
+        runtime_request={}, lock_active=False, agent_overrides={},
+        requesting_user="wren")
+    body_k = json.loads(resp.body.decode())
+    case("K1 no store at all still ACCEPTS the turn (kills M16)",
+         resp.status == 202 and body_k.get("accepted") is True,
+         f"status={resp.status} body={body_k}")
+    case("K1b and the response omits handoff_id rather than inventing one",
+         "handoff_id" not in body_k, f"body={body_k}")
+    await asyncio.wait_for(ad_none.turn_finished.wait(), timeout=TURN_SECONDS + 5)
+    case("K1c the UNTRACKED turn still runs to completion",
+         ad_none.turn_finished.is_set(), "a degraded record silently ate the work")
+
+    # The call is GUARDED. A mutant that re-raises past the except clause
+    # would otherwise kill the whole run, and an aborted run reads as zero
+    # failures to any harness that counts FAIL lines — neither red nor green
+    # (lesson 77). A broken subject must produce a NAMED FAILING CASE.
+    ad_bad = BadStoreAdapter(os.path.join(tmpdir, "unused-bad.jsonl"))
+    resp2 = None
+    raised = None
+    try:
+        resp2 = await ad_bad._enqueue_session_chat(
+            session_id="sess-k2", user_message="x", system_prompt=None,
+            gateway_session_key="k", route=None, session_model=None,
+            runtime_request={}, lock_active=False, agent_overrides={},
+            requesting_user="wren")
+    except Exception as exc:  # noqa: BLE001
+        raised = exc
+    case("K2 a store that RAISES does not swallow the accept (kills M17)",
+         raised is None and resp2 is not None and resp2.status == 202,
+         f"raised={raised!r} — 'a record failure must not swallow the work' "
+         f"is stated in the source and was asserted nowhere")
+    if raised is None:
+        try:
+            await asyncio.wait_for(ad_bad.turn_finished.wait(),
+                                   timeout=TURN_SECONDS + 5)
+        except asyncio.TimeoutError:
+            pass
+        case("K2b and the turn itself still runs (kills M17)",
+             ad_bad.turn_finished.is_set(),
+             "re-raising past the except turns an unwritable row into a lost turn")
+    else:
+        case("K2b and the turn itself still runs (kills M17)", False,
+             "the accept raised, so no turn was ever started")
+
+    # K3: M16 is VERDICT-EQUIVALENT and needs the log, not the return value.
+    # Changing `if store is not None:` to `if True:` calls open_handoff on
+    # None; the AttributeError lands in the except clause right below, which
+    # logs and carries on, so status, body and the turn are all identical.
+    # Two mechanisms refusing the same input mask each other (lesson 77) —
+    # what distinguishes them is WHAT THE OPERATOR IS TOLD. The None-store
+    # path is supposed to be quietly degraded; reaching open_handoff on None
+    # reports a handoff FAILURE that never happened, on every single turn.
+    import gateway.platforms.api_server as _A
+    seen_msgs = []
+    real_exc = _A.logger.exception
+
+    def _spy(msg, *a, **kw):
+        seen_msgs.append(str(msg))
+        return real_exc(msg, *a, **kw)
+
+    _A.logger.exception = _spy
+    try:
+        ad_none2 = NoStoreAdapter(os.path.join(tmpdir, "unused-none2.jsonl"))
+        await ad_none2._enqueue_session_chat(
+            session_id="sess-k3", user_message="x", system_prompt=None,
+            gateway_session_key="k", route=None, session_model=None,
+            runtime_request={}, lock_active=False, agent_overrides={},
+            requesting_user="wren")
+        await asyncio.wait_for(ad_none2.turn_finished.wait(),
+                               timeout=TURN_SECONDS + 5)
+        await asyncio.sleep(0.2)
+    finally:
+        _A.logger.exception = real_exc
+    case("K3 a None store is SKIPPED, not called and caught (kills M16)",
+         not any("could not open a handoff row" in m for m in seen_msgs),
+         f"logged={seen_msgs} — the guard and the except clause refuse the "
+         f"same input, so only the message tells them apart")
+
+
+async def drive_handles(tmpdir):
+    """L: the things the CALLER is left holding.
+
+    A mutant that deletes a recovery HANDLE leaves the VERDICT intact, so no
+    status/accepted assertion can see it (lesson 80, second half). M13 dropped
+    the X-Hermes-Session-Id header and M12 put the LOCAL session id in the
+    completion event's `peer` field; both passed all 19.
+    """
+    from tools.process_registry import process_registry as _pr
+
+    while True:
+        try:
+            _pr.completion_queue.get_nowait()
+        except Exception:
+            break
+
+    ad = FakeAdapter(os.path.join(tmpdir, "l.jsonl"))
+    resp = await ad._enqueue_session_chat(
+        session_id="sess-l", user_message="x", system_prompt=None,
+        gateway_session_key="kk", route=None, session_model=None,
+        runtime_request={}, lock_active=False, agent_overrides={},
+        requesting_user="ash")
+    case("L1 the accept names the session in a HEADER too (kills M13)",
+         resp.headers.get("X-Hermes-Session-Id") == "sess-l",
+         f"headers={dict(resp.headers)} — the session id is the only handle "
+         f"to an answer that has not arrived yet")
+    case("L1b and echoes the session key (non-vacuity for L1)",
+         resp.headers.get("X-Hermes-Session-Key") == "kk",
+         f"headers={dict(resp.headers)}")
+
+    await asyncio.wait_for(ad.turn_finished.wait(), timeout=TURN_SECONDS + 5)
+    await asyncio.sleep(0.3)
+    evts = []
+    while True:
+        try:
+            evts.append(_pr.completion_queue.get_nowait())
+        except Exception:
+            break
+    mine = [e for e in evts if e.get("session_id") == "sess-l"]
+    case("L2 the completion event names the REQUESTER as peer (kills M12)",
+         bool(mine) and mine[0].get("peer") == "ash",
+         f"evt={mine[0] if mine else None} — the local session id here sends "
+         f"the reply back to ourselves, the 2026-09-16 live failure")
+    case("L3 a finished task is discarded from the strong-ref set (kills M7)",
+         len(ad._accepted_chat_tasks) == 0,
+         f"n={len(ad._accepted_chat_tasks)} — G proves the task is HELD; "
+         f"nothing proved it is ever RELEASED, so the set grows per turn")
+
 async def main() -> None:
     tmp = tempfile.mkdtemp(prefix="wren-recv-")
     print("=== receiver: accept-only chat ===")
@@ -217,6 +496,17 @@ async def main() -> None:
          sender_reads_as_completed(mutant_body) is True)
     case("H the real accept response is NOT misread (mutant killed)",
          sender_reads_as_completed(body) is False, f"body={body}")
+
+    # --- I/J/K/L: added by the PR #21 mutation audit ---------------------
+    await drive_gate()
+    await drive_store(tmp)
+    await drive_degraded(tmp)
+    await drive_handles(tmp)
+
+    CASE_FLOOR = 35  # measured AFTER the run, not guessed (lesson 79e)
+    if ran < CASE_FLOOR:
+        fails.append(f"CASE FLOOR: only {ran} cases ran (expected >= {CASE_FLOOR})")
+        print(f"  FAIL  case floor  ran={ran}")
 
     print()
     if fails:
