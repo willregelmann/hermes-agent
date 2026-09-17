@@ -60,6 +60,8 @@ security:
   redact_secrets: true
 terminal:
   timeout: 999
+  ssh_host: host-from-B
+  docker_image: image-from-B
 browser:
   inactivity_timeout: 99
 """
@@ -75,7 +77,11 @@ CHILD = textwrap.dedent(
     import hermes_constants as hc
 
     def snap():
-        return {k: os.environ.get(k) for k in WATCHED}
+        # The WHOLE environment, not a watchlist.  A pure read must write NO
+        # key; naming five of ~35 bridged vars makes the arm blind to the
+        # other thirty (measured: a mutant leaking TERMINAL_SSH_HOST /
+        # TERMINAL_DOCKER_IMAGE / TERMINAL_ENV survived the watchlist arm).
+        return dict(os.environ)
 
     out = {"home_A": str(hc.get_hermes_home()), "env_after_import": snap()}
     out["cfgA_slow"] = (cli.CLI_CONFIG.get("sessions") or {}).get("search_slow_ms")
@@ -97,6 +103,7 @@ CHILD = textwrap.dedent(
             out["exporter_present"] = False
         else:
             out["exporter_present"] = True
+            out["env_before_explicit_export"] = snap()
             exporter(cfgB, True)
             out["env_after_explicit_export"] = snap()
     finally:
@@ -193,11 +200,74 @@ def test_load_follows_the_profile_home_override(probe):
 
 
 def test_reading_config_under_another_profile_does_not_write_process_env(probe):
-    """The regression. A read is a read."""
+    """The regression. A read is a read -- of EVERY key, not of a watchlist.
+
+    The population matters more than the assertion here.  An earlier version of
+    this arm compared five named vars; a mutant that re-leaked only
+    ``TERMINAL_SSH_HOST`` / ``TERMINAL_DOCKER_IMAGE`` / ``TERMINAL_ENV`` --
+    none of them in that list, all of them written by the same bridge --
+    survived the whole suite.  Diff the entire environment instead: the claim
+    being made is "writes nothing", and that claim has no watchlist.
+    """
     before = probe["env_before_B_call"]
     after = probe["env_after_B_call"]
-    leaked = {k: (before[k], after[k]) for k in after if before[k] != after[k]}
+    keys = set(before) | set(after)
+    leaked = {
+        k: (before.get(k), after.get(k))
+        for k in keys
+        if before.get(k) != after.get(k)
+    }
     assert leaked == {}, "load_cli_config() exported profile B's config: %r" % (leaked,)
+
+
+def test_scope_exit_leaves_the_environment_exactly_as_import_left_it(probe):
+    """The persistence half: leaks that survive the scope are the damaging ones.
+
+    Same whole-environment population as above, over the widest possible span:
+    import time to after ``reset_hermes_home_override``.  Note the explicit
+    ``_export_config_to_env(cfgB, ...)`` call in between is DELIBERATE and does
+    write B's values, so this arm compares against ``env_after_explicit_export``
+    -- it asserts that nothing ELSE moved, and in particular that scope exit
+    itself neither writes nor restores.
+    """
+    after_export = probe["env_after_explicit_export"]
+    at_exit = probe["env_after_scope_exit"]
+    keys = set(after_export) | set(at_exit)
+    moved = {
+        k: (after_export.get(k), at_exit.get(k))
+        for k in keys
+        if after_export.get(k) != at_exit.get(k)
+    }
+    assert moved == {}, "environment moved across scope exit: %r" % (moved,)
+
+
+def test_explicit_export_covers_the_whole_terminal_mapping(probe):
+    """Population arm for the exporter itself.
+
+    ``_export_config_to_env`` bridges ~35 keys through one ``env_mappings``
+    loop.  Asserting three of them cannot distinguish "the loop ran" from "the
+    loop ran once and broke".  Assert on the SET of keys the export introduces
+    or changes, which is derived from the environment diff rather than from a
+    list written by hand here.
+    """
+    before = probe["env_before_explicit_export"]
+    after = probe["env_after_explicit_export"]
+    changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
+    # B's config sets terminal.timeout, browser.inactivity_timeout, redact,
+    # cjk_fts and search_slow_ms; the terminal loop additionally re-asserts the
+    # resolved env_type/degraded_mode/cwd defaults.
+    assert "TERMINAL_TIMEOUT" in changed
+    assert "HERMES_SEARCH_SLOW_MS" in changed
+    assert "HERMES_REDACT_SECRETS" in changed
+    assert "HERMES_CJK_FTS" in changed
+    assert "BROWSER_INACTIVITY_TIMEOUT" in changed
+    # ...and the mapping loop must reach past its first entry.
+    terminal_keys = {k for k in changed if k.startswith("TERMINAL_")}
+    assert terminal_keys >= {"TERMINAL_TIMEOUT", "TERMINAL_SSH_HOST", "TERMINAL_DOCKER_IMAGE"}, (
+        "the terminal env_mappings loop bridged only %r -- it did not run to "
+        "completion (B's config sets timeout, ssh_host and docker_image, which "
+        "sit at different positions in env_mappings)" % (sorted(terminal_keys),)
+    )
 
 
 def test_export_helper_still_bridges_when_called_explicitly(probe):
