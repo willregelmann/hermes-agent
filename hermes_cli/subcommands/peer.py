@@ -506,6 +506,12 @@ def cmd_peer(args) -> int:
             origin = _self_origin()
             if origin:
                 body["reply_to"] = origin
+                # Name ourselves so the receiver's record says WHO, not the
+                # placeholder "peer". This is SELF-ATTESTATION and proves
+                # nothing on its own — it exists so the row and the logs name
+                # a real sender. Verification happens against the receiver's
+                # OWN identity.json, which the sender cannot influence.
+                body.setdefault("from", origin.get("agent"))
 
         try:
             result = _request(

@@ -28132,21 +28132,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         agent = str(reply_to.get("agent") or "").strip()
         sender = str(evt.get("peer") or "").strip()
-        if sender and agent != sender:
+
+        # WHAT THIS CHECK CAN AND CANNOT DO — corrected after it refused a
+        # legitimate reply on a live pair, 2026-09-16 11:31:46:
+        #     reply_to.agent='wren' but the turn came from peer='peer'
+        # The accept path defaults requesting_user to the literal "peer" when
+        # the sender does not name itself, so the comparison could never match
+        # and the ONLY thing the guard ever did in production was refuse a
+        # real reply. It was written against a fixture that supplied a sender
+        # name no real sender sends.
+        #
+        # Worse, the comparison is weak even when both fields are populated:
+        # `peer` and `reply_to` arrive in the SAME request from the SAME
+        # party, so agreement between them is self-attestation. A sender that
+        # lies about one lies about both.
+        #
+        # So the load-bearing check is the one against LOCAL state: the agent
+        # must be a peer THIS box already knows, and its host must match what
+        # we recorded. identity.json is not attacker-supplied.
+        if sender and sender != "peer" and agent != sender:
             logger.error(
                 "peer completion declared reply_to.agent=%r but the turn came "
-                "from peer=%r — refusing to deliver to an unverified third "
-                "party; dropping (handoff stays open)", agent, sender,
+                "from peer=%r — refusing; dropping (handoff stays open)",
+                agent, sender,
             )
             return False
 
-        # `host` was collected, carried and never read (Ash's C1). An unused
-        # field invites the assumption that it is validated, so compare it
-        # against what identity.json already records for that peer.
-        declared_host = str(reply_to.get("host") or "").strip().casefold()
-        if not declared_host:
-            return True
-        known_host = ""
+        known = {}
+        identity_readable = False
         try:
             import json as _json
             import os as _os
@@ -28157,13 +28170,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _os.path.join(str(get_hermes_home()), "identity.json"),
                 encoding="utf-8",
             ) as fh:
-                peers = _json.load(fh).get("peers") or {}
-            known_host = str(
-                (peers.get(agent) or {}).get("host") or ""
-            ).strip().casefold()
+                known = _json.load(fh).get("peers") or {}
+            identity_readable = True
         except Exception:
-            known_host = ""
-        if known_host and declared_host != known_host:
+            identity_readable = False
+
+        # "NO POLICY AVAILABLE" IS NOT "POLICY SAYS YES" — Ash's H1-H4 on #34.
+        # In #32 the identity read was scoped to the host half, so a damaged
+        # file disabled only the host comparison and the known-peer check
+        # survived (his D2 asserted exactly that). Moving the read above the
+        # known-peer check and returning True on failure widened the hole from
+        # one comparison to the whole predicate, and H3/H4 reach it with NO
+        # file damage at all: `if known and ...` short-circuits whenever the
+        # peers map is missing or empty, leaving nothing checking the address
+        # while every G arm stays green.
+        #
+        # So an unverifiable address is REFUSED, not trusted. A box that
+        # cannot read its own peer list cannot know where a reply belongs —
+        # the same reason _self_origin() returns None rather than guessing on
+        # the sending side. The row stays open and the reply stays
+        # recoverable; trusting instead would deliver it somewhere nobody
+        # asked for and close the row saying it went home.
+        if not identity_readable or not known:
+            logger.error(
+                "peer completion declared reply_to.agent=%r but this box "
+                "cannot verify it (identity_readable=%s, known_peers=%d) — "
+                "refusing; dropping (handoff stays open)",
+                agent, identity_readable, len(known),
+            )
+            return False
+
+        if agent not in known:
+            logger.error(
+                "peer completion declared reply_to.agent=%r which is not a "
+                "known peer on this box (known: %s) — refusing; dropping "
+                "(handoff stays open)", agent, sorted(known),
+            )
+            return False
+
+        declared_host = str(reply_to.get("host") or "").strip().casefold()
+        known_host = str(
+            (known.get(agent) or {}).get("host") or ""
+        ).strip().casefold()
+        if declared_host and known_host and declared_host != known_host:
             logger.error(
                 "peer completion from %r declared host %r but this box knows "
                 "%r as %r — refusing; dropping (handoff stays open)",

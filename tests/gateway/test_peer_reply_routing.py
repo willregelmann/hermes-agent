@@ -106,10 +106,34 @@ check("B4 no identity -> None, NOT a fabricated address",
       f"while the send still looks successful")
 
 # ---- C: routing, driven on the real method ---------------------------
+# Tests run against the REAL production identity.json unless told otherwise,
+# and #34's fix means a box with no known peers refuses every address. That is
+# correct behaviour, but it would make the in-process arms (C/D/E/G1) depend on
+# THIS machine's peer list, which is not their subject. Give them a jailed home
+# with a known peer so they measure ROUTING; the H arms below own the
+# no-policy question and each use their own home.
+_home_jail = tempfile.mkdtemp(prefix="wren-testhome-")
+with open(os.path.join(_home_jail, "identity.json"), "w", encoding="utf-8") as _fh:
+    json.dump({"agent": "wren", "host": "ha-pi.local",
+               "peers": {"ash": {"host": "will-ms-7b93.local"},
+                         "wren": {"host": "ha-pi.local"}}}, _fh)
+os.environ["HERMES_HOME"] = _home_jail
+
 import gateway.run as R  # noqa: E402
 from gateway.handoff import DELIVERED, OPEN, HandoffStore  # noqa: E402
 
+# ONE HOME, ONE STORE. The production closer resolves the handoff store from
+# HERMES_HOME, so if the test reads a store at a DIFFERENT path than the
+# subject writes, C3 goes red against correct code — the test half and the
+# production half never touch the same file. That is the untethered-by-data-
+# location defect, and it cost me a red C3 here.
+# The same home also needs a peers map, because #34 refuses any address it
+# cannot verify. The H arms below use their own throwaway homes.
 tmp = tempfile.mkdtemp(prefix="wren-route-")
+with open(os.path.join(tmp, "identity.json"), "w", encoding="utf-8") as _fh:
+    json.dump({"agent": "wren", "host": "ha-pi.local",
+               "peers": {"ash": {"host": "will-ms-7b93.local"},
+                         "wren": {"host": "ha-pi.local"}}}, _fh)
 os.environ["HERMES_HOME"] = tmp
 path = os.path.join(tmp, "handoffs.jsonl")
 
@@ -224,6 +248,213 @@ async def drive():
                    reply_to={"agent": "wren"}))) is True,
           "the refusal arm cannot be distinguished from a subject that never "
           "returns at all")
+
+    # ---- G: THE LIVE SHAPE. Every case above supplied a sender name that no
+    # real sender sends. The accept path defaults requesting_user to the
+    # literal "peer", so on the live pair the guard refused the ONLY kind of
+    # reply that actually occurs:
+    #     11:31:46 reply_to.agent='wren' but the turn came from peer='peer'
+    # A fixture that supplies a value production never supplies tests a
+    # different system. These cases use the real defaulted string.
+    h6 = store.open_handoff(from_session="peer", to_session="s6",
+                            requesting_user="peer", intent="live shape")
+    evt6 = {"type": "peer_completion", "session_id": "local", "text": "ack",
+            "peer": "peer", "handoff_id": h6.id,
+            "reply_to": {"agent": "ash", "host": "will-ms-7b93.local"}}
+    r6 = FakeRunner()
+    ok6 = await r6._deliver_peer_completion(evt6)
+    check("G1 THE LIVE SHAPE: peer='peer' + a KNOWN agent DELIVERS",
+          r6.returned == [("ash", "ack")],
+          f"returned={r6.returned} — this is the exact event the live guard "
+          f"refused at 11:31:46; if this fails the chain is still broken")
+    check("G2 and the row closes on that delivery", ok6 is True, f"got {ok6}")
+
+    # G3/G4 need a REAL identity.json — without one the abstention path fires
+    # and the unknown-agent check never runs, which is precisely the failure
+    # my own control caught. Point HERMES_HOME at a temp home containing a
+    # known-peers file, in a child so nothing leaks.
+    import subprocess as _sp2
+
+    jail2 = tempfile.mkdtemp(prefix="wren-known-")
+    with open(os.path.join(jail2, "identity.json"), "w", encoding="utf-8") as fh:
+        json.dump({"agent": "wren", "host": "ha-pi.local",
+                   "peers": {"ash": {"host": "will-ms-7b93.local"}}}, fh)
+    probe_src = f'''import os, sys
+os.environ["HERMES_HOME"] = {jail2!r}
+sys.path.insert(0, {TREE!r})
+import gateway.run as R
+
+
+class F:
+    def __init__(self):
+        self.returned = []
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+f = F()
+print("KNOWN=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "will-ms-7b93.local"}}, {{"peer": "peer"}})))
+print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    probe_path = os.path.join(jail2, "probe.py")
+    with open(probe_path, "w", encoding="utf-8") as fh:
+        fh.write(probe_src)
+    pr = _sp2.run([sys.executable, probe_path], capture_output=True,
+                  text=True, timeout=180)
+    out = pr.stdout
+    check("G3 CONTROL: with a real identity.json, an UNKNOWN agent is REFUSED",
+          "UNKNOWN=False" in out,
+          f"stdout={out[-300:]!r} stderr={pr.stderr[-200:]!r} — the fix must "
+          f"not be 'stop checking'")
+    check("G4 NON-VACUITY: the KNOWN agent is still trusted in the same run",
+          "KNOWN=True" in out,
+          f"stdout={out[-300:]!r} — if both arms agree the predicate is inert")
+
+    # ---- H: "NO POLICY AVAILABLE" IS NOT "POLICY SAYS YES" (Ash, #34 review)
+    # In #32 the identity read was scoped to the host half, so a damaged file
+    # disabled only the host comparison. Moving it above the known-peer check
+    # with `return True` on failure widened the hole to the WHOLE predicate,
+    # and H3/H4 reach it with NO file damage: `if known and ...` short-circuits
+    # on a missing or empty peers map. Every G arm stays green throughout,
+    # which is why only a differential probe finds it.
+    #
+    # THE DISCRIMINATING PAIR IS G3 vs H1, and it is Ash's: the SAME event and
+    # the SAME predicate in two different homes must give OPPOSITE verdicts.
+    # A single-home arm cannot tell "refuses correctly" from "refuses
+    # everything", which is the vacuous control he caught in his own review.
+    homes = {
+        "H1 no identity.json at all": None,
+        "H2 corrupt identity.json": "{ not json",
+        "H3 valid json, NO peers key": '{"agent": "wren"}',
+        "H4 valid json, EMPTY peers map": '{"agent": "wren", "peers": {}}',
+    }
+    for label, content in homes.items():
+        hj = tempfile.mkdtemp(prefix="wren-nopolicy-")
+        if content is not None:
+            with open(os.path.join(hj, "identity.json"), "w", encoding="utf-8") as fh:
+                fh.write(content)
+        src = f'''import os, sys
+os.environ["HERMES_HOME"] = {hj!r}
+sys.path.insert(0, {TREE!r})
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+print("V=" + repr(F()._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+        pp = os.path.join(hj, "p.py")
+        with open(pp, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        rr = _sp2.run([sys.executable, pp], capture_output=True, text=True,
+                      timeout=180)
+        check(f"{label} -> an unverifiable address is REFUSED",
+              "V=False" in rr.stdout,
+              f"stdout={rr.stdout.strip()!r} stderr={rr.stderr[-160:]!r} — "
+              f"trusting here delivers a real reply somewhere nobody asked "
+              f"for and closes the row saying it went home")
+
+    # ---- I: THE HOST HALF, AND THE LOG DISTINCTION ASH ASKED FOR
+    # Found by mutating my own subject after the H arms went green (round 4):
+    #   34E  delete the host-mismatch branch entirely   -> SURVIVED
+    #   34B  delete the "cannot verify" branch entirely -> SURVIVED
+    # 34E is a plain coverage hole: the host comparison has been in this
+    # predicate since #32 and NOTHING here ever asserted it, so a later edit
+    # could delete it with every arm green. I1/I2 close it.
+    #
+    # 34B is subtler and is the more interesting of the two. Deleting the
+    # unverifiable branch does not change any RETURN VALUE — an empty peers
+    # map falls through to `agent not in known` and refuses anyway. It is
+    # equivalent on the verdict and NOT equivalent on the thing Ash actually
+    # asked for: "abstained because unverifiable" and "policy says no" must
+    # not produce the same line, or the next person debugging cannot tell
+    # which happened. I3 asserts the two refusals are DISTINGUISHABLE in the
+    # log, which is the only place that distinction exists.
+    probe2_src = f'''import logging, os, sys
+os.environ["HERMES_HOME"] = {jail2!r}
+sys.path.insert(0, {TREE!r})
+logging.basicConfig(level=logging.ERROR, format="LOG:%(message)s")
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+f = F()
+print("HOSTBAD=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "attacker.example"}}, {{"peer": "peer"}})))
+print("HOSTGOOD=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "will-ms-7b93.local"}}, {{"peer": "peer"}})))
+print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    pp2 = os.path.join(jail2, "probe_host.py")
+    with open(pp2, "w", encoding="utf-8") as fh:
+        fh.write(probe2_src)
+    hr = _sp2.run([sys.executable, pp2], capture_output=True, text=True,
+                  timeout=180)
+    check("I1 a KNOWN agent declaring the WRONG HOST is REFUSED",
+          "HOSTBAD=False" in hr.stdout,
+          f"stdout={hr.stdout.strip()!r} stderr={hr.stderr[-200:]!r} — the "
+          f"host comparison has been unasserted since #32; mutant 34E "
+          f"deleted it and every other arm stayed green")
+    check("I2 NON-VACUITY: the SAME agent with the RIGHT host is TRUSTED",
+          "HOSTGOOD=True" in hr.stdout,
+          f"stdout={hr.stdout.strip()!r} — without this I1 passes against a "
+          f"predicate that refuses everything")
+
+    # I3: the two refusals must not be the same line. Home with no policy
+    # (H-shape) vs home with a policy that says no (G3-shape).
+    nopolicy = tempfile.mkdtemp(prefix="wren-logdist-")
+    with open(os.path.join(nopolicy, "identity.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"agent": "wren", "peers": {}}')
+    probe3_src = f'''import logging, os, sys
+os.environ["HERMES_HOME"] = {nopolicy!r}
+sys.path.insert(0, {TREE!r})
+logging.basicConfig(level=logging.ERROR, format="LOG:%(message)s")
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+print("V=" + repr(F()._reply_to_is_trustworthy(
+    {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    pp3 = os.path.join(nopolicy, "p.py")
+    with open(pp3, "w", encoding="utf-8") as fh:
+        fh.write(probe3_src)
+    nr = _sp2.run([sys.executable, pp3], capture_output=True, text=True,
+                  timeout=180)
+    nopolicy_log = "".join(
+        l for l in (nr.stderr + nr.stdout).splitlines(True) if "LOG:" in l)
+    knownhome_log = "".join(
+        l for l in (hr.stderr + hr.stdout).splitlines(True)
+        if "LOG:" in l and "known peer" in l)
+    check("I3 'cannot verify' and 'not a known peer' are DIFFERENT log lines",
+          ("cannot verify" in nopolicy_log
+           and "known peer" in knownhome_log
+           and "cannot verify" not in knownhome_log),
+          f"nopolicy={nopolicy_log.strip()[:200]!r} "
+          f"knownhome={knownhome_log.strip()[:200]!r} — both refuse, so the "
+          f"verdict cannot tell them apart; the log is the only place the "
+          f"distinction exists and Ash asked for it explicitly")
+
+    check("H5 DISCRIMINATION: G3(known home)=False and H1(no home)=False are "
+          "reached by DIFFERENT branches, and G4 proves the predicate still "
+          "says True somewhere",
+          "KNOWN=True" in out,
+          "if the predicate refused everything, every H arm would pass "
+          "vacuously; G4 is what rules that out")
 
     print()
 
