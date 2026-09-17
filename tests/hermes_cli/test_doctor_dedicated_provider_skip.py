@@ -17,8 +17,8 @@ from __future__ import annotations
 def test_build_apikey_providers_list_skips_dedicated_check_providers():
     from hermes_cli import doctor
 
-    # Force a rebuild — the module caches the list on first call.
-    doctor._APIKEY_PROVIDERS_CACHE = None
+    # _build_apikey_providers_list() is called directly here, bypassing the
+    # keyed cache dict entirely — it always rebuilds. Nothing to reset.
     entries = doctor._build_apikey_providers_list()
 
     # Tuple shape: (display_name, env_vars, default_url, base_env, supports_health_check)

@@ -929,7 +929,58 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
-_APIKEY_PROVIDERS_CACHE: list | None = None
+# HERMES_HOME (resolved) -> list. KEYED, NOT A BARE GLOBAL — same defect
+# shape as agent/turn_context.py::_RECALL_CFG_CACHE and
+# agent/relay_runtime.py::_SEGMENTS_CONFIG_CACHE (both fixed 2026-09-15/16):
+# _build_apikey_providers_list() calls providers.list_providers(), which
+# returns profile-scoped plugin registrations (bundled + $HERMES_HOME/plugins
+# + entry points). A bare global here would let the first profile's provider
+# list pin the doctor output for every other profile in the same process
+# until restart — the diagnostic would silently describe the wrong profile's
+# providers. Latent today (single-profile use is the common case) for the
+# same reason the other two were latent: profiles/ is empty on this box.
+#
+# NOT YET A FULL FIX for the underlying multiplex hazard: providers/__init__.py
+# ``_discovered``/``_REGISTRY`` are STILL bare globals one level down, so
+# ``list_providers()`` itself does not yet vary by resolved home — discovery
+# runs once per process and its per-plugin import guard is keyed by plugin
+# dirname, not by home, so a second profile's plugins/model-providers/<name>
+# would be silently skipped even after registry keying. Keying this cache
+# is still correct and non-regressive on its own (it removes ITS OWN
+# unbounded-pin defect immediately, and stops re-pinning the moment the
+# layer below is fixed) — tracked as the remaining wren:i24 member.
+_APIKEY_PROVIDERS_CACHE: dict[str, list] = {}
+
+
+def _apikey_providers_cache_key() -> str:
+    """Resolve the cache key: the HERMES_HOME this call would discover under."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    except Exception:
+        return ""
+
+
+def _reset_apikey_providers_cache_for_tests() -> None:
+    """Test hook — drop the doctor API-key provider list cache."""
+    _APIKEY_PROVIDERS_CACHE.clear()
+
+
+def _apikey_providers_for_home() -> list:
+    """The single accessor run_doctor() uses to read the keyed cache.
+
+    Extracted so tests can bind to the REAL lookup instead of re-deriving
+    the key/cache logic inline — a suite that reimplements the lookup can
+    pass while the production call site regresses (e.g. a stray `global`
+    reintroduced, or the cache read/written under a different key than the
+    one this function resolves). Every caller, test or production, goes
+    through this one function.
+    """
+    _key = _apikey_providers_cache_key()
+    if _key not in _APIKEY_PROVIDERS_CACHE:
+        _APIKEY_PROVIDERS_CACHE[_key] = _build_apikey_providers_list()
+    return _APIKEY_PROVIDERS_CACHE[_key]
 
 
 def _build_apikey_providers_list() -> list:
@@ -3096,10 +3147,7 @@ def run_doctor(args):
     _probes.append(("OpenRouter API", _probe_openrouter))
     _probes.append(("Anthropic API", _probe_anthropic))
 
-    global _APIKEY_PROVIDERS_CACHE
-    if _APIKEY_PROVIDERS_CACHE is None:
-        _APIKEY_PROVIDERS_CACHE = _build_apikey_providers_list()
-    for _entry in _APIKEY_PROVIDERS_CACHE:
+    for _entry in _apikey_providers_for_home():
         _pname, _env_vars, _default_url, _base_env, _supports = _entry
         # Capture loop vars by binding default args — without this, all closures
         # would share the final iteration's values and every probe would hit
