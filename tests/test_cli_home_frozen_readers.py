@@ -49,10 +49,17 @@ import textwrap
 from pathlib import Path
 
 FAILS: list[str] = []
+PASSES: list[str] = []
+
+# CASE FLOOR, set from the MEASURED count after the round-17 run (lesson 79e).
+# A script suite can die halfway and print zero FAIL lines; a fail-counting
+# harness reads that as green.  32 is what this file actually produces.
+CASE_FLOOR = 32
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     if cond:
+        PASSES.append(name)
         print(f"  PASS  {name}")
     else:
         FAILS.append(name)
@@ -221,26 +228,99 @@ print("\nE2. WHOLE-CLASS INVARIANT -- no runtime site reads the import-time home
 # THE NAME AND THE VALUE ARE DIFFERENT FACTS.  So the population is now derived
 # from the AST: every module-level name transitively bound to the constant, and
 # the allowlist applies to all of them.
+# ROUND 17 (2026-09-17, wren:i27).  The population above was still too small in
+# TWO ways, and three mutants proved it against the 28-case suite:
+#
+#   (a) THE VALUE HAS A SECOND SPELLING.  The frozen home is not only reachable
+#       through a NAME bound to the constant -- it is reachable by CALLING
+#       ``get_process_hermes_home()``, which is what the constant is assigned
+#       from.  That function ignores the ``_profile_runtime_scope`` override BY
+#       CONSTRUCTION, so a runtime reader that calls it lands in the process
+#       home while the turn belongs to another profile: the exact frozen-profile
+#       defect #19 exists to remove, one spelling over.  Measured: the second
+#       ``paste_dir`` site rewritten as ``get_process_hermes_home() / "pastes"``
+#       passed all 28 cases.
+#
+#   (b) THE ALIAS WALKER ONLY SAW ``name = name``.  ``a, b = FROZEN, True`` and
+#       ``alias = get_process_hermes_home()`` bind the same value and were both
+#       invisible; a reader on either survived all 28.
+#
+# So the derivation now ranges over module-level bindings of EITHER spelling,
+# including tuple targets, and the line pattern matches the CALL as well as the
+# names.  Sibling of lesson 72: a negative assertion must range over the whole
+# space the claim is about, and "the frozen home" is a VALUE with more than one
+# way to say it.
+_FROZEN_CALL = "get_process_hermes_home"
+
+
+def _is_frozen_expr(node: ast.AST, names: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in names
+    if isinstance(node, ast.Call):
+        f = node.func
+        return (isinstance(f, ast.Name) and f.id == _FROZEN_CALL) or (
+            isinstance(f, ast.Attribute) and f.attr == _FROZEN_CALL)
+    return False
+
+
 def _alias_names(src: str) -> set[str]:
+    """Every module-level name bound to the frozen home, under either spelling."""
     tree = ast.parse(src)
     names = {"_IMPORT_TIME_HERMES_HOME"}
     changed = True
     while changed:
         changed = False
-        for node in tree.body:
-            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Name)
-                    and node.value.id in names):
-                for t in node.targets:
-                    if isinstance(t, ast.Name) and t.id not in names:
-                        names.add(t.id)
-                        changed = True
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            if value is None:
+                continue
+            # elementwise for `a, b = x, y`; whole-value otherwise
+            pairs = []
+            for t in targets:
+                if isinstance(t, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)) \
+                        and len(t.elts) == len(value.elts):
+                    pairs.extend(zip(t.elts, value.elts))
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    pairs.extend((e, value) for e in t.elts)
+                else:
+                    pairs.append((t, value))
+            for tgt, val in pairs:
+                if isinstance(tgt, ast.Name) and tgt.id not in names and _is_frozen_expr(val, names):
+                    names.add(tgt.id)
+                    changed = True
     return names
 
 
-_NAMES = _alias_names(SRC)
-code_lines = [l for l in SRC.splitlines() if not l.lstrip().startswith("#")]
-_pat = re.compile(r"(?<![\w.])(" + "|".join(sorted(_NAMES)) + r")(?![\w])")
-hits = [l.strip() for l in code_lines if _pat.search(l)]
+# the allowlist is a list of IMPORT-TIME shapes; anything else is a runtime reader.
+_ALLOWED = ("_IMPORT_TIME_HERMES_HOME = ",
+            "load_hermes_dotenv(",
+            "_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME",
+            "if str(get_hermes_home()) != str(_CLI_CONFIG_IMPORT_HOME)",
+            "get_hermes_home(), _CLI_CONFIG_IMPORT_HOME,",
+            "home=_CLI_CONFIG_IMPORT_HOME")
+# the import of the frozen-home resolver itself is not a read of it.  Matched
+# EXACTLY, not as a substring, so it cannot accidentally excuse a reader.
+_ALLOWED_EXACT = ("get_process_hermes_home,", "get_process_hermes_home",
+                  "from hermes_constants import get_process_hermes_home")
+
+
+def _scan(src: str):
+    """(tracked names, matching code lines, stray runtime readers) for a source."""
+    names = _alias_names(src)
+    code = [l for l in src.splitlines() if not l.lstrip().startswith("#")]
+    pat = re.compile(r"(?<![\w.])(" + "|".join(sorted(names) + [_FROZEN_CALL])
+                     + r")(?![\w])")
+    hits = [l.strip() for l in code if pat.search(l)]
+    stray = [h for h in hits
+             if h not in _ALLOWED_EXACT
+             and not any(h.startswith(a) or a in h for a in _ALLOWED)]
+    return names, hits, stray
+
+
+_NAMES, hits, _stray = _scan(SRC)
 print(f"    tracked names: {sorted(_NAMES)}")
 for h in hits:
     print(f"    {h}")
@@ -250,17 +330,41 @@ check("E2a the constant still exists and is still assigned once",
 check("E2a2 the alias derivation is not vacuous (it found the #21 alias too)",
       len(_NAMES) >= 2,
       f"only {_NAMES} -- if #21's _CLI_CONFIG_IMPORT_HOME is gone, re-check the allowlist")
-# the allowlist is a list of IMPORT-TIME shapes; anything else is a runtime reader.
-_ALLOWED = ("_IMPORT_TIME_HERMES_HOME = ",
-            "load_hermes_dotenv(",
-            "_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME",
-            "if str(get_hermes_home()) != str(_CLI_CONFIG_IMPORT_HOME)",
-            "get_hermes_home(), _CLI_CONFIG_IMPORT_HOME,",
-            "home=_CLI_CONFIG_IMPORT_HOME")
-_stray = [h for h in hits if not any(h.startswith(a) or a in h for a in _ALLOWED)]
 check("E2b no runtime site reads the import-time home under ANY of its names",
       len(hits) >= 2 and not _stray,
       f"a runtime reader is still on the snapshot: {_stray or hits}")
+
+# E2d -- THE INVARIANT IS ITSELF ARMED (round 17).  E2b asserts a NEGATIVE, and a
+# negative passes for free if the scan is broken, mis-anchored or too narrow.
+# Three spellings of the same frozen value are injected into a synthetic module
+# and EACH must be caught by name; then a clean module must produce no stray, so
+# the arm cannot pass by flagging everything.
+_SPELLINGS = {
+    "direct call": '                    paste_dir = get_process_hermes_home() / "pastes"',
+    "alias of the call": '        self._history_file = _PROC_HOME_ALIAS / ".hermes_history"',
+    "alias by tuple assign": '        self._history_file = _ALT_IMPORT_HOME / ".hermes_history"',
+}
+_SYNTH_HEAD = (
+    "from hermes_constants import get_process_hermes_home, get_hermes_home\n"
+    "_IMPORT_TIME_HERMES_HOME = get_process_hermes_home()\n"
+    "_CLI_CONFIG_IMPORT_HOME = _IMPORT_TIME_HERMES_HOME\n"
+    "_PROC_HOME_ALIAS = get_process_hermes_home()\n"
+    "_ALT_IMPORT_HOME, _alt_flag = _IMPORT_TIME_HERMES_HOME, True\n"
+    "class C:\n    def f(self):\n"
+)
+# The synthetic head's own binding lines are strays by construction (the
+# allowlist is written for cli.py's exact import-time lines), so each spelling
+# is judged by the DELTA against a clean control that reads the LIVE resolver.
+_CLEAN = _SYNTH_HEAD + '        paste_dir = get_hermes_home() / "pastes"\n'
+_clean_stray = set(_scan(_CLEAN)[2])
+check("E2d0 the control's live-resolver read is NOT flagged (scan is not indiscriminate)",
+      not [h for h in _clean_stray if "get_hermes_home() / \"pastes\"" in h],
+      f"a live get_hermes_home() read was called frozen: {sorted(_clean_stray)}")
+for _label, _line in _SPELLINGS.items():
+    _delta = set(_scan(_SYNTH_HEAD + _line + "\n")[2]) - _clean_stray
+    check(f"E2d the scan catches a frozen read spelled as: {_label}",
+          _delta == {_line.strip()},
+          f"missed it or over-caught -- delta={sorted(_delta)}")
 check("E2c the old name is gone entirely (no reader left behind under it)",
       not re.search(r"(?<![\w.])_hermes_home(?![\w])", SRC),
       "a bare `_hermes_home` survives -- the rename was partial")
@@ -357,11 +461,18 @@ mutate("        path = get_hermes_home() / path\n",
 def test_cli_home_frozen_readers() -> None:
     """pytest entry point -- the cases run at import."""
     assert not FAILS, f"{len(FAILS)} failed: {FAILS}"
+    assert len(PASSES) + len(FAILS) >= CASE_FLOOR, (
+        f"only {len(PASSES) + len(FAILS)} cases ran (floor {CASE_FLOOR}) -- "
+        f"the suite died partway and a fail count would read that as green")
 
 
 if __name__ == "__main__":
     print()
+    ran = len(PASSES) + len(FAILS)
     if FAILS:
         print(f"  {len(FAILS)} FAILED: {FAILS}")
         sys.exit(1)
-    print("  ALL PASS")
+    if ran < CASE_FLOOR:
+        print(f"  FAIL  case floor :: only {ran} cases ran (floor {CASE_FLOOR})")
+        sys.exit(1)
+    print(f"  ALL PASS ({ran} cases)")
