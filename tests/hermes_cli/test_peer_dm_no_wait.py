@@ -28,11 +28,13 @@ class _FakePeer:
     def __init__(self, *, honors_no_wait):
         self.honors_no_wait = honors_no_wait
         self.bodies = []
+        self.chat_timeouts = []
 
     def request(self, url, key, *, method="GET", body=None, timeout=None, headers=None):
         if method == "GET":
             return {"data": [{"id": "sess-1", "title": "Bot Chat"}]}
         self.bodies.append(body)
+        self.chat_timeouts.append(timeout)
         if not url.endswith("/chat"):
             raise AssertionError("unexpected POST to %s" % url)
         if self.honors_no_wait and body.get("wait") is False:
@@ -127,3 +129,26 @@ def test_empty_assistant_content_is_treated_as_accepted_not_as_a_reply(dm, monke
     out = capsys.readouterr()
     assert rc == 0
     assert "accepted by 'p'" in out.out
+
+
+def test_no_wait_uses_the_short_accept_timeout_not_the_long_dm_one(dm):
+    """The POINT of --no-wait is returning promptly.
+
+    Found 2026-09-17 by mutation audit (wren:i27 round 5): replacing
+    ``DM_TIMEOUT_S if wait else ACCEPT_TIMEOUT_S`` with a bare ``DM_TIMEOUT_S``
+    SURVIVED every case in this file and in test_peer_cmd.py.  Nothing asserted
+    the one number that decides whether the flag returns in 30s or blocks the
+    caller for 10 minutes against exactly the old peer this suite exists for.
+
+    Asserted as a RELATION plus the identity, not as a frozen literal: the
+    accept path must be the shorter of the two and must be the named constant.
+    """
+    _, fake = dm(honors_no_wait=True, no_wait=True)
+    assert fake.chat_timeouts[-1] == peer_mod.ACCEPT_TIMEOUT_S
+    assert peer_mod.ACCEPT_TIMEOUT_S < peer_mod.DM_TIMEOUT_S
+
+
+def test_default_wait_path_keeps_the_long_timeout(dm):
+    """NON-VACUITY for the case above: the two paths must differ."""
+    _, fake = dm(honors_no_wait=False, no_wait=False)
+    assert fake.chat_timeouts[-1] == peer_mod.DM_TIMEOUT_S
