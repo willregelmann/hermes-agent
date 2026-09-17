@@ -237,3 +237,115 @@ class TestEarlyInterfaceCacheIsProfileScoped:
         assert m._config_default_interface_early() == "tui"
         assert list(m._EARLY_INTERFACE_CACHE) == [m._early_interface_config_path()]
         assert m._early_interface_config_path() == str(root / "config.yaml")
+
+
+# ---------------------------------------------------------------------------
+# Precedence, the TRUE direction — restored after a suite-wide prune
+# ---------------------------------------------------------------------------
+# Commit 6b81590c55 ("prune low-value tests, wave 1") removed every case that
+# asserted a TUI decision resolving to True, plus both no-TTY gate cases.  What
+# survived only ever asserts False, so a resolver that returned False
+# unconditionally — or one with the --cli branch, the --tui branch, the TTY
+# gate or the error fallback deleted — passed the whole file.  Measured: eight
+# separate one-branch mutants of `_wants_tui_early` / `_resolve_use_tui`
+# survived all 13 remaining cases, including deletion of the no-TTY gate that
+# commit b06e2f846c exists to add (its absence is the kanban-worker
+# "protocol violation" crash).
+#
+# These assert the relationship each branch encodes, not a frozen value.
+
+
+class TestEarlyPrecedenceTrueDirection:
+    """`_wants_tui_early` — the branches whose only observable is True."""
+
+    @staticmethod
+    def _home(tmp_path, monkeypatch, interface):
+        (tmp_path / "config.yaml").write_text(
+            f"display:\n  interface: {interface}\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(m, "_EARLY_INTERFACE_CACHE", {})
+
+    def test_config_tui_boots_tui_on_a_tty(self, tmp_path, monkeypatch):
+        # The whole point of display.interface: tui. Nothing asserted it.
+        self._home(tmp_path, monkeypatch, "tui")
+        _fake_tty(monkeypatch, True)
+        assert m._wants_tui_early([]) is True
+
+    def test_no_tty_blocks_config_tui(self, tmp_path, monkeypatch):
+        # The load-bearing gate: ambient config must not hijack a pipe.
+        self._home(tmp_path, monkeypatch, "tui")
+        _fake_tty(monkeypatch, False)
+        assert m._wants_tui_early([]) is False
+
+    def test_cli_flag_beats_config_tui_on_a_tty(self, tmp_path, monkeypatch):
+        # Without a TTY this passes even with the --cli branch deleted.
+        self._home(tmp_path, monkeypatch, "tui")
+        _fake_tty(monkeypatch, True)
+        assert m._wants_tui_early(["--cli"]) is False
+
+    def test_explicit_tui_flag_survives_no_tty(self, tmp_path, monkeypatch):
+        # --tui is checked BEFORE the TTY gate: the user asked explicitly and
+        # gets the TUI's informative bail-out rather than silence.
+        self._home(tmp_path, monkeypatch, "cli")
+        _fake_tty(monkeypatch, False)
+        assert m._wants_tui_early(["--tui"]) is True
+
+    def test_env_tui_survives_no_tty(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch, "cli")
+        monkeypatch.setenv("HERMES_TUI", "1")
+        _fake_tty(monkeypatch, False)
+        assert m._wants_tui_early([]) is True
+
+    def test_unreadable_config_falls_back_to_cli_not_tui(
+        self, tmp_path, monkeypatch
+    ):
+        # Reached directly: _wants_tui_early's TTY gate returns before the
+        # config read under pytest capture, so the existing no-TTY case can
+        # never observe the except-branch's value.
+        (tmp_path / "config.yaml").write_text("this: : : not valid yaml\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(m, "_EARLY_INTERFACE_CACHE", {})
+        assert m._config_default_interface_early() == "cli"
+
+
+class TestResolveUseTuiPrecedenceTrueDirection:
+    """`_resolve_use_tui` — same branches, the args-aware resolver."""
+
+    def test_config_tui_boots_tui_on_a_tty(self, monkeypatch):
+        _patch_config(monkeypatch, "tui")
+        _fake_tty(monkeypatch, True)
+        assert m._resolve_use_tui(_args()) is True
+
+    def test_cli_flag_beats_config_tui_on_a_tty(self, monkeypatch):
+        _patch_config(monkeypatch, "tui")
+        _fake_tty(monkeypatch, True)
+        assert m._resolve_use_tui(_args(cli=True)) is False
+
+    def test_tui_flag_survives_no_tty(self, monkeypatch):
+        _patch_config(monkeypatch, "cli")
+        _fake_tty(monkeypatch, False)
+        assert m._resolve_use_tui(_args(tui=True)) is True
+
+    def test_no_tty_blocks_env_tui(self, monkeypatch):
+        _patch_config(monkeypatch, "cli")
+        monkeypatch.setenv("HERMES_TUI", "1")
+        _fake_tty(monkeypatch, False)
+        assert m._resolve_use_tui(_args()) is False
+
+    def test_isatty_raising_falls_back_to_classic(self, monkeypatch):
+        # The TTY probe's own except-branch: a stdio object whose isatty()
+        # explodes must not be treated as interactive.
+        import sys as _sys
+
+        def boom():
+            raise ValueError("I/O operation on closed file")
+
+        monkeypatch.setattr(_sys.stdin, "isatty", boom, raising=False)
+        monkeypatch.setenv("HERMES_TUI", "1")
+        assert m._resolve_use_tui(_args()) is False
+
+    def test_interface_value_is_case_insensitive(self, monkeypatch):
+        _patch_config(monkeypatch, "TUI")
+        _fake_tty(monkeypatch, True)
+        assert m._resolve_use_tui(_args()) is True
