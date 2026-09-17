@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cron.lifecycle_guard import contains_gateway_lifecycle_command as blocked  # noqa: E402
+from cron.lifecycle_guard import _ssh_target_is_remote as _ssh_target_is_remote_late  # noqa: E402
 
 fails: list = []
 ran = 0
@@ -96,6 +97,42 @@ case("absolute-path ssh binary is allowed",
 case("peer hermes gateway restart is allowed",
      blocked(f"ssh {PEER} hermes gateway restart") is False,
      "still blocked")
+
+print()
+print("=== CHAINED COMMANDS: one local segment poisons the whole command ===")
+#  The exemption is all(), not any(): a command is exempt only when EVERY
+#  executable segment is a provably-remote ssh. PR #24 claims this in prose
+#  and nothing asserted it -- mutating all()->any() survived all 25 cases,
+#  so the shell operator that makes the exemption safe was uncovered.
+LOCAL = 'systemctl --user restart hermes-gateway'
+HVERB = 'hermes gateway restart'
+case("remote ssh THEN local restart is blocked",
+     blocked(f"ssh {SYNTH} uptime; " + LOCAL) is True,
+     "a local lifecycle segment rode in behind a remote one")
+case("local restart THEN remote ssh is blocked",
+     blocked(LOCAL + f"; ssh {SYNTH} uptime") is True,
+     "a local lifecycle segment rode in ahead of a remote one")
+case("remote ssh && local hermes verb is blocked",
+     blocked(f"ssh {SYNTH} true && " + HVERB) is True,
+     "&& chaining bypassed the guard")
+case("remote ssh | local restart is blocked",
+     blocked(f"ssh {SYNTH} true | " + LOCAL) is True,
+     "pipe chaining bypassed the guard")
+case("two remote ssh segments stay allowed (chaining is not itself a block)",
+     blocked(f"ssh {SYNTH} uptime; ssh {SYNTH} " + HVERB) is False,
+     "the chained-command arms are only asserting that chaining blocks")
+
+print()
+print("=== LOOPBACK SPELLINGS: every self-name must refuse ===")
+#  _local_host_identities() carries four loopback literals. Only two were
+#  asserted; dropping ::1 and 0.0.0.0 survived the whole suite, so half the
+#  self-identity set was uncovered.
+for spelling in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+    case(f"ssh {spelling} self-restart is blocked",
+         blocked(f"ssh {spelling} " + LOCAL) is True,
+         "a loopback spelling was read as a peer")
+    case(f"predicate says {spelling} is NOT remote",
+         _ssh_target_is_remote_late(["ssh", spelling, "x"]) is False)
 
 print()
 print("=== NON-VACUITY: these cases must be able to fail ===")
