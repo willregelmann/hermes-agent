@@ -25,8 +25,13 @@ REPLY = "REAL REPLY, the whole answer, not a promise of one."
 class _FakePeer:
     """Records POST bodies; answers /api/sessions and .../chat."""
 
-    def __init__(self, *, honors_no_wait):
+    def __init__(self, *, honors_no_wait, peer_session_id="sess-1"):
         self.honors_no_wait = honors_no_wait
+        # The session the PEER says the turn is in. Defaults to the
+        # resolved one; a case that wants to tell "the peer's id" from
+        # "the id we already had" must make them DIFFER, or the two
+        # readings are observationally identical (lesson 72).
+        self.peer_session_id = peer_session_id
         self.bodies = []
         self.chat_timeouts = []
 
@@ -40,7 +45,8 @@ class _FakePeer:
         if self.honors_no_wait and body.get("wait") is False:
             # A real enqueue-and-return: no assistant content exists yet.
             return {"object": "hermes.session.chat.accepted",
-                    "session_id": "sess-1", "message_id": "m-9"}
+                    "session_id": self.peer_session_id,
+                    "message_id": "m-9"}
         return {"object": "hermes.session.chat.completion",
                 "session_id": "sess-1",
                 "message": {"role": "assistant", "content": REPLY},
@@ -49,8 +55,9 @@ class _FakePeer:
 
 @pytest.fixture
 def dm(monkeypatch):
-    def run(*, honors_no_wait, no_wait, as_json=False):
-        fake = _FakePeer(honors_no_wait=honors_no_wait)
+    def run(*, honors_no_wait, no_wait, as_json=False, peer_session_id="sess-1"):
+        fake = _FakePeer(honors_no_wait=honors_no_wait,
+                         peer_session_id=peer_session_id)
         monkeypatch.setattr(peer_mod, "_load_peers",
                             lambda: {"p": {"url": "http://127.0.0.1:1"}})
         monkeypatch.setattr(peer_mod, "_peer_secret", lambda name: "k")
@@ -152,3 +159,91 @@ def test_default_wait_path_keeps_the_long_timeout(dm):
     """NON-VACUITY for the case above: the two paths must differ."""
     _, fake = dm(honors_no_wait=False, no_wait=False)
     assert fake.chat_timeouts[-1] == peer_mod.DM_TIMEOUT_S
+
+
+# ---------------------------------------------------------------------------
+# THE ACCEPTED PATH'S RECOVERY HANDLE.
+#
+# Found 2026-09-17 by mutation audit of merged PR #17 (wren:i27 round 15).
+# Six mutants survived all six cases; PR #35 killed one and PR #44's sender
+# arms killed three more.  These two had no killer anywhere in the repo, and
+# both live on the GENUINELY-ACCEPTED branch -- the one that ships a promise
+# instead of an answer, and therefore the one where the session id is the
+# only thing the caller can use to go and read the reply later.
+#
+# Both mutants are DELETIONS OF A HANDLE, not of a verdict.  rc stays 0 and
+# the banner still prints, so no existing arm can see them.  That is lesson
+# 66's shape: a branch whose only observable effect is a diagnostic.
+# ---------------------------------------------------------------------------
+
+
+def test_accepted_path_prints_the_session_id_as_the_recovery_handle(dm, capsys):
+    """MUTANT M10: delete the session_id line from the accept banner.
+
+    The whole promise of --no-wait against a real async peer is "the answer
+    exists somewhere else, later".  The session id is the only handle to that
+    somewhere.  PR #12's body states the invariant for the FAILURE arms --
+    "every failure after the session id is known now prints it" -- and PR #40
+    armed those.  Nobody armed the SUCCESS arm, which is the one that
+    routinely leaves without an answer in hand.
+    """
+    rc, _ = dm(honors_no_wait=True, no_wait=True)
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "session_id: sess-1" in out.out, (
+        "accepted, no reply shown, and no handle printed -- the caller has "
+        "nothing to go and read"
+    )
+
+
+def test_accepted_path_reports_the_PEERS_session_id_not_the_local_one(dm, capsys):
+    """MUTANT M11: `result.get("session_id") or session_id` -> `session_id`.
+
+    The peer is the authority on which of ITS sessions the turn is running in.
+    Reporting the id we resolved before the POST prints a plausible, wrong
+    handle -- worse than none, because it names a session that exists.  The
+    fixture makes the two ids DIFFER; with the default fixture the mutant is
+    observationally identical to the fix.
+    """
+    rc, _ = dm(honors_no_wait=True, no_wait=True, peer_session_id="peer-side-99")
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "session_id: peer-side-99" in out.out, (
+        "printed the pre-POST id; the peer said the turn is elsewhere"
+    )
+
+
+def test_accepted_json_carries_the_peers_session_id_too(dm, capsys):
+    """Same claim on the --json channel: a scripted caller needs the handle."""
+    rc, _ = dm(honors_no_wait=True, no_wait=True, as_json=True,
+               peer_session_id="peer-side-99")
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert rc == 0
+    assert payload["session_id"] == "peer-side-99"
+
+
+def test_control_peer_omits_session_id_falls_back(monkeypatch, capsys):
+    """NON-VACUITY for the two above: the `or session_id` fallback must stay.
+
+    Without this, both cases above are satisfied by a version that reads
+    ONLY the peer's id and prints an empty handle when the peer omits it.
+    """
+    fake = _FakePeer(honors_no_wait=True)
+
+    def no_session(url, key, *, method="GET", body=None, timeout=None, headers=None):
+        res = fake.request(url, key, method=method, body=body, timeout=timeout)
+        res.pop("session_id", None)
+        return res
+
+    monkeypatch.setattr(peer_mod, "_load_peers",
+                        lambda: {"p": {"url": "http://127.0.0.1:1"}})
+    monkeypatch.setattr(peer_mod, "_peer_secret", lambda name: "k")
+    monkeypatch.setattr(peer_mod, "_request", no_session)
+    rc = peer_mod.cmd_peer(argparse.Namespace(peer_action="dm", target="p",
+                                              message="m", json=False,
+                                              no_wait=True))
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "session_id: sess-1" in out.out, (
+        "the peer named no session; the resolved one is the only handle left"
+    )
