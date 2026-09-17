@@ -276,6 +276,131 @@ d_msg, d_rc = fixed_report(d_exc)
 case("f a truly unreachable peer is still reported unreachable",
      "could not reach" in d_msg.lower() and d_rc == 1, f"{d_msg} rc={d_rc}")
 
+
+# --- g: THE SESSION ID ON EVERY FAILURE ARM --------------------------------
+#     The PR body promises: "Every failure after the session id is known now
+#     prints it." That sentence is the recovery contract -- a late reply is
+#     only recoverable if the handle is on screen -- and no case asserted it
+#     for three of the four arms. Mutants that deleted the session_id print
+#     from the HTTPError, RuntimeError and URLError/OSError arms all survived
+#     the original 18 cases. A claim stated in prose with no case behind it is
+#     a documented invariant with no binding.
+#
+#     Each arm is driven by REAL SERVER BEHAVIOUR, not by a raised sentinel:
+#       http500  -> HTTPError        (peer rejects the chat POST)
+#       nonjson  -> RuntimeError     (_request cannot parse the body)
+#       hangup   -> OSError          (peer closes the socket mid-response)
+#     In all three the Bot Chat session resolves FIRST, so session_id is known
+#     and the contract applies.
+
+
+class BreakingPeer:
+    """A peer that answers session lookup normally and then fails the chat POST."""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, code, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                self._json(200, {"sessions": [
+                    {"id": "sess-bot-chat", "title": P.BOT_CHAT_TITLE},
+                ]})
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                if not self.path.endswith("/chat"):
+                    self._json(200, {"session": {"id": "sess-bot-chat",
+                                                 "title": P.BOT_CHAT_TITLE}})
+                    return
+                if outer.mode == "http500":
+                    self._json(500, {"error": "boom"})
+                elif outer.mode == "nonjson":
+                    b = b"<html>not json</html>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                else:  # hangup: close without any response at all
+                    self.close_connection = True
+                    try:
+                        self.connection.close()
+                    except OSError:
+                        pass
+
+        self.httpd = HTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.t.start()
+        return self
+
+    def __exit__(self, *a):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+for _mode, _label, _expect_rc in (
+    ("http500", "g HTTPError", 1),
+    ("nonjson", "g RuntimeError", 1),
+    ("hangup", "g unreachable/OSError", 1),
+):
+    with BreakingPeer(_mode) as _bp:
+        _rc, _out, _err = run_dm(_bp.port)
+        case(f"{_label} arm exits {_expect_rc}",
+             _rc == _expect_rc, f"rc={_rc} err={_err[:160]}")
+        # NON-VACUITY: the arm must have been reached at all, i.e. the failure
+        # is the chat POST and not the session lookup -- otherwise "no session
+        # id printed" would be CORRECT rather than a defect.
+        case(f"{_label} arm did not fail at session resolution",
+             "resolving Bot Chat session" not in _err, f"err={_err[:160]}")
+        case(f"{_label} arm prints the session id (recovery contract)",
+             "sess-bot-chat" in _err, f"err={_err[:200]}")
+
+
+# --- h: THE DEFAULT PATH KEEPS ITS 600s PATIENCE ---------------------------
+#     `timeout = DM_TIMEOUT_S if wait else ACCEPT_TIMEOUT_S` is a CONDITIONAL,
+#     and only its false branch was covered: case c proves --no-wait uses the
+#     short timeout, nothing proved the default uses the long one. Collapsing
+#     it to `timeout = ACCEPT_TIMEOUT_S` -- which reintroduces the exact bug
+#     the PR fixes, a blocking send that gives up after 30s -- passed all 18.
+#
+#     Asserted as BEHAVIOUR under a shrunk pair, not by reading the constant:
+#     ACCEPT=1 would fail a 3s turn, DM=30 must not. The 3s/1s margin is wide
+#     and the failing direction is a TIMEOUT, so machine load can only make the
+#     fixed subject look broken, never the broken one look fixed (lesson 62).
+_sa, _sd = P.ACCEPT_TIMEOUT_S, P.DM_TIMEOUT_S
+P.ACCEPT_TIMEOUT_S = 1
+P.DM_TIMEOUT_S = 30
+try:
+    with FakePeer(delay=3.0) as peer:
+        rc, out, err = run_dm(peer.port)
+        case("h the DEFAULT path uses DM_TIMEOUT_S, not ACCEPT_TIMEOUT_S",
+             rc == 0 and "done thinking" in out,
+             f"rc={rc} out={out[:80]} err={err[:200]}")
+    # Non-vacuity control: the same turn under the SHORT timeout must fail,
+    # or the case above would pass no matter which branch was taken.
+    with FakePeer(delay=3.0, honour_wait=False) as peer:
+        rc2, out2, err2 = run_dm(peer.port, no_wait=True)
+        case("h non-vacuity: the same turn DOES time out on the short branch",
+             rc2 == 3, f"rc={rc2} err={err2[:160]}")
+finally:
+    P.ACCEPT_TIMEOUT_S, P.DM_TIMEOUT_S = _sa, _sd
+
 print()
 if fails:
     print(f"  {len(fails)} FAILED: {', '.join(fails)}")
