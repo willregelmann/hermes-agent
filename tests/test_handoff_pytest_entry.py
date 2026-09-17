@@ -40,6 +40,13 @@ def _run() -> tuple[int, str]:
 def test_handoff_suite_passes() -> None:
     """Run the script suite as a subprocess and require a real verdict.
 
+    The case floor is the part that earns its keep. A mutant that makes a
+    reader raise does not FAIL a case, it kills the run part-way through: no
+    FAIL line is ever printed, so a harness reading exit codes sees "no
+    failures". The floor turns a truncated run into a failure. Measured: with
+    `_rows()` catching a narrower exception the script dies after 24 of 65
+    cases, and this guard exits 1 where a fail-line count would have said zero.
+
     Asserting on the VERDICT TEXT as well as the exit code is deliberate: an
     empty or crashed run can exit 0 in some shells, and "no output" must not be
     mistaken for "no failures". The suite has to positively say ALL PASS.
@@ -48,8 +55,9 @@ def test_handoff_suite_passes() -> None:
     assert "ALL PASS" in out, f"suite did not report ALL PASS:\n{out[-2000:]}"
     assert code == 0, f"suite exited {code}:\n{out[-2000:]}"
     # Non-vacuity: a suite that ran no cases must not count as passing.
-    assert out.count("PASS ") >= 25, (
-        f"only {out.count('PASS ')} cases ran — suite may have collected nothing:\n"
+    assert out.count("PASS ") >= 60, (
+        f"only {out.count('PASS ')} cases ran (expected >= 60) — the suite may have "
+        f"collected nothing, or died part-way through:\n"
         f"{out[-2000:]}"
     )
 
@@ -59,4 +67,4 @@ if __name__ == "__main__":
     print(out)
     ran = out.count("PASS ")
     print(f"[pytest-visibility guard] cases executed: {ran}")
-    sys.exit(0 if ("ALL PASS" in out and code == 0 and ran >= 25) else 1)
+    sys.exit(0 if ("ALL PASS" in out and code == 0 and ran >= 60) else 1)
