@@ -35,8 +35,12 @@ import agent.turn_context as tc  # noqa: E402
 FAILS: list[str] = []
 
 
+_PASSED = {"n": 0}
+
+
 def check(name: str, cond: bool, detail: str = "") -> None:
     if cond:
+        _PASSED["n"] += 1
         print(f"  PASS  {name}")
     else:
         FAILS.append(name)
@@ -308,6 +312,316 @@ check(
 )
 _reset_cache()
 
+
+print("\nG. NEW ARMS (wren:i27 round 20 mutation audit)")
+
+# ---------------------------------------------------------------- G1
+# The resolver-unavailable fallback. `_recall_indicator_enabled` catches an
+# ImportError from gateway.display_config and reads the FLAT key with a
+# default of True. Nothing drove that branch: under the suite the gateway
+# import always succeeds, so flipping its default to False was invisible --
+# and that default is the "unconfigured box keeps today's behaviour" promise
+# on the one path where no gateway exists at all (plain CLI, the case the
+# comment names).
+import importlib as _importlib  # noqa: E402
+
+
+class _NoDisplayConfig:
+    """Make `from gateway.display_config import ...` raise, and prove it did."""
+
+    def __enter__(self):
+        self.saved = sys.modules.get("gateway.display_config", "<absent>")
+        sys.modules["gateway.display_config"] = None  # import -> ImportError
+        return self
+
+    def __exit__(self, *a):
+        if self.saved == "<absent>":
+            sys.modules.pop("gateway.display_config", None)
+        else:
+            sys.modules["gateway.display_config"] = self.saved
+        return False
+
+
+with _NoDisplayConfig():
+    _raised = False
+    try:
+        from gateway.display_config import resolve_display_setting  # noqa: F401
+    except ImportError:
+        _raised = True
+    check(
+        "G0 non-vacuity: the resolver import really fails in G1's fixture",
+        _raised,
+        "fixture does not block the import; G1 is measuring the resolver path",
+    )
+
+    _with_config({"display": {}})
+    check(
+        "G1 no resolver + unconfigured -> ON (flat-key default)",
+        tc._recall_indicator_enabled(ProductionShapedAgent()) is True,
+        "the no-gateway fallback silently disabled the indicator",
+    )
+    _with_config({"display": {"memory_recall_indicator": False}})
+    check(
+        "G1b no resolver + flat key off -> OFF (branch is load-bearing)",
+        tc._recall_indicator_enabled(ProductionShapedAgent()) is False,
+    )
+_reset_cache()
+
+
+# ---------------------------------------------------------------- G2
+# B4 asserts exactly one string, "off", so the whole falsey SET was
+# satisfiable by {"off"} alone. An arm asserting a carried value must range
+# over the space of values it claims to cover (lessons 72/76/83).
+_FALSEY = ["off", "OFF", "  Off  ", "false", "FALSE", "no", "NO", "0"]
+_TRUTHY = ["on", "true", "TRUE", "yes", "1", "anything-else", ""]
+
+_bad = []
+for _s in _FALSEY:
+    _with_config({"display": {"memory_recall_indicator": _s}})
+    if tc._recall_indicator_enabled(ProductionShapedAgent()) is not False:
+        _bad.append(_s)
+check("G2 every falsey spelling disables it", not _bad, f"still enabled for {_bad}")
+
+_bad = []
+for _s in _TRUTHY:
+    _with_config({"display": {"memory_recall_indicator": _s}})
+    if tc._recall_indicator_enabled(ProductionShapedAgent()) is not True:
+        _bad.append(_s)
+check("G2b every other string leaves it on", not _bad, f"wrongly disabled for {_bad}")
+_reset_cache()
+
+
+# ---------------------------------------------------------------- G3
+# The PR body claims: "Keying also means an edited config.yaml takes effect on
+# the next turn rather than requiring a restart." No case asserted it. The
+# freshness stamp lives in the cache VALUE, so dropping the `hit[:2] == stamp`
+# comparison keeps one entry per path forever and pins the first answer for
+# the life of the process -- which is the restart-required behaviour the key
+# exists to remove. Same path, edited file.
+def _edit_in_place_pair(first: dict, second: dict) -> tuple:
+    import pathlib
+    import hermes_cli.config as hc
+
+    home = tempfile.mkdtemp(prefix="g3cfg-")
+    cfgfile = os.path.join(home, "config.yaml")
+    with open(cfgfile, "w") as fh:
+        fh.write("display: {}\n")
+
+    seq = [first, second]
+    st = {"i": 0, "loads": 0}
+    orig_path, orig_load = hc.get_config_path, _gr._load_gateway_config
+
+    def fake_load():
+        st["loads"] += 1
+        cfg = seq[min(st["i"], 1)]
+        return cfg
+
+    hc.get_config_path = lambda: pathlib.Path(cfgfile)
+    _gr._load_gateway_config = fake_load
+    _reset_cache()
+    try:
+        a = tc._recall_indicator_enabled(ProductionShapedAgent())
+        # SAME path, new bytes: the user edited config.yaml.
+        st["i"] = 1
+        with open(cfgfile, "w") as fh:
+            fh.write("display: {}\n# edited by the user, changes size and mtime\n")
+        b = tc._recall_indicator_enabled(ProductionShapedAgent())
+        return [a, b], st["loads"]
+    finally:
+        hc.get_config_path = orig_path
+        _gr._load_gateway_config = orig_load
+        _reset_cache()
+
+
+_res, _loads = _edit_in_place_pair(OFF, ON)
+check(
+    "G3 an edited config.yaml takes effect on the next turn",
+    _res == [False, True],
+    f"got {_res}; a stamp-blind cache gives [False, False] until restart",
+)
+check("G3b ...and it did so by re-reading the file", _loads == 2, f"{_loads} loads")
+
+
+# ---------------------------------------------------------------- G4
+# When the config path cannot be identified the code deliberately does NOT
+# cache -- storing under a placeholder key is exactly the profile collision
+# the key exists to prevent, and no case covered the except branch. Two turns
+# with an unresolvable path must each see their own config.
+def _unkeyable_pair(first: dict, second: dict) -> tuple:
+    import hermes_cli.config as hc
+
+    seq = [first, second]
+    st = {"i": 0, "loads": 0}
+    orig_path, orig_load = hc.get_config_path, _gr._load_gateway_config
+
+    def boom():
+        raise RuntimeError("no profile home on this box")
+
+    def fake_load():
+        cfg = seq[min(st["i"], 1)]
+        st["i"] += 1
+        st["loads"] += 1
+        return cfg
+
+    hc.get_config_path = boom
+    _gr._load_gateway_config = fake_load
+    _reset_cache()
+    try:
+        return [tc._recall_indicator_enabled(ProductionShapedAgent()) for _ in range(2)], st["loads"]
+    finally:
+        hc.get_config_path = orig_path
+        _gr._load_gateway_config = orig_load
+        _reset_cache()
+
+
+_res, _loads = _unkeyable_pair(OFF, ON)
+check(
+    "G4 an unkeyable config is not cached under a placeholder key",
+    _res == [False, True],
+    f"got {_res}; caching under a constant key gives [False, False]",
+)
+check("G4b non-vacuity: both turns loaded", _loads == 2, f"{_loads} loads")
+
+
+# ---------------------------------------------------------------- G6
+# "LOAD UNDER THE LOCK, re-checking first" is a claim about CONCURRENT first
+# callers, and E1 only ever calls sequentially -- so moving the load outside
+# the lock passed. N threads arriving together must produce exactly one load.
+def _concurrent_first_callers(n: int = 8) -> int:
+    import pathlib
+    import threading as _th
+    import hermes_cli.config as hc
+
+    home = tempfile.mkdtemp(prefix="g6cfg-")
+    with open(os.path.join(home, "config.yaml"), "w") as fh:
+        fh.write("display: {}\n")
+    st = {"loads": 0}
+    lk = _th.Lock()
+    orig_path, orig_load = hc.get_config_path, _gr._load_gateway_config
+
+    def slow_load():
+        with lk:
+            st["loads"] += 1
+        time.sleep(0.05)  # widen the window a load-outside-the-lock would open
+        return {"display": {"memory_recall_indicator": False}}
+
+    hc.get_config_path = lambda: pathlib.Path(home, "config.yaml")
+    _gr._load_gateway_config = slow_load
+    _reset_cache()
+    barrier = _th.Barrier(n)
+
+    def worker():
+        barrier.wait()
+        tc._recall_indicator_enabled(ProductionShapedAgent())
+
+    try:
+        ts = [_th.Thread(target=worker) for _ in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(30)
+        return st["loads"]
+    finally:
+        hc.get_config_path = orig_path
+        _gr._load_gateway_config = orig_load
+        _reset_cache()
+
+
+import time  # noqa: E402
+
+_loads = _concurrent_first_callers()
+check(
+    "G6 eight concurrent first callers cause exactly one load",
+    _loads == 1,
+    f"{_loads} loads; the loader ran outside the lock",
+)
+
+
+# ---------------------------------------------------------------- G5
+# RLock, not Lock: the loader runs WITH THE LOCK HELD and late-imports
+# gateway.run, so a re-entrant call must degrade to a redundant load rather
+# than deadlock. Downgrading to a plain Lock hangs forever.
+#
+# A deadlock is not a failed assertion -- the thread never returns, holds the
+# lock, and every later case blocks behind it, turning a red suite into a
+# corpse a fail-counting harness reads as SURVIVED (lesson 77). So: run the
+# re-entrant call in a DAEMON THREAD with a join timeout, treat "did not
+# finish" as the failure, and if it did deadlock, rebind the module lock to a
+# fresh RLock so the abandoned thread cannot poison the cleanup below.
+# Deliberately LAST for the same reason.
+#
+# Not a child process: the child would need an interpreter that can import
+# this tree, and under uvx/pytest sys.executable cannot -- an arm that dies of
+# ModuleNotFoundError is a green light wired to nothing.
+def _reentrant_load_finishes(timeout_s: float = 10.0) -> tuple:
+    import pathlib
+    import threading as _th
+    import hermes_cli.config as hc
+
+    home = tempfile.mkdtemp(prefix="g5cfg-")
+    with open(os.path.join(home, "config.yaml"), "w") as fh:
+        fh.write("display: {}\n")
+
+    st = {"depth": 0, "loads": 0, "inner_ran": False}
+    orig_path, orig_load = hc.get_config_path, _gr._load_gateway_config
+
+    def reentrant_load():
+        # Stands in for the real loader's late `import gateway.run`: any import
+        # side effect that reaches back into the config path re-enters this
+        # function while the lock is already held by this same thread.
+        st["loads"] += 1
+        if st["depth"] == 0:
+            st["depth"] = 1
+            tc._recall_indicator_config()  # RE-ENTRY
+            st["inner_ran"] = True
+        return {"display": {"memory_recall_indicator": False}}
+
+    hc.get_config_path = lambda: pathlib.Path(home, "config.yaml")
+    _gr._load_gateway_config = reentrant_load
+    _reset_cache()
+
+    out = {}
+
+    def worker():
+        out["val"] = tc._recall_indicator_enabled(ProductionShapedAgent())
+
+    t = _th.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    hung = t.is_alive()
+    try:
+        return (not hung), out.get("val"), st
+    finally:
+        hc.get_config_path = orig_path
+        _gr._load_gateway_config = orig_load
+        if hung:
+            # The abandoned thread still holds the old lock. Rebind so the
+            # cleanup below cannot block on it.
+            import threading as _th2
+
+            tc._RECALL_CFG_LOCK = _th2.RLock()
+            tc._RECALL_CFG_CACHE.clear()
+        else:
+            _reset_cache()
+
+
+_finished, _val, _g5st = _reentrant_load_finishes()
+check(
+    "G5 a re-entrant load degrades to a redundant load, never a deadlock",
+    _finished,
+    "the loader never returned: a non-reentrant lock deadlocks the config read",
+)
+check(
+    "G5b non-vacuity: the fixture really did re-enter the loader",
+    _g5st["inner_ran"] and _g5st["loads"] >= 2,
+    f"no re-entry happened, so G5 proved nothing: {_g5st}",
+)
+check(
+    "G5c ...and the re-entrant turn still returns the configured answer",
+    _val is False,
+    f"got {_val}",
+)
+
 # ── CLEAN UP THE MONKEYPATCH ──────────────────────────────────────────────
 # `_with_config` replaces gateway.run._load_gateway_config and never restores
 # it. Standalone that is harmless (the process exits); under pytest this file
@@ -321,6 +635,20 @@ _reset_cache()
 def test_no_cross_file_pollution() -> None:
     """The loader this file patched is the real one again."""
     assert _gr._load_gateway_config is _REAL_LOADER
+
+
+CASE_FLOOR = 28  # MEASURED after the round-20 run, not guessed (lessons 79e / 83f).
+
+
+def test_case_floor() -> None:
+    """A script suite can die halfway and still print no FAIL line.
+
+    The count is the only thing that distinguishes "every case ran and passed"
+    from "the module raised at case 12 and the harness saw zero failures"
+    (lesson 77). Set from the measured count AFTER the mutation run.
+    """
+    ran = len(FAILS) + _PASSED["n"]
+    assert ran >= CASE_FLOOR, f"only {ran} cases ran, floor is {CASE_FLOOR}"
 
 
 def test_recall_indicator_production_shape() -> None:
@@ -339,4 +667,8 @@ if __name__ == "__main__":
     if FAILS:
         print(f"  {len(FAILS)} FAILED: {FAILS}")
         sys.exit(1)
-    print("  ALL PASS")
+    ran = len(FAILS) + _PASSED["n"]
+    if ran < CASE_FLOOR:
+        print(f"  ABORTED: only {ran} cases ran, floor is {CASE_FLOOR}")
+        sys.exit(1)
+    print(f"  ALL PASS ({ran} cases)")
