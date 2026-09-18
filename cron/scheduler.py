@@ -5802,7 +5802,24 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # WAKE RESUME BRANCH. A job armed by gateway/wake_arm.py carries
+    # wake_session_id: the session whose turn asked to be continued. Minting a
+    # fresh id here is right for an ordinary cron job and WRONG for a wake —
+    # it turns a continuation into a reminder. Measured 2026-09-18: job
+    # 45e55b83bf5e fired correctly and resumed nothing, because this line had
+    # no branch and the scheduler's wake_session_id reader count was zero.
+    #
+    # The divert MUST happen before the mint, not after: anything downstream
+    # that has already captured _cron_session_id would keep the fresh one.
+    _wake_target = job.get("wake_session_id") if isinstance(job, dict) else None
+    if isinstance(_wake_target, str) and _wake_target.strip():
+        _cron_session_id = _wake_target.strip()
+        logger.info(
+            "Job '%s': wake resume — continuing session %s rather than "
+            "minting a new one", job_name, _cron_session_id,
+        )
+    else:
+        _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])

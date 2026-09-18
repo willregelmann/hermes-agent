@@ -76,15 +76,31 @@ if not all(os.path.isfile(p) for p in (sched, mirror, arm)):
 sched_src = open(sched, encoding="utf-8").read()
 arm_src = open(arm, encoding="utf-8").read()
 
-# S2 pins the GAP this suite exists to close, as a fact about the tree
-# rather than my belief about it. When the caller lands, S2 flips and
-# that is the signal the subject moved -- not a silent pass.
-check("S2 BASELINE: the scheduler still mints a session id with no "
-      "wake_session_id branch (this is the gap; it FLIPS when fixed)",
-      "_cron_session_id = f\"cron_" in sched_src
-      and sched_src.count("wake_session_id") == 0,
+# S2 pinned the GAP as a fact about the tree rather than a belief about it,
+# and it FLIPPED when the caller landed -- which is the signal it was built
+# to give. RE-POLARISED by Wren 2026-09-18 to assert the FIX, for the reason
+# my own i24-auxenv case taught: an arm left asserting the defect goes red
+# BECAUSE the bug was fixed, and its failure message then argues confidently
+# FOR the bug. Triaging that by reading the message alone concludes the gap
+# is still open.
+#
+# The assertion is deliberately about BOTH halves, because either alone
+# passes for a broken subject: the branch must READ wake_session_id, and the
+# unconditional mint must still exist as the ELSE for ordinary cron jobs. A
+# resume that removed the mint would break every non-wake job.
+_reads_field = sched_src.count("wake_session_id") > 0
+_keeps_mint = '_cron_session_id = f"cron_' in sched_src
+check("S2 the scheduler READS wake_session_id (the resume branch landed)",
+      _reads_field,
       f"wake_session_id occurrences in scheduler: "
-      f"{sched_src.count('wake_session_id')}")
+      f"{sched_src.count('wake_session_id')} — the arm half writes this "
+      f"field and verifies it lands on disk; with no reader it is a correct "
+      f"record with no consumer, and the wake fires into a fresh session")
+check("S2b NON-VACUITY: the unconditional mint SURVIVES as the else-branch "
+      "(an ordinary cron job must still get a fresh session)",
+      _keeps_mint,
+      "the fresh-session mint is gone — a resume that removes it breaks "
+      "every job that is not a wake")
 check("S3 wake_arm DOES write the field (so the producer half exists)",
       "wake_session_id" in arm_src)
 
@@ -225,6 +241,147 @@ check("E2 ...and that refusal is DISTINGUISHABLE from the surface refusal",
       and missing_reason != reason,
       f"missing={missing_reason[:120]!r} surface={reason[:120]!r} — two "
       f"different conditions must not render as one line")
+
+
+# ---- F: THE DEFAULT PATH MUST EXIST ---------------------------------
+# B1/B2 INJECT an enqueue callable, so they prove the routing decision and
+# nothing about whether the module resume_wake reaches WHEN NOBODY INJECTS
+# ONE -- which is every real caller. Measured 2026-09-18: all sixteen cases
+# were green while an un-injected resume_wake() refused with
+# kind='no_enqueue', because gateway/wake_enqueue.py does not exist. An
+# injected dependency is a fixture, not a subject (lesson 78's shape: faking
+# a method to observe its caller leaves that method untested surface).
+_f_mod = None
+_f_modfile = None
+_f_kind = None
+_f_reason = None
+if resume_wake is not None:
+    try:
+        _rsrc = open(os.path.join(TREE, "gateway", "wake_resume.py"),
+                     encoding="utf-8").read()
+        import ast as _ast
+        for _n in _ast.walk(_ast.parse(_rsrc)):
+            if isinstance(_n, _ast.ImportFrom) and _n.module \
+                    and "enqueue" in _n.module:
+                _f_mod = _n.module
+                break
+    except Exception as _exc:
+        _f_reason = f"could not read the fallback import: {_exc}"
+    if _f_mod:
+        _f_modfile = os.path.join(TREE, *_f_mod.split(".")) + ".py"
+    # Drive it with NOTHING injected. This is the shape every production
+    # caller has.
+    try:
+        resume_wake(session_id="api_f_probe", prompt="p")
+        _f_kind = "__no_refusal__"
+    except Exception as _exc:
+        _f_kind = getattr(_exc, "kind", f"__{type(_exc).__name__}__")
+        _f_reason = str(_exc)
+
+check("F0 the default enqueue import target is NAMED in the source "
+      "(derived, not assumed)",
+      bool(_f_mod), f"no enqueue import found in wake_resume.py: {_f_reason}")
+check("F1 the module resume_wake falls back to EXISTS in the tree",
+      bool(_f_modfile) and os.path.exists(_f_modfile),
+      f"{_f_mod} -> {_f_modfile} does not exist; every un-injected caller "
+      f"refuses with no_enqueue, so the feature is inert while the suite "
+      f"is green")
+check("F2 an UN-INJECTED resume_wake does not refuse for want of an "
+      "enqueue path",
+      _f_kind != "no_enqueue",
+      f"kind={_f_kind!r} reason={str(_f_reason)[:140]!r} -- B1/B2 pass "
+      f"because they hand in a callable; nobody in production does")
+check("F3 NON-VACUITY: the un-injected probe really reached resume_wake "
+      "(a refusal or a result was produced)",
+      _f_kind is not None,
+      "the probe produced neither an outcome nor an exception -- F2 would "
+      "pass for free (lesson 49)")
+
+# ---- G: A CONSUMER MUST EXIST ---------------------------------------
+# wake_preflight.py shipped merged with no callers and the whole reason this
+# module exists is that wake_arm wrote a field nothing read. A resumer with
+# no caller is the same defect one level up. Scanned STRUCTURALLY, never by
+# substring: tui_gateway/server.py contains "wake_resume" eleven times and
+# every one is _wake_resume_if_owner, a microphone. A substring scan reports
+# this feature as consumed.
+import ast as _gast
+import time as _gtime
+
+_G_BUDGET_S = float(os.environ.get("RESUME_SCAN_BUDGET_S", "20"))
+
+
+def _scan_importers(root, skip_prefixes=()):
+    """Files under root that IMPORT gateway.wake_resume or call resume_wake
+    through it. Returns (hits, examined, unexamined, truncated)."""
+    hits = []
+    examined = 0
+    pending = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "venv", "node_modules",
+                                    "__pycache__")]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, root)
+            if any(rel.startswith(sp) for sp in skip_prefixes):
+                continue
+            pending.append((p, rel))
+    deadline = _gtime.monotonic() + _G_BUDGET_S
+    for i, (p, rel) in enumerate(pending):
+        if _gtime.monotonic() > deadline:
+            return hits, examined, len(pending) - i, True
+        try:
+            raw = open(p, "rb").read()
+        except Exception:
+            continue
+        if b"wake_resume" not in raw:          # cheap prefilter on the leaf
+            continue
+        examined += 1
+        try:
+            tree_ = _gast.parse(raw)
+        except Exception:
+            continue
+        for n in _gast.walk(tree_):
+            if isinstance(n, _gast.ImportFrom) and \
+                    (n.module or "").endswith("wake_resume"):
+                hits.append(rel)
+                break
+            if isinstance(n, _gast.Import) and \
+                    any(a.name.endswith("wake_resume") for a in n.names):
+                hits.append(rel)
+                break
+    return hits, examined, 0, False
+
+
+_prod_hits, _prod_examined, _prod_left, _prod_trunc = _scan_importers(
+    TREE, skip_prefixes=("tests" + os.sep,))
+_test_hits, _test_examined, _test_left, _test_trunc = _scan_importers(
+    os.path.join(TREE, "tests"))
+
+check("G0 NON-VACUITY: the same scanner FINDS this suite importing "
+      "wake_resume",
+      bool(_test_hits),
+      f"the importer scan found nothing even under tests/ "
+      f"(examined={_test_examined}, truncated={_test_trunc}) -- a scanner "
+      f"that finds nothing anywhere makes G1 pass for free")
+check("G1 at least one NON-TEST file imports gateway.wake_resume",
+      bool(_prod_hits) and not _prod_trunc,
+      f"production importers={_prod_hits} examined={_prod_examined} "
+      f"truncated={_prod_trunc} unexamined={_prod_left} -- resume_wake has "
+      f"no caller. TWO HONEST RESOLUTIONS, and this arm is red under "
+      f"neither-of-them: (1) wire it, if the resume is meant to go over the "
+      f"accept path to a session another process owns; or (2) DELETE it, if "
+      f"the scheduler branch is the whole mechanism -- run_agent already "
+      f"takes session_id + session_db, so diverting the mint IS a "
+      f"continuation for a cron-owned session. What is not acceptable is "
+      f"the third state we are in: a written, tested, unreachable module, "
+      f"which is exactly how wake_preflight.py shipped")
+check("G2 the scan was COMPLETE (a truncated scan is UNKNOWN, never zero)",
+      not _prod_trunc,
+      f"stopped at its {_G_BUDGET_S}s budget with {_prod_left} files "
+      f"unexamined; who imports wake_resume is UNKNOWN, not 'nobody'")
 
 print()
 failed = [r for r in results if not r[1]]
