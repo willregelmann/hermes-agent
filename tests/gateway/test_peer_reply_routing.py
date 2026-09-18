@@ -459,10 +459,241 @@ print("V=" + repr(F()._reply_to_is_trustworthy(
     print()
 
 
+# ---- J: THE SENDER HALF. Every case above starts from an event that ALREADY
+# carries reply_to. Nothing drove `hermes peer dm --no-wait` itself, so the
+# line that PUTS the address on the wire was pinned only by a substring (A1).
+# Deleting the call and leaving the name in place passes A1.
+def _drive_sender(no_wait: bool):
+    import types
+    import hermes_cli.subcommands.peer as P
+
+    seen = {}
+
+    def _fake_request(url, key, method="GET", body=None, timeout=None, headers=None):
+        seen["body"] = body
+        seen["timeout"] = timeout
+        return {"session_id": "peer-side-session", "message": {"content": ""}}
+
+    orig = (P._request, P._resolve_peer_target, P._base_url, P._ensure_bot_chat,
+            P._self_origin)
+    P._request = _fake_request
+    P._resolve_peer_target = lambda t: ("ash", None, {"url": "http://x"}, "k")
+    P._base_url = lambda peer, profile: "http://x"
+    P._ensure_bot_chat = lambda base, key: "bot-chat-1"
+    P._self_origin = lambda: {"agent": "wren", "host": "ha-pi.local"}
+    try:
+        args = types.SimpleNamespace(peer_action="dm", target="ash",
+                                     message="ping", no_wait=no_wait, json=True)
+        rc = P.cmd_peer(args)
+    finally:
+        (P._request, P._resolve_peer_target, P._base_url, P._ensure_bot_chat,
+         P._self_origin) = orig
+    return rc, seen.get("body") or {}
+
+
+_rc_nw, _body_nw = _drive_sender(True)
+check("J1 --no-wait puts a reply_to on the WIRE, not just a symbol in the file",
+      isinstance(_body_nw.get("reply_to"), dict)
+      and _body_nw["reply_to"].get("agent") == "wren",
+      f"body={_body_nw!r} rc={_rc_nw} — A1 is a substring check; deleting the "
+      f"assignment while leaving the name elsewhere passes it")
+check("J2 and names itself in `from`, so the receiver records WHO not 'peer'",
+      _body_nw.get("from") == "wren", f"body={_body_nw!r}")
+_rc_w, _body_w = _drive_sender(False)
+check("J3 CONTROL: a WAITING dm sends no reply_to and no wait key",
+      "reply_to" not in _body_w and "wait" not in _body_w,
+      f"body={_body_w!r} — without this J1 passes for a sender that attaches "
+      f"a return address unconditionally")
+
+
+# ---- K: THE RECEIVER HALF, driven on the real accept entry point.
+# A2 is also a substring: `"reply_to": reply_to,` can stay in the publish dict
+# while the parameter is fed None at the call site. Nothing read the request.
+async def drive_receiver():
+    import types
+    import gateway.platforms.api_server as A
+
+    async def once(body_extra):
+        captured = {}
+
+        class FakeAdapter:
+            _model_name = "virtual"
+            _pending_agent_requests = 0
+
+            # The handler is wrapped by _admit_api_agent_request, so the real
+            # entry point runs its auth/drain gate first. Satisfy it rather
+            # than reaching past it via __wrapped__: the point of driving the
+            # entry point is that nothing upstream returns before the read.
+            def _room_grant_token(self, request):
+                return None
+
+            def _check_auth(self, request):
+                return None
+
+            def _draining_response(self):
+                return None
+
+            def _parse_session_key_header(self, request):
+                return ("k", None)
+
+            async def _get_existing_session_or_404(self, sid):
+                return ({"id": sid}, None)
+
+            async def _read_json_body(self, request):
+                return (dict({"message": "hi", "wait": False}, **body_extra), None)
+
+            def _effective_session_runtime_request(self, session=None, body=None):
+                return {}
+
+            def _runtime_lock_error(self, rr):
+                return None
+
+            def _persist_session_runtime_lock(self, sid, rr):
+                return True
+
+            def _stored_session_model(self, session):
+                return None
+
+            def _resolve_route(self, alias):
+                return None
+
+            def _request_route_conflict_error(self, **kw):
+                return None
+
+            async def _enqueue_session_chat(self, **kw):
+                captured.update(kw)
+                return "RESP"
+
+        FakeAdapter._handle_session_chat = A.APIServerAdapter._handle_session_chat
+        req = types.SimpleNamespace(match_info={"session_id": "s-local"},
+                                    path="/api/sessions/s-local/chat",
+                                    headers={})
+        out = await FakeAdapter()._handle_session_chat(req)
+        return out, captured
+
+    out1, cap1 = await once({"reply_to": {"agent": "wren", "host": "ha-pi.local"},
+                             "from": "wren"})
+    check("K1 the accept path READS reply_to off the request and passes it on",
+          cap1.get("reply_to") == {"agent": "wren", "host": "ha-pi.local"},
+          f"got {cap1.get('reply_to')!r} — the publish dict can keep the key "
+          f"while the parameter is fed None; A2 cannot see that")
+    check("K2 NON-VACUITY: the accept path really ran",
+          out1 == "RESP" and cap1.get("requesting_user") == "wren",
+          f"out={out1!r} cap_keys={sorted(cap1)}")
+    out2, cap2 = await once({"reply_to": "wren"})
+    check("K3 a NON-DICT reply_to is dropped, not forwarded",
+          cap2.get("reply_to") is None,
+          f"got {cap2.get('reply_to')!r} — a string would reach "
+          f"reply_to.get() in the router")
+    out3, cap3 = await once({})
+    check("K4 CONTROL: no reply_to in the body -> None (local delivery)",
+          cap3.get("reply_to") is None, f"got {cap3.get('reply_to')!r}")
+
+
+# ---- L: THE SEND ITSELF. C/E stub _return_peer_completion entirely, so every
+# branch inside it — the PATH check, the returncode check, the ARGV — was
+# unarmed. M3/M4/M5/M6 all survived 33 cases.
+async def drive_return():
+    import asyncio as _a
+    import shutil as _sh
+
+    calls = []
+
+    class _Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+
+        async def communicate(self):
+            return (b"", b"boom")
+
+    def _make_exec(rc):
+        async def _exec(*argv, **kw):
+            calls.append(list(argv))
+            return _Proc(rc)
+        return _exec
+
+    real_exec = _a.create_subprocess_exec
+    real_which = _sh.which
+    evt = {"peer": "wren"}
+    try:
+        _sh.which = lambda n: "/usr/bin/hermes"
+
+        _a.create_subprocess_exec = _make_exec(0)
+        del calls[:]
+        ok_good = await R.GatewayRunner._return_peer_completion(
+            None, {"agent": "wren"}, "pong", evt)
+        argv_good = list(calls[0]) if calls else []
+        check("L1 CONTROL: a successful send reports True",
+              ok_good is True, f"got {ok_good}")
+        check("L2 the return send does NOT use --no-wait "
+              "(a lost reply would be indistinguishable from a landed one)",
+              "--no-wait" not in argv_good and argv_good[:4]
+              == ["/usr/bin/hermes", "peer", "dm", "wren"],
+              f"argv={argv_good!r} — the PR body states this deliberately; "
+              f"nothing asserted it")
+
+        _a.create_subprocess_exec = _make_exec(3)
+        del calls[:]
+        ok_rc = await R.GatewayRunner._return_peer_completion(
+            None, {"agent": "wren"}, "pong", evt)
+        check("L3 a NON-ZERO exit from the send is a FAILURE, not a delivery",
+              ok_rc is False,
+              f"got {ok_rc} — reporting True here closes the handoff row for a "
+              f"reply that never left the box")
+
+        _a.create_subprocess_exec = _make_exec(0)
+        del calls[:]
+        ok_empty = await R.GatewayRunner._return_peer_completion(
+            None, {"agent": "   "}, "pong", evt)
+        check("L4 an EMPTY agent name is refused before exec",
+              ok_empty is False and calls == [],
+              f"got {ok_empty} calls={calls!r}")
+
+        _sh.which = lambda n: None
+        del calls[:]
+        ok_nopath = await R.GatewayRunner._return_peer_completion(
+            None, {"agent": "wren"}, "pong", evt)
+        check("L5 no hermes on PATH -> refuse, and exec nothing",
+              ok_nopath is False and calls == [],
+              f"got {ok_nopath} calls={calls!r} — execing a bare name would "
+              f"depend on the gateway's PATH and fail somewhere else")
+    finally:
+        _a.create_subprocess_exec = real_exec
+        _sh.which = real_which
+
+
+# ---- M: the ROUTING PREDICATE's own shape. isinstance(dict) alone is not the
+# condition; an address with no agent must fall through to LOCAL delivery,
+# because _return_peer_completion would refuse it and the reply would be lost.
+async def drive_empty_agent():
+    store = HandoffStore(path, author="test")
+    h = store.open_handoff(from_session="local", to_session="s9",
+                           requesting_user="local", intent="noagent")
+    evt = {"type": "peer_completion", "session_id": "my-session",
+           "text": "local answer", "peer": "self", "handoff_id": h.id,
+           "reply_to": {"host": "ha-pi.local"}}
+    r = FakeRunner()
+    ok = await r._deliver_peer_completion(evt)
+    check("M1 a reply_to with NO agent falls through to LOCAL delivery",
+          ok is True and r.injected == [("my-session", "local answer")]
+          and r.returned == [],
+          f"injected={r.injected} returned={r.returned} — routing on "
+          f"isinstance(dict) alone strands the reply: the return path refuses "
+          f"an empty name and nothing delivers it")
+
+
+asyncio.run(drive_receiver())
+asyncio.run(drive_return())
+asyncio.run(drive_empty_agent())
+
 asyncio.run(drive())
 
 print()
 if fails:
     print(f"  {len(fails)} FAILED: {', '.join(fails)}")
+    sys.exit(1)
+MIN_CASES = 40
+if ran < MIN_CASES:
+    print(f"  ABORTED: only {ran} cases ran (floor {MIN_CASES}) — a suite that DIES halfway prints no FAIL line and a fail-counting harness reads that as green")
     sys.exit(1)
 print(f"  ALL PASS ({ran} cases)")
