@@ -719,3 +719,342 @@ class TestProcessIdentityGate:
 
         assert "--user" in seen[0]
         assert "--user" not in seen[1]
+
+
+# ===========================================================================
+# MUTATION-AUDIT ARMS (wren:i27 round 27, 2026-09-18).
+#
+# Twelve of eighteen mutants survived the suites as merged. The pattern: the
+# file's docstring says "these tests are all about the FAILURE paths", and the
+# failure paths it drives are the ones the AUTHOR was thinking about. The
+# restart verb, the health gate's empty-population branch, the log window, the
+# per-host check wiring and BOTH rollback arguments had no arm at all.
+# ===========================================================================
+
+
+class TestRestartVerb:
+    """M3/M4. ``_restart`` had NO case. It is the one function in this file
+    that actuates another machine, and both its branches and its error path
+    were deletable green."""
+
+    def _capture(self):
+        seen = []
+
+        def fake_run(host, cmd, timeout=120):
+            seen.append((host, cmd))
+            return 0, "", ""
+
+        return seen, fake_run
+
+    def test_system_scope_uses_sudo_systemctl(self):
+        seen, fake_run = self._capture()
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._restart("h", "system")
+        assert len(seen) == 1
+        cmd = seen[0][1]
+        assert "sudo -n systemctl restart" in cmd, cmd
+        assert "--user" not in cmd, (
+            "system scope issued a --user restart: the deploy would report a "
+            "restart it never performed, and every later gate reads the OLD "
+            "process as if it were new")
+
+    def test_user_scope_uses_systemctl_user(self):
+        seen, fake_run = self._capture()
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._restart("h", "user")
+        cmd = seen[0][1]
+        assert "systemctl --user restart" in cmd, cmd
+        assert "sudo" not in cmd, cmd
+
+    def test_the_two_scopes_do_not_issue_the_same_command(self):
+        """Non-vacuity for the pair above: a mutant that swaps the branches
+        keeps both substrings present in the file, so each arm must also be
+        false under the swap."""
+        seen, fake_run = self._capture()
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._restart("h", "system")
+            pd._restart("h", "user")
+        assert seen[0][1] != seen[1][1]
+
+    def test_a_failed_restart_raises(self):
+        """rc != 0 from systemctl must abort. Ignoring it sends the sequence
+        into a health gate that can only be measuring the old process."""
+        with patch.object(pd, "_run", return_value=(1, "", "Failed to restart")):
+            with pytest.raises(DeployError, match="restart failed"):
+                pd._restart("h", "system")
+
+    def test_issued_timestamp_precedes_the_ssh_call(self):
+        """The return value is the freshness anchor for tier 1. If it were
+        taken AFTER the call, every state file written during the restart
+        would read as stale."""
+        marks = []
+
+        def fake_run(host, cmd, timeout=120):
+            marks.append(time.time())
+            time.sleep(0)
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            issued = pd._restart("h", "system")
+        assert issued <= marks[0]
+
+
+class TestHealthGatePopulationAndWindow:
+    """M1/M2/M5/M6. The health gate's arms all drove a NON-EMPTY platform list
+    and a log answer of 0 or 7. The empty population, the boundary instant and
+    the log WINDOW were unarmed."""
+
+    def _all_good(self, issued, platforms="api_server,google_chat", conn=None,
+                  mtime_delta=10, journal="0"):
+        conn = platforms if conn is None else conn
+
+        def fake_run(host, cmd, timeout=120):
+            if "gateway_state.json" in cmd:
+                return 0, _state_probe(issued + mtime_delta, platforms, conn), ""
+            if "is-active" in cmd:
+                return 0, "active", ""
+            if "journalctl" in cmd:
+                return 0, journal, ""
+            return 0, "", ""
+
+        return fake_run
+
+    def test_a_gateway_listing_no_platforms_is_not_healthy(self):
+        """M1. A gateway that came up far enough to write a fresh state file
+        and lists NOTHING is the shape where every platform failed to
+        register. ``sorted([]) == sorted([])`` reads that as full health."""
+        issued = 1_000_000.0
+        with patch.object(pd, "_run",
+                          side_effect=self._all_good(issued, "none", "none")):
+            with pytest.raises(DeployError, match="did not become healthy"):
+                pd._await_health("h", "system", issued)
+
+    def test_mtime_exactly_at_the_restart_instant_is_stale(self):
+        """M2. The file the OLD process wrote as it was SIGTERMed carries an
+        mtime at the restart instant. ``<`` accepts it; ``<=`` does not."""
+        issued = 1_000_000.0
+        with patch.object(pd, "_run",
+                          side_effect=self._all_good(issued, mtime_delta=0)):
+            with pytest.raises(DeployError, match="did not become healthy"):
+                pd._await_health("h", "system", issued)
+
+    def test_a_fresh_file_one_second_later_is_accepted(self):
+        """Non-vacuity for the boundary: the arm above must fail because the
+        instant is not LATER, not because the gate rejects everything."""
+        issued = 1_000_000.0
+        with patch.object(pd, "_run",
+                          side_effect=self._all_good(issued, mtime_delta=1)):
+            pd._await_health("h", "system", issued)
+
+    # DECLARED INDEPENDENTLY OF THE SUBJECT, on purpose.
+    #
+    # My first version of the arm below parametrised over
+    # ``pd.UNHEALTHY_LOG_PATTERNS`` itself. Measured, that CANNOT see the
+    # mutant it was written for: narrowing the tuple to one member does not
+    # fail a case, it REMOVES three, and a harness reading pass/fail counts
+    # sees a shorter green run. An arm that derives its population from the
+    # thing it is pinning is a mirror, not a measurement -- the same shape as
+    # lesson 64 one level down, and it is why the case floor is the arm that
+    # caught it.
+    DECLARED_UNHEALTHY = ("connect timed out", "Disconnected", "Retrying in", "backoff")
+
+    def test_the_declared_unhealthy_set_is_not_narrowed(self):
+        assert set(self.DECLARED_UNHEALTHY) <= set(pd.UNHEALTHY_LOG_PATTERNS), (
+            "a log pattern that means 'came up, then failed downstream' was "
+            "dropped from the set the health gate greps for; the 55-minute "
+            "Pub/Sub outage is exactly this signal")
+
+    @pytest.mark.parametrize("pattern", DECLARED_UNHEALTHY)
+    def test_every_unhealthy_pattern_reaches_the_log_scan(self, pattern):
+        """M5. The set was satisfiable by one member: only a COUNT ever came
+        back from journalctl, so narrowing the set to {backoff} changed no
+        verdict. Range over the space (lessons 72/76/83)."""
+        issued = 1_000_000.0
+        seen = []
+
+        def fake_run(host, cmd, timeout=120):
+            if "journalctl" in cmd:
+                seen.append(cmd)
+                return 0, "0", ""
+            if "gateway_state.json" in cmd:
+                return 0, _state_probe(issued + 10, "api_server", "api_server"), ""
+            if "is-active" in cmd:
+                return 0, "active", ""
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._await_health("h", "system", issued)
+        assert seen, "no journalctl scan was issued at all"
+        assert pattern in seen[0], (
+            f"pattern {pattern!r} is declared unhealthy but is not in the "
+            f"grep the gate actually runs: {seen[0]!r}")
+
+    def test_the_log_scan_is_bounded_to_since_the_restart(self):
+        """M6. Scanning the WHOLE log makes yesterday's backoff fail today's
+        deploy, and a clean scan prove nothing about the new process. The
+        window is the claim; the count is only its answer."""
+        issued = 1_000_000.0
+        seen = []
+
+        def fake_run(host, cmd, timeout=120):
+            if "journalctl" in cmd:
+                seen.append(cmd)
+                return 0, "0", ""
+            if "gateway_state.json" in cmd:
+                return 0, _state_probe(issued + 10, "api_server", "api_server"), ""
+            if "is-active" in cmd:
+                return 0, "active", ""
+            return 0, "", ""
+
+        with patch.object(pd, "_run", side_effect=fake_run):
+            pd._await_health("h", "system", issued)
+        expected = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(issued))
+        assert "--since" in seen[0], seen[0]
+        assert expected in seen[0], (
+            f"log scan is not bounded to the restart instant {expected!r}: "
+            f"{seen[0]!r}")
+
+
+class TestExternalChecksAreActuallyWired:
+    """M7. ``test_both_universal_checks_present`` reads the UNIVERSAL_CHECKS
+    constant; nothing read the per-host EXTERNAL_CHECKS, and nothing checked
+    that either tuple reaches ``_await_health``. Dropping the per-host lookup
+    silently removes the only gate that is a fact the target cannot
+    fabricate."""
+
+    def _drive(self, peer):
+        captured = {}
+
+        def fake_await(host, scope, issued, extra=()):
+            captured["checks"] = tuple(extra)
+
+        with patch.object(pd, "_preflight"), \
+             patch.object(pd, "_process_identity", side_effect=[(1, 10), (2, 20)]), \
+             patch.object(pd, "_checkout_and_sync"), \
+             patch.object(pd, "_restart", return_value=1_000_000.0), \
+             patch.object(pd, "_await_health", side_effect=fake_await), \
+             patch.object(pd, "_verify_identity"):
+            pd._deploy_once(peer, "h", "abc1234", "system", allow_unresolved=False)
+        return captured["checks"]
+
+    def test_universal_checks_reach_the_gate(self):
+        checks = self._drive("somebody")
+        assert len(checks) == len(pd.UNIVERSAL_CHECKS)
+        assert any("onnxruntime" in c for c in checks)
+        assert any("pubsub" in c for c in checks)
+
+    def test_the_per_host_check_reaches_the_gate(self):
+        """wren's HA call is registered in EXTERNAL_CHECKS and must arrive."""
+        checks = self._drive("wren")
+        assert len(checks) == len(pd.UNIVERSAL_CHECKS) + len(pd.EXTERNAL_CHECKS["wren"])
+        assert any("8123" in c for c in checks), checks
+
+    def test_an_unregistered_peer_gets_only_the_universal_set(self):
+        """Precision: the arm above must fail because the lookup was dropped,
+        not because every peer gets every check."""
+        assert "somebody" not in pd.EXTERNAL_CHECKS
+        assert self._drive("somebody") == tuple(
+            c.format(repo=pd.REPO) for _, c in pd.UNIVERSAL_CHECKS)
+
+
+class TestRollbackArguments:
+    """M8/M9. TestRollbackIsNetworkIndependent drives ``_preflight`` directly,
+    so it pins what rollback does ONCE IT IS CALLED CORRECTLY. Nothing pinned
+    the call itself: ``deploy()`` could roll back to the FAILING sha, or roll
+    back with the network preflight re-armed, and all 132 cases passed."""
+
+    def _run_failing_deploy(self):
+        calls = []
+
+        def fake_once(peer, host, sha, scope, **kw):
+            calls.append((sha, kw))
+            if len(calls) == 1:
+                raise DeployError("gate failed")
+
+        peers = {"ash": {"url": "http://elsewhere.example:8642"}}
+        with patch("hermes_cli.subcommands.peer._load_peers", return_value=peers), \
+             patch.object(pd, "assert_target_is_not_self", return_value="elsewhere.example"), \
+             patch.object(pd, "_detect_unit_scope", return_value="system"), \
+             patch.object(pd, "_current_sha", return_value="0ldc0de1111"), \
+             patch.object(pd, "_snapshot", return_value="/snap"), \
+             patch.object(pd, "_deploy_once", side_effect=fake_once):
+            rc = pd.deploy("ash", "abc1234def")
+        return rc, calls
+
+    def test_rollback_targets_the_previous_sha_not_the_failing_one(self):
+        rc, calls = self._run_failing_deploy()
+        assert rc == 1
+        assert len(calls) == 2, f"no rollback was attempted: {calls}"
+        assert calls[0][0] == "abc1234def"
+        assert calls[1][0] == "0ldc0de1111", (
+            "rollback re-deployed the SHA that just failed every gate: the "
+            "peer stays broken and the operator is told it was rolled back")
+
+    def test_rollback_is_network_independent_at_the_call_site(self):
+        rc, calls = self._run_failing_deploy()
+        assert calls[1][1]["allow_unresolved"] is True
+        assert calls[1][1]["skip_fetch"] is True, (
+            "rollback re-armed the fetch; a network fault is then sufficient "
+            "to prevent recovery from a network fault")
+
+    def test_the_first_attempt_is_not_network_independent(self):
+        """Precision: the skip must be scoped to rollback only, or a deploy
+        would proceed on a SHA it never fetched."""
+        rc, calls = self._run_failing_deploy()
+        assert calls[0][1]["allow_unresolved"] is False
+        assert calls[0][1].get("skip_fetch", False) is False
+
+
+class TestProcessIdentityReading:
+    """M12. ``systemctl show -p A -p B --value`` prints one line per property,
+    but a unit that is not loaded prints fewer. Accepting a short reading makes
+    ``vals[0]``/``vals[1]`` an IndexError at best and a comparison against the
+    WRONG property at worst."""
+
+    def test_a_single_line_reading_is_refused(self):
+        with patch.object(pd, "_run", return_value=(0, "726691\n", "")):
+            with pytest.raises(DeployError, match="cannot read gateway process identity"):
+                pd._process_identity("h", "system")
+
+    def test_an_empty_reading_is_refused(self):
+        with patch.object(pd, "_run", return_value=(0, "", "")):
+            with pytest.raises(DeployError, match="cannot read gateway process identity"):
+                pd._process_identity("h", "system")
+
+    def test_a_two_line_reading_is_accepted(self):
+        """Non-vacuity: the refusals above must be about the COUNT."""
+        with patch.object(pd, "_run", return_value=(0, "726691\n999\n", "")):
+            assert pd._process_identity("h", "system") == (726691, 999)
+
+
+def test_case_floor():
+    """A script-or-suite can die halfway and print zero FAILs (lesson 77).
+    Floor set from the MEASURED count after the run (lesson 79e), and it
+    counts itself.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    from pathlib import Path as _P
+
+    here = _P(__file__).parent
+    files = [
+        here / "test_peer_deploy_sequence.py",
+        here / "test_peer_deploy_target.py",
+        here / "test_peer_deploy_guard_bypasses.py",
+        here / "test_peer_deploy_guard_exemption.py",
+    ]
+    out = _sp.run(
+        [_sys.executable, "-m", "pytest", *[str(f) for f in files],
+         "--collect-only", "-q", "-p", "no:cacheprovider"],
+        capture_output=True, text=True, cwd=str(here.parent), timeout=300,
+    ).stdout
+    import re as _re
+    m = _re.search(r"(\d+) tests? collected", out)
+    assert m, f"could not read a collected count: {out[-500:]!r}"
+    n = int(m.group(1))
+    assert n >= 161, (
+        f"only {n} case(s) collected across the peer-deploy suites; the "
+        "measured floor after the 2026-09-18 mutation audit is 161. A mutant "
+        "that REMOVES cases (e.g. narrowing a constant a parametrised arm "
+        "ranges over) shortens a green run rather than failing one.")
+
