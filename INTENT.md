@@ -34,7 +34,7 @@ The agent we are building is a continuous participant instead. A turn can start 
   that can be addressed.
 - **Sessions reach each other by intent, not by relaying text.** A conversation hands another
   conversation *what is needed*, and the receiving conversation decides what to say, in its own
-  words ([primary-session wake](docs/capabilities/primary-session-wake.md)).
+  words ([tell-partner](docs/capabilities/tell-partner.md)).
 - **An agent owns its own time.** Before a turn ends it can set an alarm, and the same session
   wakes when it goes off ([self-wake](docs/capabilities/self-wake.md)).
 
