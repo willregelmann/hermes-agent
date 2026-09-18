@@ -21,6 +21,16 @@ import queue
 import sys
 import tempfile
 
+def _session_ctx(session_id, user_message, gateway_session_key):
+    """The ctx dict _prepare_session_chat hands the accept path (only the keys it reads)."""
+    return {
+        "session_id": session_id, "gateway_session_key": gateway_session_key,
+        "user_message": user_message, "body": {}, "runtime_request": {}, "lock_active": False,
+        "run_kwargs": {"user_message": user_message, "session_id": session_id,
+                       "gateway_session_key": gateway_session_key},
+    }
+
+
 TREE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, TREE)
 
@@ -43,7 +53,10 @@ print("E2E: accepted peer turn -> published event -> delivered reply")
 print(f"  tree: {TREE}")
 print("=" * 70)
 
-run_py = os.path.join(TREE, "gateway", "run.py")
+# The consumer is the GatewayRunner mixin in gateway/run_peer_completion.py; its spawn is the
+# table-driven loop in gateway/run_startup.py.
+run_py = os.path.join(TREE, "gateway", "run_peer_completion.py")
+startup_py = os.path.join(TREE, "gateway", "run_startup.py")
 api_py = os.path.join(TREE, "gateway", "platforms", "api_server.py")
 check("S1 both subjects exist", os.path.isfile(run_py) and os.path.isfile(api_py),
       "a missing subject is a FAILURE, not a skip")
@@ -79,7 +92,7 @@ check("B2 the watcher is what records DELIVERED",
       "nothing closes the row on delivery")
 
 # ---- C: REAL WIRE TEST -----------------------------------------------
-from gateway.run import _drain_peer_completions  # noqa: E402
+from gateway.run_peer_completion import _drain_peer_completions  # noqa: E402
 
 # Build the exact event shape the producer emits, read OUT of the producer
 # source rather than retyped, so a key rename breaks this test instead of
@@ -186,22 +199,24 @@ import ast  # noqa: E402
 # STRUCTURAL rather than behavioural: parse the file and require the spawn
 # call to be a direct statement of its function body, not nested in any
 # conditional. That distinguishes "named" from "reached".
-_tree = ast.parse(run_src)
+# Spawning is table-driven: _start_spawn_background_watchers loops over
+# _POST_RECONNECT_WATCHERS. Require the watcher in that literal tuple AND the loop over it to be
+# a DIRECT statement of the spawning function (not nested under a conditional).
+_tree = ast.parse(open(startup_py, encoding="utf-8").read())
 _spawn_sites = []
+_in_table = False
+for _node in ast.walk(_tree):
+    if isinstance(_node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_POST_RECONNECT_WATCHERS" for t in _node.targets):
+        _in_table = any(isinstance(e, ast.Constant) and e.value == "_peer_completion_watcher"
+                        for e in getattr(_node.value, "elts", []))
 for _fn in ast.walk(_tree):
     if not isinstance(_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
         continue
     for _stmt in _fn.body:  # DIRECT body only — no ast.walk here
-        if not isinstance(_stmt, ast.Expr):
-            continue
-        _c = _stmt.value
-        if not isinstance(_c, ast.Call):
-            continue
-        if getattr(_c.func, "attr", None) != "_spawn_supervised":
-            continue
-        for _a in _c.args:
-            if getattr(_a, "attr", None) == "_peer_completion_watcher":
-                _spawn_sites.append(_fn.name)
+        if (isinstance(_stmt, ast.For) and getattr(_stmt.iter, "attr", None) == "_POST_RECONNECT_WATCHERS"
+                and _in_table):
+            _spawn_sites.append(_fn.name)
 check("E1 STRUCTURAL: the watcher spawn is an unconditional statement",
       len(_spawn_sites) == 1,
       f"found {_spawn_sites} — the call may be present but nested under a "
@@ -361,9 +376,7 @@ async def drive_all():
         FakeAPI._enqueue_session_chat = A.APIServerAdapter._enqueue_session_chat
         api = FakeAPI()
         resp = await api._enqueue_session_chat(
-            session_id="s-prod", user_message="ping", system_prompt=None,
-            gateway_session_key="k", route=None, session_model=None,
-            runtime_request={}, lock_active=False, agent_overrides={},
+            _session_ctx("s-prod", "ping", "k"),
             requesting_user="wren", reply_to=None)
         for t in list(FakeAPI._accepted_chat_tasks):
             await t

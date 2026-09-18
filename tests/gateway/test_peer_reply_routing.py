@@ -45,7 +45,7 @@ print("=" * 70)
 
 peer_py = os.path.join(TREE, "hermes_cli", "subcommands", "peer.py")
 api_py = os.path.join(TREE, "gateway", "platforms", "api_server.py")
-run_py = os.path.join(TREE, "gateway", "run.py")
+run_py = os.path.join(TREE, "gateway", "run_peer_completion.py")
 for p in (peer_py, api_py, run_py):
     if not os.path.isfile(p):
         print(f"SUBJECT ABSENT: {p}")
@@ -58,7 +58,7 @@ run_src = open(run_py, encoding="utf-8").read()
 
 # ---- A: the three halves must agree on ONE key name ------------------
 check("A1 sender sets reply_to on the --no-wait body",
-      'body["reply_to"] = origin' in peer_src,
+      'extra["reply_to"] = origin' in peer_src,
       "sender declares no return address; --no-wait delivers nowhere")
 check("A2 receiver carries reply_to into the completion event",
       '"reply_to": reply_to,' in api_src,
@@ -560,11 +560,16 @@ async def drive_receiver():
             def _request_route_conflict_error(self, **kw):
                 return None
 
-            async def _enqueue_session_chat(self, **kw):
+            def _concurrency_limited_response(self):
+                return None
+
+            async def _enqueue_session_chat(self, ctx=None, **kw):
                 captured.update(kw)
                 return "RESP"
 
         FakeAdapter._handle_session_chat = A.APIServerAdapter._handle_session_chat
+        # The real shared prelude, so the read is driven exactly as production reaches it.
+        FakeAdapter._prepare_session_chat = A.APIServerAdapter._prepare_session_chat
         req = types.SimpleNamespace(match_info={"session_id": "s-local"},
                                     path="/api/sessions/s-local/chat",
                                     headers={})

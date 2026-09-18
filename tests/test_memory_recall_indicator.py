@@ -118,6 +118,10 @@ def _guard_line_for(src: str, marker: str) -> str:
         (i for i, ln in enumerate(lines) if marker in ln), None
     )
     assert marker_idx is not None, f"marker not found: {marker!r}"
+    # An inline conditional (``x = f(ext_prefetch_cache) if ext_prefetch_cache else ""``) is its
+    # own guard line.
+    if " if ext_prefetch_cache" in lines[marker_idx]:
+        return lines[marker_idx].strip()
     candidates = [
         i for i, ln in enumerate(lines)
         if i < marker_idx and ln.strip().startswith("if ext_prefetch_cache")

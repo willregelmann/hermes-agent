@@ -54,17 +54,21 @@ print(f"  tree        : {TREE}")
 print("=" * 70)
 
 # ---- S: SUBJECT PREREQUISITES ---------------------------------------
-run_py = os.path.join(TREE, "gateway", "run.py")
-check("S1 gateway/run.py exists in the declared tree", os.path.isfile(run_py),
+# The watcher lives in its own GatewayRunner mixin (gateway/run_peer_completion.py); the model
+# watcher it copies lives in gateway/run_notifications.py.
+run_py = os.path.join(TREE, "gateway", "run_peer_completion.py")
+model_py = os.path.join(TREE, "gateway", "run_notifications.py")
+check("S1 gateway/run_peer_completion.py exists in the declared tree", os.path.isfile(run_py),
       f"absent: {run_py} — a missing subject is a FAILURE, not a skip")
 if not os.path.isfile(run_py):
     print("\nSUBJECT ABSENT. Verdict withheld.")
     sys.exit(2)
 
 src = open(run_py, encoding="utf-8").read()
+model_src = open(model_py, encoding="utf-8").read() if os.path.isfile(model_py) else ""
 
 check("S2 the model watcher is present (we are modelling on real code)",
-      "_async_delegation_watcher" in src,
+      "_async_delegation_watcher" in model_src,
       "_async_delegation_watcher not found — wrong tree?")
 
 # ---- A: THE SUBJECT MUST EXIST AT ALL --------------------------------
@@ -72,10 +76,19 @@ check("S2 the model watcher is present (we are modelling on real code)",
 check("A1 _peer_completion_watcher is defined",
       "_peer_completion_watcher" in src,
       "NOT IMPLEMENTED — this is the expected red. Define "
-      "_peer_completion_watcher in gateway/run.py.")
+      "_peer_completion_watcher in gateway/run_peer_completion.py.")
 
+# Spawning is table-driven (run_startup.py::_POST_RECONNECT_WATCHERS): assert membership of the
+# table the startup path actually iterates, not a source substring.
+_spawned = False
+try:
+    sys.path.insert(0, TREE)
+    from gateway.run import GatewayRunner as _GR  # type: ignore
+    _spawned = "_peer_completion_watcher" in getattr(_GR, "_POST_RECONNECT_WATCHERS", ())
+except Exception:  # pragma: no cover
+    _spawned = False
 check("A2 it is spawned as a supervised task",
-      '_spawn_supervised(self._peer_completion_watcher' in src,
+      _spawned,
       "NOT WIRED — a watcher that is never spawned is a gate after an "
       "early return (lesson 52). Defining it is not enough.")
 
@@ -87,7 +100,7 @@ import_error = None
 if "_peer_completion_watcher" in src:
     try:
         sys.path.insert(0, TREE)
-        from gateway.run import _drain_peer_completions as drain  # type: ignore
+        from gateway.run_peer_completion import _drain_peer_completions as drain  # type: ignore
     except Exception as exc:  # pragma: no cover
         import_error = f"{type(exc).__name__}: {exc}"
 

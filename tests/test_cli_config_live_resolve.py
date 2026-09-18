@@ -188,7 +188,7 @@ SNAP_NAME = ("_IMPORT_TIME_HERMES_HOME" if "_IMPORT_TIME_HERMES_HOME =" in src
 # home, reverting the reader alone still yields PROFILE-A and the case dies
 # for the wrong reason (observed 2026-09-15).  A mutant is only evidence if it
 # differs from the current subject by exactly the thing you mutated.
-ANCHOR = "    user_config_path = (home or get_hermes_home()) / 'config.yaml'"
+ANCHOR = "    config_path = (home or get_hermes_home()) / 'config.yaml'"
 ANCHOR_SNAP = "_IMPORT_TIME_HERMES_HOME = get_process_hermes_home()"
 check("C0 the reader mutation anchor exists", ANCHOR in src,
       "the fix is not where this suite thinks it is — every case above is suspect")
@@ -207,7 +207,7 @@ if ANCHOR in src and ANCHOR_SNAP in src:
         except OSError:
             pass
     mutated = src.replace(
-        ANCHOR, "    user_config_path = %s / 'config.yaml'" % SNAP_NAME, 1)
+        ANCHOR, "    config_path = %s / 'config.yaml'" % SNAP_NAME, 1)
     # revert the snapshot too — this is the pre-#21 world
     mutated = mutated.replace(
         ANCHOR_SNAP, "_IMPORT_TIME_HERMES_HOME = get_hermes_home()", 1)

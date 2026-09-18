@@ -134,11 +134,12 @@ class TestGatewayBridgeCodeParity:
         content = gateway_path.read_text(encoding="utf-8")
         # Dynamic env-var derivation present
         assert 'f"AUXILIARY_{_upper}_PROVIDER"' in content
-        assert 'f"AUXILIARY_{_upper}_MODEL"' in content
-        assert 'f"AUXILIARY_{_upper}_BASE_URL"' in content
-        # No API_KEY writer: AUXILIARY_{TASK}_API_KEY had no reader anywhere
-        # in the tree and was removed 2026-09-15 along with its doc entry.
-        assert 'f"AUXILIARY_{_upper}_API_KEY"' not in content
+        # MODEL / BASE_URL are bridged through one field->suffix loop. No API_KEY
+        # entry: AUXILIARY_{TASK}_API_KEY has no reader anywhere in the tree.
+        assert 'f"AUXILIARY_{_upper}_{_suffix}"' in content
+        for field, suffix in (("model", "MODEL"), ("base_url", "BASE_URL")):
+            assert f'("{field}", "{suffix}")' in content
+        assert '("api_key", "API_KEY")' not in content
         # Built-in bridged keys present
         assert "_aux_bridged_keys" in content
         assert '"vision"' in content
@@ -238,6 +239,7 @@ class TestCLIDefaultsHaveAuxiliaryKeys:
         # test runs on Windows where the default locale is cp1252.
         source = Path(_cli_mod.__file__).read_text(encoding="utf-8")
         assert "auxiliary_config = defaults.get(\"auxiliary\"" in source
+        assert "_AUXILIARY_TASK_ENV" in source
         assert "AUXILIARY_VISION_PROVIDER" in source
         assert "AUXILIARY_VISION_MODEL" in source
 
@@ -255,8 +257,8 @@ class TestCLIDefaultsHaveAuxiliaryKeys:
         """
         import cli as _cli_mod
         content = Path(_cli_mod.__file__).read_text(encoding="utf-8")
-        start = content.index("auxiliary_task_env = {")
-        end = content.index("# Security settings", start)
+        start = content.index("_AUXILIARY_TASK_ENV = {")
+        end = content.index("_CWD_PLACEHOLDERS", start)
         code = "\n".join(
             line for line in content[start:end].splitlines()
             if not line.lstrip().startswith("#")
@@ -511,9 +513,20 @@ class TestGatewayAuxiliaryBridgeReachable:
         src = (_repo_root() / "gateway" / "run.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
         keys = set(_environ_write_keys(tree))
-        for suffix in ("_PROVIDER", "_MODEL", "_BASE_URL"):
-            assert f"AUXILIARY_*{suffix}" in keys, (suffix, sorted(
-                k for k in keys if k.startswith("AUXILIARY")))
+        assert "AUXILIARY_*_PROVIDER" in keys, sorted(k for k in keys if k.startswith("AUXILIARY"))
+        # MODEL / BASE_URL are written through one f"AUXILIARY_{_upper}_{_suffix}" loop over
+        # (field, suffix) pairs; read the suffixes out of that loop's literal table.
+        assert "AUXILIARY_*_*" in keys, sorted(k for k in keys if k.startswith("AUXILIARY"))
+        suffixes = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple):
+                for elt in node.iter.elts:
+                    if (isinstance(elt, ast.Tuple) and len(elt.elts) == 2
+                            and all(isinstance(e, ast.Constant) for e in elt.elts)):
+                        suffixes.add(elt.elts[1].value)
+        for suffix in ("MODEL", "BASE_URL"):
+            assert suffix in suffixes, (suffix, sorted(suffixes))
+        assert "API_KEY" not in suffixes, sorted(suffixes)
 
 
 # Case-count floor: this suite is run by pytest, which reports its own count,

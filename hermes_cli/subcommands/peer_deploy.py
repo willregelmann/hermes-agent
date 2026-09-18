@@ -145,7 +145,7 @@ class DeployLock:
         if LOCK_PATH.exists():
             try:
                 age = time.time() - LOCK_PATH.stat().st_mtime
-                held = LOCK_PATH.read_text().strip()
+                held = LOCK_PATH.read_text(encoding="utf-8").strip()
             except OSError:
                 age, held = 0, "unknown"
             if age < LOCK_STALE_S:
@@ -157,7 +157,7 @@ class DeployLock:
                 )
             _log(f"clearing stale lock ({age:.0f}s old)")
         LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LOCK_PATH.write_text(f"deploying {self.peer} pid={os.getpid()}")
+        LOCK_PATH.write_text(f"deploying {self.peer} pid={os.getpid()}", encoding="utf-8")
         return self
 
     def __exit__(self, *exc):
@@ -534,7 +534,7 @@ def _await_health(
             "import json, os\n"
             f"p = os.path.expanduser({STATE_FILE!r})\n"
             "try:\n"
-            "    st = os.stat(p); d = json.load(open(p))\n"
+            "    st = os.stat(p); d = json.load(open(p, encoding='utf-8'))\n"
             "except Exception as e:\n"
             "    print('ERR', type(e).__name__); raise SystemExit\n"
             "plats = d.get('platforms', {})\n"
