@@ -383,6 +383,161 @@ check("G2 the scan was COMPLETE (a truncated scan is UNKNOWN, never zero)",
       f"stopped at its {_G_BUDGET_S}s budget with {_prod_left} files "
       f"unexamined; who imports wake_resume is UNKNOWN, not 'nobody'")
 
+# ---- H: A CONTINUATION MUST CARRY THE TRANSCRIPT --------------------
+# G1 says resume_wake has no caller and names two honest resolutions. This
+# arm exists because ONE OF THOSE TWO IS INCOMPLETE AS WRITTEN, and the
+# notepad entry that proposed it -- mine -- called it "the smaller one".
+#
+# Resolution (2) is "delete wake_resume and let the scheduler branch be the
+# whole mechanism, since run_agent already takes session_id + session_db".
+# MEASURED IN THE LIVE TREE: taking session_id is not resuming. The cron
+# fire calls agent.run_conversation(prompt, task_id=...) with NO
+# conversation_history, and build_turn_context (agent/turn_context.py:908)
+# sets messages = list(conversation_history) if conversation_history else [].
+# The ONLY DB hydration on that path is recover_rotated_compression_session
+# and the post-lease-wait reload in run_agent.py:9447, which fires solely
+# when another process held the turn lease. So a diverted session id
+# produces a turn that WRITES INTO the old session and READS NONE OF IT: a
+# shared label, not a continuation. That is a quieter version of the same
+# defect this whole branch exists to remove -- a record that looks like the
+# act.
+#
+# THE ARM IS A DISJUNCTION, deliberately, because THREE shapes are honest
+# and requiring any one of them by name would be an opinion:
+#   (a) the scheduler passes prior history into the turn, or
+#   (b) something on the cron path loads the transcript of the session it
+#       was told to continue, or
+#   (c) resolution (1) is wired and the gateway owns hydration, in which
+#       case a production importer of wake_resume exists.
+# Red under none-of-them. Each scanner carries its own non-vacuity arm,
+# because a broken scan satisfies a negative for free.
+_LOADERS = ("get_messages_as_conversation", "resolve_resume_session_id",
+            "get_resume_conversations")
+
+
+def _loader_calls(root, skip_prefixes=()):
+    """Files under root that CALL a transcript loader. (hits, examined)."""
+    hits = []
+    examined = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "venv", "node_modules",
+                                    "__pycache__")]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, root)
+            if any(rel.startswith(sp) for sp in skip_prefixes):
+                continue
+            try:
+                raw = open(p, "rb").read()
+            except Exception:
+                continue
+            if not any(nm.encode() in raw for nm in _LOADERS):
+                continue
+            examined += 1
+            try:
+                tree_ = _gast.parse(raw)
+            except Exception:
+                continue
+            for n in _gast.walk(tree_):
+                if isinstance(n, _gast.Call):
+                    nm = getattr(n.func, "attr", None) or \
+                        getattr(n.func, "id", None)
+                    if nm in _LOADERS:
+                        hits.append(rel)
+                        break
+    return hits, examined
+
+
+def _run_conversation_kwargs(path):
+    """kwarg NAMES passed at every agent.run_conversation call in path.
+
+    Structural, via ast: a substring scan cannot tell an argument from a
+    mention in a comment, and cron/scheduler.py has six of the latter.
+    """
+    names = set()
+    found = 0
+    try:
+        tree_ = _gast.parse(open(path, "rb").read())
+    except Exception:
+        return names, found
+    for n in _gast.walk(tree_):
+        # The cron fire submits the BOUND METHOD to an executor:
+        #   pool.submit(ctx.run, agent.run_conversation, prompt, task_id=...)
+        # so the kwargs belong to the submit call, not to a call whose func
+        # is run_conversation. Both shapes are read.
+        fn_ = getattr(n, "func", None)
+        if isinstance(n, _gast.Call) and fn_ is not None:
+            direct = getattr(fn_, "attr", None) == "run_conversation"
+            handed = any(getattr(a, "attr", None) == "run_conversation"
+                         for a in n.args)
+            if direct or handed:
+                found += 1
+                for k in n.keywords:
+                    if not k.arg:
+                        continue
+                    # A KWARG PASSED None IS NOT A HYDRATION. Caught while
+                    # writing mutant N1a: conversation_history=None satisfies
+                    # "the name appears" and carries nothing, so the arm would
+                    # have read a placeholder as a fix. Same shape as lesson
+                    # 82 -- enumerate what actually produces the value.
+                    if isinstance(k.value, _gast.Constant) and \
+                            k.value.value is None:
+                        continue
+                    names.add(k.arg)
+    return names, found
+
+
+_cron_dir = os.path.join(TREE, "cron")
+_cron_loader_hits, _cron_loader_examined = _loader_calls(_cron_dir)
+_known_loader_hits, _known_loader_examined = _loader_calls(
+    os.path.join(TREE, "hermes_cli"))
+_rc_kwargs, _rc_calls = _run_conversation_kwargs(sched)
+
+_carries_history = "conversation_history" in _rc_kwargs
+_loads_transcript = bool(_cron_loader_hits)
+_resume_wired = bool(_prod_hits) and not _prod_trunc
+
+check("H0 NON-VACUITY: the loader scanner finds a KNOWN transcript-loading "
+      "caller (hermes_cli resume)",
+      bool(_known_loader_hits),
+      f"the loader scan found nothing under hermes_cli/ "
+      f"(examined={_known_loader_examined}); a scanner that finds nothing "
+      f"anywhere makes H1 pass or fail for a reason that is not about cron")
+check("H2 NON-VACUITY: the kwarg reader actually FOUND the cron fire's "
+      "run_conversation call and can see its arguments",
+      _rc_calls > 0 and bool(_rc_kwargs),
+      f"calls found={_rc_calls} kwargs seen={sorted(_rc_kwargs)} -- with no "
+      f"call or no visible kwargs, H1's history half is vacuous")
+check("H1 a resumed wake is a CONTINUATION: the turn can see the session's "
+      "prior transcript",
+      _carries_history or _loads_transcript or _resume_wired,
+      f"none of the three honest shapes is present. "
+      f"(a) scheduler run_conversation kwargs={sorted(_rc_kwargs)} -- no "
+      f"conversation_history, and build_turn_context sets "
+      f"messages=list(conversation_history) if conversation_history else [], "
+      f"so the turn starts EMPTY; "
+      f"(b) transcript loader calls under cron/={_cron_loader_hits} "
+      f"(examined={_cron_loader_examined}) -- nothing on the cron path reads "
+      f"the session it was told to continue; "
+      f"(c) production importers of wake_resume={_prod_hits} -- resolution "
+      f"(1) is not wired either. CONSEQUENCE: diverting the session id makes "
+      f"the turn WRITE INTO the named session while READING NONE OF IT. The "
+      f"prompt arrives, the row lands in the right place, and the agent has "
+      f"no memory of the turn that armed it -- a shared label, not a "
+      f"continuation. Resolution (2) is therefore NOT the smaller of the "
+      f"two: it needs hydration as well as the branch.")
+
+# ---- CASE FLOOR -----------------------------------------------------
+# Set from the MEASURED count after the run (lesson 79e). A script suite can
+# die halfway and a fail-counting reader calls that green.
+_FLOOR = 26
+check(f"Z0 case floor: at least {_FLOOR} cases executed",
+      len(results) >= _FLOOR - 1,
+      f"only {len(results)} cases ran; an aborted suite is not a green one")
+
 print()
 failed = [r for r in results if not r[1]]
 print("=" * 72)
