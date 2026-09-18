@@ -264,3 +264,268 @@ class TestCLIDefaultsHaveAuxiliaryKeys:
         assert "api_key" not in code.lower(), (
             "cli.py auxiliary bridge must not read or write api_key"
         )
+# appended by wren:i27 round 19 — real-bridge behavioural arms + structural gateway arms
+import ast
+
+
+# ── cli.py's real bridge, driven (not a re-implementation) ───────────────────
+
+
+def _aux_env_snapshot():
+    return {k: v for k, v in os.environ.items() if k.startswith("AUXILIARY_")}
+
+
+def _drive_cli_bridge(config_dict, monkeypatch):
+    """Call the REAL cli.py bridge and return (before, after) full env maps.
+
+    The four bridging cases at the top of this file call a local copy of the
+    bridge logic, so nothing in this suite ever executed cli.py's own writer
+    (Wren, PR #15 audit, lesson 64).  These arms import cli and call
+    ``_export_config_to_env`` directly.
+    """
+    import cli as _cli_mod
+    for k in list(os.environ):
+        if k.startswith("AUXILIARY_"):
+            monkeypatch.delenv(k, raising=False)
+    before = dict(os.environ)
+    _cli_mod._export_config_to_env({"auxiliary": config_dict})
+    after = dict(os.environ)
+    for k in list(after):
+        if k.startswith("AUXILIARY_") and k not in before:
+            monkeypatch.setenv(k, after[k])
+    return before, after
+
+
+class TestCliBridgeBehaviour:
+    """Drive cli.py's own auxiliary bridge, once per claim."""
+
+    def test_real_cli_bridge_writes_provider_model_base_url(self, monkeypatch):
+        _b, after = _drive_cli_bridge(
+            {"vision": {"provider": "openrouter", "model": "m1",
+                        "base_url": "https://example.invalid/v1"}},
+            monkeypatch,
+        )
+        assert after.get("AUXILIARY_VISION_PROVIDER") == "openrouter"
+        assert after.get("AUXILIARY_VISION_MODEL") == "m1"
+        assert after.get("AUXILIARY_VISION_BASE_URL") == "https://example.invalid/v1"
+
+    def test_real_cli_bridge_each_value_lands_in_its_own_variable(self, monkeypatch):
+        """provider/model/base_url must not be cross-wired (the map is data,
+        and a swapped pair is invisible to a per-key existence check)."""
+        _b, after = _drive_cli_bridge(
+            {"approval": {"provider": "P", "model": "M", "base_url": "B"}},
+            monkeypatch,
+        )
+        assert after.get("AUXILIARY_APPROVAL_PROVIDER") == "P"
+        assert after.get("AUXILIARY_APPROVAL_MODEL") == "M"
+        assert after.get("AUXILIARY_APPROVAL_BASE_URL") == "B"
+
+    def test_real_cli_bridge_skips_auto_provider(self, monkeypatch):
+        _b, after = _drive_cli_bridge(
+            {"vision": {"provider": "auto", "model": "m2"}}, monkeypatch
+        )
+        assert "AUXILIARY_VISION_PROVIDER" not in after
+        assert after.get("AUXILIARY_VISION_MODEL") == "m2"
+
+    def test_real_cli_bridge_skips_empty_values(self, monkeypatch):
+        _b, after = _drive_cli_bridge(
+            {"vision": {"provider": "openrouter", "model": "", "base_url": ""}},
+            monkeypatch,
+        )
+        assert after.get("AUXILIARY_VISION_PROVIDER") == "openrouter"
+        assert "AUXILIARY_VISION_MODEL" not in after
+        assert "AUXILIARY_VISION_BASE_URL" not in after
+
+    def test_real_cli_bridge_writes_no_api_key_anywhere(self, monkeypatch):
+        """The whole point of PR #15, asserted over the WHOLE env space.
+
+        Not a watchlist of names (lesson 72): the api_key value must not reach
+        os.environ under ANY key, however that key is spelled.
+        """
+        secret = "sk-audit-canary-2026"
+        _b, after = _drive_cli_bridge(
+            {"vision": {"provider": "openrouter", "model": "m1",
+                        "base_url": "B", "api_key": secret},
+             "approval": {"provider": "nous", "model": "m2", "api_key": secret}},
+            monkeypatch,
+        )
+        leaked = {k: v for k, v in after.items() if v == secret}
+        assert not leaked, f"api_key reached os.environ as {sorted(leaked)}"
+        assert not [k for k in after if k.startswith("AUXILIARY_") and "API_KEY" in k]
+
+    def test_real_cli_bridge_non_vacuity(self, monkeypatch):
+        """The negative arm above passes for free if the bridge never runs."""
+        _b, after = _drive_cli_bridge(
+            {"vision": {"provider": "openrouter", "model": "m1",
+                        "base_url": "B", "api_key": "sk-audit-canary-2026"}},
+            monkeypatch,
+        )
+        assert {k for k in after if k.startswith("AUXILIARY_")} >= {
+            "AUXILIARY_VISION_PROVIDER",
+            "AUXILIARY_VISION_MODEL",
+            "AUXILIARY_VISION_BASE_URL",
+        }
+
+
+# ── gateway/run.py: structural, because the bridge sits in start() ───────────
+
+
+def _key_spellings(node):
+    """Every literal spelling an env-var key expression can produce.
+
+    f-strings contribute their literal fragments with ``*`` for each
+    interpolation; ``+`` concatenation is flattened; anything else yields the
+    empty string (unknown, cannot be judged).
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        out = ""
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                out += part.value
+            else:
+                out += "*"
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _key_spellings(node.left) + _key_spellings(node.right)
+    if isinstance(node, ast.Call):
+        return "*"
+    if isinstance(node, ast.Name):
+        return "*"
+    return ""
+
+
+def _environ_write_keys(tree):
+    """Keys of every ``os.environ[<expr>] = ...`` assignment in a tree."""
+    keys = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if not isinstance(tgt, ast.Subscript):
+                continue
+            val = tgt.value
+            name = ""
+            if isinstance(val, ast.Attribute):
+                name = val.attr
+            elif isinstance(val, ast.Name):
+                name = val.id
+            if name != "environ":
+                continue
+            keys.append(_key_spellings(tgt.slice))
+    return keys
+
+
+def _api_key_writers(source):
+    """Env writes whose key can spell AUXILIARY_<anything>_API_KEY."""
+    tree = ast.parse(source)
+    out = []
+    for key in _environ_write_keys(tree):
+        norm = key.upper()
+        if "API_KEY" in norm.replace("*", "") or (
+            norm.startswith("AUXILIARY_") and norm.endswith("_API_KEY")
+        ):
+            out.append(key)
+    return out
+
+
+_SYNTHETIC_FORBIDDEN = '''
+import os
+def bridge(upper, cfg):
+    os.environ[f"AUXILIARY_{upper}_API_KEY"] = cfg["api_key"]
+    os.environ["AUXILIARY_" + upper + "_API_KEY"] = cfg["api_key"]
+    os.environ["AUXILIARY_VISION_API_KEY"] = cfg["api_key"]
+'''
+
+_SYNTHETIC_CLEAN = '''
+import os
+def bridge(upper, cfg):
+    os.environ[f"AUXILIARY_{upper}_PROVIDER"] = cfg["provider"]
+    os.environ["AUXILIARY_" + upper + "_MODEL"] = cfg["model"]
+    os.environ["AUXILIARY_VISION_BASE_URL"] = cfg["base_url"]
+'''
+
+
+class TestApiKeyWriterScanner:
+    """An arm that asserts a negative must itself be armed (lesson 82)."""
+
+    def test_scanner_catches_all_three_spellings(self):
+        found = _api_key_writers(_SYNTHETIC_FORBIDDEN)
+        assert len(found) == 3, found
+
+    def test_scanner_clears_the_live_shaped_control(self):
+        assert _api_key_writers(_SYNTHETIC_CLEAN) == []
+
+
+def _repo_root():
+    return Path(__file__).parent.parent.parent
+
+
+class TestNoApiKeyWriterInEitherBridge:
+    def test_gateway_run_py_has_no_api_key_writer(self):
+        src = (_repo_root() / "gateway" / "run.py").read_text(encoding="utf-8")
+        assert _api_key_writers(src) == []
+
+    def test_cli_py_has_no_api_key_writer(self):
+        src = (_repo_root() / "cli.py").read_text(encoding="utf-8")
+        assert _api_key_writers(src) == []
+
+
+class TestGatewayAuxiliaryBridgeReachable:
+    """A substring arm cannot see ``if False:`` wrapped around the block
+    (lesson 79).  start() is not drivable from a test, so the honest arm is
+    structural and says so in its name."""
+
+    def _aux_block(self, tree):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == "_aux_bridged_keys":
+                        return node
+        return None
+
+    def test_bridge_block_exists_and_has_no_constant_false_ancestor(self):
+        src = (_repo_root() / "gateway" / "run.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        target = self._aux_block(tree)
+        assert target is not None, "_aux_bridged_keys assignment is gone"
+        # Build parent links, then walk the chain to module scope.
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        cur, chain = target, []
+        while cur in parents:
+            cur = parents[cur]
+            chain.append(cur)
+        dead = []
+        for node in chain:
+            if isinstance(node, (ast.If, ast.While)):
+                t = node.test
+                if isinstance(t, ast.Constant) and not t.value:
+                    dead.append(node.lineno)
+        assert not dead, f"auxiliary bridge is unreachable, gated at line(s) {dead}"
+
+    def test_bridge_writes_the_three_live_variables(self):
+        src = (_repo_root() / "gateway" / "run.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        keys = set(_environ_write_keys(tree))
+        for suffix in ("_PROVIDER", "_MODEL", "_BASE_URL"):
+            assert f"AUXILIARY_*{suffix}" in keys, (suffix, sorted(
+                k for k in keys if k.startswith("AUXILIARY")))
+
+
+# Case-count floor: this suite is run by pytest, which reports its own count,
+# but a collection error can still leave a truthy-looking partial run.
+# Floor set from the MEASURED count after the round-19 run.
+def test_case_count_floor():
+    import inspect as _inspect
+    mod = sys.modules[__name__]
+    n = 0
+    for _name, obj in vars(mod).items():
+        if _name.startswith("test_") and callable(obj):
+            n += 1
+        elif _inspect.isclass(obj) and _name.startswith("Test"):
+            n += sum(1 for m in vars(obj) if m.startswith("test_"))
+    assert n >= 25, f"suite shrank to {n} cases"
