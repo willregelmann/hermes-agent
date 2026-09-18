@@ -99,6 +99,21 @@ conservative at the waist.
   concrete consumer. Adding a hook is easy; removing one after plugins depend
   on it is hard. A hook is NOT speculative if a contributor has a real, stated
   use case — even if the consumer ships separately.
+- **Preemptive guards on what an agent can do.** Loop or hop limits, spend
+  budgets, rate limits, quiet hours, sender allowlists, "brakes": any mechanism
+  whose only job is to stop an agent doing something it otherwise could, added
+  before a real failure showed it was needed. Such a guard hamstrings the agent
+  against a risk nobody has seen, and once it's in place nobody can tell whether
+  it is load-bearing. Build the capability without it, but keep the evidence that
+  would show misuse (every attempt writes a record; e.g. a handoff's
+  `extra.parent` chain). Add the guard when that evidence shows a failure, and
+  cite the failure in the PR that adds it. If leaving a guard out opens a real
+  exposure, name the exposure in the issue or PR; don't build the guard. Dropped
+  from the wake designs (#52, #53) on this principle: the `peer_budget.py` brake
+  and a handoff hop limit. This principle does NOT cover correctness invariants
+  (prompt caching, role alternation, profile isolation and fail-closed secret
+  scope, per-session exclusivity, a woken session stating its origin) or the fix
+  for a failure that already happened.
 - **New `HERMES_*` env vars for non-secret config.** `.env` is for secrets
   only (API keys, tokens, passwords). All behavioral settings — timeouts,
   thresholds, feature flags, display prefs — go in `config.yaml`. Bridge to an
