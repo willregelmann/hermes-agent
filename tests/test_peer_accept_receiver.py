@@ -23,6 +23,16 @@ import sys
 import tempfile
 import time
 
+def _session_ctx(session_id, user_message, gateway_session_key):
+    """The ctx dict _prepare_session_chat hands the accept path (only the keys it reads)."""
+    return {
+        "session_id": session_id, "gateway_session_key": gateway_session_key,
+        "user_message": user_message, "body": {}, "runtime_request": {}, "lock_active": False,
+        "run_kwargs": {"user_message": user_message, "session_id": session_id,
+                       "gateway_session_key": gateway_session_key},
+    }
+
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 fails: list[str] = []
@@ -133,8 +143,9 @@ async def drive_gate():
             def _stored_session_model(self, session): return None
             def _resolve_route(self, alias): return None
             def _request_route_conflict_error(self, **kw): return None
+            def _concurrency_limited_response(self): return None
 
-            async def _enqueue_session_chat(self, **kw):
+            async def _enqueue_session_chat(self, ctx=None, **kw):
                 cap["enqueued"] = True
                 cap.update(kw)
                 return "ACCEPTED"
@@ -146,6 +157,8 @@ async def drive_gate():
                 return ({"final_response": "sync answer", "session_id": "s-local"}, {})
 
         FakeAdapter._handle_session_chat = A.APIServerAdapter._handle_session_chat
+        # The real shared prelude, so the gate is driven exactly as production reaches it.
+        FakeAdapter._prepare_session_chat = A.APIServerAdapter._prepare_session_chat
         req = types.SimpleNamespace(match_info={"session_id": "s-local"},
                                     path="/api/sessions/s-local/chat", headers={})
         try:
@@ -237,9 +250,7 @@ async def drive_degraded(tmpdir):
 
     ad_none = NoStoreAdapter(os.path.join(tmpdir, "unused-none.jsonl"))
     resp = await ad_none._enqueue_session_chat(
-        session_id="sess-k1", user_message="x", system_prompt=None,
-        gateway_session_key="k", route=None, session_model=None,
-        runtime_request={}, lock_active=False, agent_overrides={},
+        _session_ctx("sess-k1", "x", "k"),
         requesting_user="wren")
     body_k = json.loads(resp.body.decode())
     case("K1 no store at all still ACCEPTS the turn (kills M16)",
@@ -260,9 +271,7 @@ async def drive_degraded(tmpdir):
     raised = None
     try:
         resp2 = await ad_bad._enqueue_session_chat(
-            session_id="sess-k2", user_message="x", system_prompt=None,
-            gateway_session_key="k", route=None, session_model=None,
-            runtime_request={}, lock_active=False, agent_overrides={},
+            _session_ctx("sess-k2", "x", "k"),
             requesting_user="wren")
     except Exception as exc:  # noqa: BLE001
         raised = exc
@@ -303,9 +312,7 @@ async def drive_degraded(tmpdir):
     try:
         ad_none2 = NoStoreAdapter(os.path.join(tmpdir, "unused-none2.jsonl"))
         await ad_none2._enqueue_session_chat(
-            session_id="sess-k3", user_message="x", system_prompt=None,
-            gateway_session_key="k", route=None, session_model=None,
-            runtime_request={}, lock_active=False, agent_overrides={},
+            _session_ctx("sess-k3", "x", "k"),
             requesting_user="wren")
         await asyncio.wait_for(ad_none2.turn_finished.wait(),
                                timeout=TURN_SECONDS + 5)
@@ -336,9 +343,7 @@ async def drive_handles(tmpdir):
 
     ad = FakeAdapter(os.path.join(tmpdir, "l.jsonl"))
     resp = await ad._enqueue_session_chat(
-        session_id="sess-l", user_message="x", system_prompt=None,
-        gateway_session_key="kk", route=None, session_model=None,
-        runtime_request={}, lock_active=False, agent_overrides={},
+        _session_ctx("sess-l", "x", "kk"),
         requesting_user="ash")
     case("L1 the accept names the session in a HEADER too (kills M13)",
          resp.headers.get("X-Hermes-Session-Id") == "sess-l",
@@ -376,9 +381,7 @@ async def main() -> None:
     ad = FakeAdapter(store_path)
     t0 = time.time()
     resp = await ad._enqueue_session_chat(
-        session_id="sess-1", user_message="do the thing", system_prompt=None,
-        gateway_session_key="k", route=None, session_model=None,
-        runtime_request={}, lock_active=False, agent_overrides={},
+        _session_ctx("sess-1", "do the thing", "k"),
         requesting_user="wren",
     )
     elapsed = time.time() - t0
@@ -456,9 +459,7 @@ async def main() -> None:
     store_f = os.path.join(tmp, "f.jsonl")
     adf = FakeAdapter(store_f, turn_raises=True)
     await adf._enqueue_session_chat(
-        session_id="sess-2", user_message="explode", system_prompt=None,
-        gateway_session_key="k", route=None, session_model=None,
-        runtime_request={}, lock_active=False, agent_overrides={},
+        _session_ctx("sess-2", "explode", "k"),
         requesting_user="wren",
     )
     await asyncio.sleep(TURN_SECONDS + 1.0)
@@ -473,9 +474,7 @@ async def main() -> None:
     #     no error anywhere. Non-vacuity: assert the set was actually used.
     ad2 = FakeAdapter(os.path.join(tmp, "g.jsonl"))
     await ad2._enqueue_session_chat(
-        session_id="sess-3", user_message="x", system_prompt=None,
-        gateway_session_key="k", route=None, session_model=None,
-        runtime_request={}, lock_active=False, agent_overrides={},
+        _session_ctx("sess-3", "x", "k"),
         requesting_user="wren",
     )
     case("G the in-flight task is strongly referenced",

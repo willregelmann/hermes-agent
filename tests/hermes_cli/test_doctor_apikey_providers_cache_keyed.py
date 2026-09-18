@@ -1,4 +1,4 @@
-"""wren:i24 — doctor._APIKEY_PROVIDERS_CACHE was a bare module global.
+"""wren:i24 — the doctor API-key provider cache (now doctor_connectivity._APIKEY_PROVIDERS_CACHE) was a bare module global.
 
 _check_apikey_provider_health() (via _build_apikey_providers_list()) calls
 providers.list_providers(), which returns PROFILE-SCOPED plugin
@@ -30,7 +30,7 @@ from argparse import Namespace
 
 
 def test_apikey_providers_cache_is_keyed_not_a_bare_global():
-    from hermes_cli import doctor
+    from hermes_cli import doctor_connectivity as doctor
 
     doctor._reset_apikey_providers_cache_for_tests()
     assert doctor._APIKEY_PROVIDERS_CACHE == {}, (
@@ -39,7 +39,7 @@ def test_apikey_providers_cache_is_keyed_not_a_bare_global():
 
 
 def test_apikey_providers_cache_key_function_reads_hermes_home(monkeypatch, tmp_path):
-    from hermes_cli import doctor
+    from hermes_cli import doctor_connectivity as doctor
 
     fake_home_a = tmp_path / "profile_a"
     fake_home_b = tmp_path / "profile_b"
@@ -71,7 +71,7 @@ def test_two_profiles_do_not_pin_each_other(monkeypatch, tmp_path):
     call site regresses (e.g. a stray `global` reintroduced); binding to
     the real accessor closes that gap (wren393 CHANGES_REQUESTED, 2026-09-16).
     """
-    from hermes_cli import doctor
+    from hermes_cli import doctor_connectivity as doctor
 
     doctor._reset_apikey_providers_cache_for_tests()
 
@@ -145,8 +145,9 @@ def _doctor_output_under(doctor_mod, monkeypatch, home, project, label):
 
 def test_run_doctor_call_site_serves_the_current_profile(monkeypatch, tmp_path):
     from hermes_cli import doctor as doctor_mod
+    from hermes_cli import doctor_connectivity
 
-    doctor_mod._reset_apikey_providers_cache_for_tests()
+    doctor_connectivity._reset_apikey_providers_cache_for_tests()
 
     project = tmp_path / "project"
     project.mkdir()
@@ -184,7 +185,7 @@ def test_run_doctor_call_site_serves_the_current_profile(monkeypatch, tmp_path):
         return [(f"WrenProbe-{name}", ["WREN_FAKE_PROVIDER_KEY"],
                  "https://example.invalid/v1/models", "", False)]
 
-    monkeypatch.setattr(doctor_mod, "_build_apikey_providers_list", fake_build)
+    monkeypatch.setattr(doctor_connectivity, "_build_apikey_providers_list", fake_build)
 
     out_a = _doctor_output_under(doctor_mod, monkeypatch, homes["profile_a"], project, "a")
     assert "WrenProbe-profile_a" in out_a, (

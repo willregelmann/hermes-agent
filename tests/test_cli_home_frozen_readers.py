@@ -304,7 +304,8 @@ _ALLOWED = ("_IMPORT_TIME_HERMES_HOME = ",
 # the import of the frozen-home resolver itself is not a read of it.  Matched
 # EXACTLY, not as a substring, so it cannot accidentally excuse a reader.
 _ALLOWED_EXACT = ("get_process_hermes_home,", "get_process_hermes_home",
-                  "from hermes_constants import get_process_hermes_home")
+                  "from hermes_constants import get_process_hermes_home",
+                  "from hermes_constants import get_hermes_home, get_process_hermes_home")
 
 
 def _scan(src: str):
@@ -449,8 +450,8 @@ def mutate(anchor: str, replacement: str, label: str, expect_field: str, expect_
           got == expect_value, f"mutant produced {got!r}, expected {expect_value!r}")
 
 
-mutate("        user_config_path = get_hermes_home() / 'config.yaml'\n",
-       "        user_config_path = _IMPORT_TIME_HERMES_HOME / 'config.yaml'\n",
+mutate("        config_path = get_hermes_home() / 'config.yaml'\n",
+       "        config_path = _IMPORT_TIME_HERMES_HOME / 'config.yaml'\n",
        "F1 (show_config)", "displayed", str(Path(HOME_B, "config.yaml")))
 
 mutate("        path = get_hermes_home() / path\n",
