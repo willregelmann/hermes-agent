@@ -131,6 +131,50 @@ def arm_wake(
             "be verified by anyone who did not watch this call"
         )
 
+    # D1, Ash on #41: the docstring claimed "recurring forms are refused" and
+    # NOTHING REFUSED THEM. `when="every 10m"` armed happily with a stored
+    # schedule of {'kind': 'interval', 'minutes': 10}; only repeat.times=1
+    # kept it to a single firing. So the behaviour was one-shot-ish while the
+    # stored schedule was an interval, and the only thing making it terminal
+    # was a counter rather than the schedule kind. That is a property a reader
+    # takes as checked — the same C1-decoration defect as #32, in a new place.
+    #
+    # Check the STORED schedule, not the input string: parse_schedule is what
+    # decides, so validating the string would assert my reading of the parser
+    # rather than the parser's output. Same shape as the wake_session_id
+    # re-read below — verify the effect, not the intent.
+    sched = job.get("schedule")
+    kind = sched.get("kind") if isinstance(sched, dict) else None
+    if kind != "once":
+        # Roll it back. A job that exists but violates the contract is worse
+        # than no job: it fires on a cadence nobody asked for and the arming
+        # turn already reported success.
+        try:
+            # remove_job, NOT delete_job. My first version imported a name
+            # that does not exist in cron/jobs.py, so the rollback raised
+            # ImportError inside its own except arm and the recurring job
+            # SURVIVED the refusal — the arm reported failure while the job
+            # stayed armed. Caught only because case D1c reads the store
+            # independently instead of trusting the raise.
+            from cron.jobs import remove_job
+
+            removed = remove_job(job_id)
+            if not removed:
+                raise RuntimeError(f"remove_job({job_id}) returned falsy")
+        except Exception:
+            # Cannot remove it — say so loudly and name the id, because now a
+            # non-conforming job IS on disk and a human has to see it.
+            raise WakeArmError(
+                f"refused a non-one-shot wake ({when!r} parsed to "
+                f"kind={kind!r}) but could NOT delete job {job_id}; a "
+                f"recurring job is now armed and must be removed by hand"
+            )
+        raise WakeArmError(
+            f"{when!r} parsed to schedule kind={kind!r}, not 'once'. A "
+            f"recurring wake is a second tick, and the tick already exists. "
+            f"Use a one-shot form such as 'in 20m'."
+        )
+
     # The payload must carry the session and the prompt, because the FIRING
     # side reads the job ON DISK, not this process's memory.
     #
