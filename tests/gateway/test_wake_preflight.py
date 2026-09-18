@@ -293,3 +293,155 @@ def test_gate2_catches_the_class_active_sessions_actually_raises():
     raises. This case takes no fixture on purpose."""
     import hermes_cli.active_sessions as real_as
     assert WP.ActiveSessionRegistryError is real_as.ActiveSessionRegistryError
+
+
+# ===========================================================================
+# Round 18 (Wren, mutation audit of merged PR #13 + this suite).  Six mutants
+# survived all 14 cases above; each block below is one named arm per mutant.
+# ===========================================================================
+
+
+# --- D1: the wake must be DELIVERED TO THE TARGET, not to the asker ---------
+# Mutant: deliver_wake(..., session_id=from_session).  Every case above read
+# only that delivery HAPPENED and what TEXT it carried, never WHERE it went --
+# so waking the wrong session (the one that is already awake and asking) was
+# deletable green while the row still recorded `delivered`.
+
+def test_delivery_targets_the_session_being_woken(collab, store):
+    collab["acquire_mode"]["mode"] = "grant"
+    s = store("d1")
+    do_wake(FakeRunner(in_flight=False), s)
+    assert collab["delivered_calls"], "non-vacuity: delivery must be attempted"
+    assert collab["delivered_calls"][0]["session_id"] == "will"
+    assert collab["delivered_calls"][0]["session_id"] != "britta", (
+        "a wake delivered to the FROM session wakes the asker, not the target"
+    )
+
+
+# --- D2: a gate-2 refusal reason is CARRIED, never re-derived ---------------
+# Mutant: reason=str(refusal.reason) replaced with the literal
+# "SESSION_NOT_OWNED".  C1 asserts exactly that literal, so a hardcoded reason
+# passed -- the module docstring's "verbatim, never re-derived from prose"
+# had an arm only for the single reason the test author happened to pick.
+
+@pytest.mark.parametrize("reason", [
+    "SESSION_NOT_OWNED",
+    "SESSION_COORDINATION_UNAVAILABLE",
+    "A_REASON_THIS_SUITE_HAS_NEVER_SEEN",
+])
+def test_gate2_refusal_reason_is_carried_verbatim(collab, store, monkeypatch, reason):
+    def refuse(*, session_id, surface, config, track_liveness):
+        return None, FakeRefusal(reason)
+    monkeypatch.setattr(WP, "try_acquire_active_session", refuse)
+    s = store("d2-" + reason)
+    with pytest.raises(WP.WakeRefused):
+        do_wake(FakeRunner(), s)
+    assert s.all_latest()[0].reason == reason
+
+
+# --- D3: "the probe said busy" and "the probe broke" are DIFFERENT FACTS ----
+# Mutant: gate 3's except-branch relabelled COMPRESSION_IN_FLIGHT.  Verdict,
+# row status, lease release and exception type are all identical, so C8 passed.
+# What changes is what the operator is told: COMPRESSION_IN_FLIGHT says the
+# session is healthy and busy (retry later, it will clear); GATE_ERROR says the
+# gate itself could not answer (nothing will clear on its own).
+
+def test_gate3_raising_is_labelled_gate_error_not_compression(collab, store):
+    collab["acquire_mode"]["mode"] = "grant"
+    s = store("d3")
+    with pytest.raises(WP.WakeRefused):
+        do_wake(FakeRunner(in_flight=RuntimeError("probe blew up")), s)
+    assert s.all_latest()[0].reason == WP.GATE_ERROR
+
+
+def test_gate3_busy_and_gate3_broken_get_different_reasons(collab, store):
+    collab["acquire_mode"]["mode"] = "grant"
+    s_busy = store("d3-busy")
+    with pytest.raises(WP.WakeRefused):
+        do_wake(FakeRunner(in_flight=True), s_busy)
+    s_broken = store("d3-broken")
+    with pytest.raises(WP.WakeRefused):
+        do_wake(FakeRunner(in_flight=RuntimeError("probe blew up")), s_broken)
+    busy = s_busy.all_latest()[0].reason
+    broken = s_broken.all_latest()[0].reason
+    assert busy == WP.COMPRESSION_IN_FLIGHT
+    assert broken == WP.GATE_ERROR
+    assert busy != broken, "a broken gate must not read as a healthy busy session"
+
+
+# --- D4: a failing lease release must not mask the wake's outcome -----------
+# Mutant: _release() calls release() bare.  The release runs in the `finally`
+# of the block that already recorded the outcome, so a raising release
+# replaces a DELIVERED return (or a WakeRefused) with the release's own
+# exception -- the caller loses the answer the row already holds.
+
+class BadLease:
+    def __init__(self, sid):
+        self.session_id = sid
+
+    def release(self):
+        raise RuntimeError("lease file vanished under us")
+
+
+@pytest.fixture
+def bad_lease(collab, monkeypatch):
+    def acquire(*, session_id, surface, config, track_liveness):
+        return BadLease(session_id), None
+    monkeypatch.setattr(WP, "try_acquire_active_session", acquire)
+    return collab
+
+
+def test_release_failure_does_not_mask_a_successful_wake(bad_lease, store):
+    s = store("d4a")
+    h = do_wake(FakeRunner(in_flight=False), s)
+    assert h.status == DELIVERED
+    assert s.all_latest()[0].status == DELIVERED
+
+
+def test_release_failure_does_not_mask_a_refusal(bad_lease, store):
+    s = store("d4b")
+    with pytest.raises(WP.WakeRefused):
+        do_wake(FakeRunner(in_flight=True), s)
+    assert s.all_latest()[0].reason == WP.COMPRESSION_IN_FLIGHT
+
+
+# --- D5/D6: the row must record WHO asked and IN WHICH DIRECTION ------------
+# Mutants: from/to swapped at open_handoff, and requesting_user replaced with
+# a constant.  Both survive every case above, because the suite reads only
+# status, reason and intent off the row.  The handoff record is the audit
+# trail for a wake nobody watched happen; a reversed row names the wrong
+# session as woken, and a constant user erases who authorised it.
+
+def test_row_records_the_direction_of_the_wake(collab, store):
+    collab["acquire_mode"]["mode"] = "grant"
+    s = store("d5")
+    do_wake(FakeRunner(in_flight=False), s)
+    row = s.all_latest()[0]
+    assert (row.from_session, row.to_session) == ("britta", "will")
+
+
+def test_row_records_the_requesting_user(collab, store):
+    collab["acquire_mode"]["mode"] = "grant"
+    s = store("d6")
+    do_wake(FakeRunner(in_flight=False), s)
+    assert s.all_latest()[0].requesting_user == "Britta"
+
+
+def test_row_direction_matches_the_delivery_target(collab, store):
+    """The row and the wire must agree about who was woken."""
+    collab["acquire_mode"]["mode"] = "grant"
+    s = store("d5b")
+    do_wake(FakeRunner(in_flight=False), s)
+    assert s.all_latest()[0].to_session == collab["delivered_calls"][0]["session_id"]
+
+
+# --- case-count floor (rule R14c: set from the MEASURED count, after the run)
+# A script/pytest suite that dies halfway prints no failures; this turns a
+# truncated collection into a named failing case.
+def test_case_count_floor():
+    import ast as _ast
+    src = open(__file__, encoding="utf-8").read()
+    tree = _ast.parse(src)
+    n = sum(1 for node in _ast.walk(tree)
+            if isinstance(node, _ast.FunctionDef) and node.name.startswith("test_"))
+    assert n >= 22, f"suite shrank: {n} test functions, floor 22"
