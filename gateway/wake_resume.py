@@ -44,9 +44,23 @@ way that reads like success. Refusing loudly beats half-working.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 API_SESSION_PREFIX = "api_"
+
+# A CRON-OWNED session is resumable by a DIFFERENT mechanism: the scheduler
+# already runs the turn itself, in-process, so it needs no enqueue path and no
+# HTTP hop. The two surfaces are therefore NOT interchangeable, and that is
+# the whole reason the gate below takes the allowed set as a PARAMETER instead
+# of hardcoding one prefix.
+#
+# Measured 2026-09-18 and it is why this refactor exists: wake_arm arms cron
+# jobs whose wake_session_id looks like `cron_<jobid>_<label>`. Handing that id
+# to resume_wake refuses it `wrong_surface` -- correctly, because there is no
+# api_ session to POST to -- so a single shared prefix constant would have made
+# the scheduler refuse every wake this pair can currently arm. The guards must
+# be shared; the SURFACE must not be.
+CRON_SESSION_PREFIX = "cron_"
 
 
 class ResumeRefused(RuntimeError):
@@ -66,6 +80,93 @@ class ResumeRefused(RuntimeError):
         self.reason = reason
 
 
+def check_resume_target(
+    session_id: Any,
+    prompt: Any,
+    *,
+    allowed_prefixes: Sequence[str] = (API_SESSION_PREFIX, CRON_SESSION_PREFIX),
+) -> str:
+    """The wake-resume gate, in ONE place. Returns the normalised session id.
+
+    EXTRACTED 2026-09-18 because ash862 measured the defect this module exists
+    to remove reproduced one file over: cron/scheduler.py had reimplemented the
+    divert inline (``_cron_session_id = job["wake_session_id"]``) with NO gate
+    at all, while every guard lived here, in a module nothing imported. Two
+    mechanisms, divergent guards, and the one carrying the guards was dead
+    code.
+
+    The surface set is a PARAMETER, not a constant, because the divergence
+    between the two callers is REAL and must be visible rather than accidental:
+    resume_wake reaches another process over the accept path and can only speak
+    to ``api_`` sessions; the scheduler runs the turn itself and can only
+    continue a ``cron_`` session it owns. Everything else -- blank id, blank
+    prompt, the refusal taxonomy -- is shared, and sharing it is the point.
+
+    Raises ResumeRefused. Never returns a falsy answer: a falsy return is
+    indistinguishable from never having been called.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ResumeRefused(
+            "no session named: a wake with nothing to resume has nothing to "
+            "check", kind="no_session")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ResumeRefused(
+            "no prompt: a resume that does not carry its arm-time intent "
+            "arrives as a fresh session with no reason to exist",
+            kind="no_prompt")
+
+    session_id = session_id.strip()
+
+    # SAME-SURFACE GATE. Named, so D2 can tell this refusal from any other.
+    if not any(session_id.startswith(p) for p in allowed_prefixes):
+        raise ResumeRefused(
+            f"session {session_id!r} is not resumable on this surface "
+            f"(expected one of {tuple(allowed_prefixes)!r}); cross-surface "
+            f"resume is not implemented and would fail in a way that reads "
+            f"like success",
+            kind="wrong_surface")
+    return session_id
+
+
+def resolve_cron_session_id(job: Any, prompt: Any, mint: Callable[[], str]) -> str:
+    """Which session id a cron fire should run under. NEVER raises.
+
+    This is the scheduler's whole share of the wake mechanism, extracted so it
+    can be DRIVEN by a test. The scheduler's own copy could not be: the divert
+    sits ~700 lines into a function that builds a live agent, so every arm on
+    it was a source-text assertion, and a source-text assertion cannot tell a
+    guarded subject from an unguarded one.
+
+    A refused wake FALLS THROUGH TO THE MINT rather than propagating: an
+    ordinary cron job must never fail because a wake field was malformed, and
+    a wake that cannot be honoured must not run into the wrong session. The
+    refusal is returned to the caller for logging via ``last_refusal``.
+    """
+    # CLEARED HERE, NOT BY THE CALLER (mutant M5). The first version left
+    # the clear to cron/scheduler.py, so a scheduler that forgot it carried
+    # the PREVIOUS fire's refusal into this one and logged a wake as REFUSED
+    # that was honoured. A channel whose correctness depends on every caller
+    # remembering to reset it is a channel that will be wrong.
+    resolve_cron_session_id.last_refusal = None
+    target = job.get("wake_session_id") if isinstance(job, dict) else None
+    if target is None:
+        # An ordinary cron job is NOT a refused wake. Returning through the
+        # gate here would work and would leave a refusal on the channel for
+        # every non-wake fire, so the log would cry wolf on ~every job on the
+        # box (mutant M8 -- verdict-equivalent, observable only on the
+        # refusal channel).
+        return mint()
+    try:
+        return check_resume_target(
+            target, prompt, allowed_prefixes=(CRON_SESSION_PREFIX,))
+    except ResumeRefused as exc:
+        resolve_cron_session_id.last_refusal = exc
+        return mint()
+
+
+resolve_cron_session_id.last_refusal = None
+
+
 def resume_wake(
     *,
     session_id: str,
@@ -82,26 +183,8 @@ def resume_wake(
     under test, and counting is the only way to observe it, because both paths
     leave the session one row heavier.
     """
-    if not isinstance(session_id, str) or not session_id.strip():
-        raise ResumeRefused(
-            "no session named: a wake with nothing to resume has nothing to "
-            "check", kind="no_session")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ResumeRefused(
-            "no prompt: a resume that does not carry its arm-time intent "
-            "arrives as a fresh session with no reason to exist",
-            kind="no_prompt")
-
-    session_id = session_id.strip()
-
-    # SAME-SURFACE GATE. Named, so D2 can tell this refusal from any other.
-    if not session_id.startswith(API_SESSION_PREFIX):
-        raise ResumeRefused(
-            f"session {session_id!r} is not an api_server session "
-            f"(expected prefix {API_SESSION_PREFIX!r}); cross-surface resume "
-            f"is not implemented and would fail in a way that reads like "
-            f"success",
-            kind="wrong_surface")
+    session_id = check_resume_target(
+        session_id, prompt, allowed_prefixes=(API_SESSION_PREFIX,))
 
     if enqueue is None:
         try:

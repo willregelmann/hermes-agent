@@ -5811,15 +5811,41 @@ def run_job(
     #
     # The divert MUST happen before the mint, not after: anything downstream
     # that has already captured _cron_session_id would keep the fresh one.
-    _wake_target = job.get("wake_session_id") if isinstance(job, dict) else None
-    if isinstance(_wake_target, str) and _wake_target.strip():
-        _cron_session_id = _wake_target.strip()
-        logger.info(
-            "Job '%s': wake resume — continuing session %s rather than "
-            "minting a new one", job_name, _cron_session_id,
+    #
+    # THE GATE IS CALLED, NOT COPIED. Reviewed 2026-09-18 by ash862: an
+    # earlier version of this branch reimplemented the divert inline while
+    # every guard -- surface prefix, blank id, blank prompt, the named
+    # refusal taxonomy -- lived in a module nothing imported. Two mechanisms
+    # with divergent guards, and the guarded one was unreachable: exactly the
+    # wake_preflight defect this line of work exists to remove, reproduced
+    # inside the fix for it. A malformed wake field must never break an
+    # ordinary job, so a refusal falls through to the mint and is LOGGED with
+    # its kind.
+    def _mint_cron_session_id():
+        return f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
+    try:
+        from gateway.wake_resume import resolve_cron_session_id as _resolve_wake
+    except Exception as _wake_imp_exc:  # pragma: no cover - deployment fault
+        logger.error(
+            "Job '%s': wake-resume gate unavailable (%s); every wake will "
+            "fire into a fresh session", job_name, _wake_imp_exc,
         )
+        _cron_session_id = _mint_cron_session_id()
     else:
-        _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+        _cron_session_id = _resolve_wake(job, prompt, _mint_cron_session_id)
+        _wake_refusal = getattr(_resolve_wake, "last_refusal", None)
+        if _wake_refusal is not None:
+            logger.warning(
+                "Job '%s': wake resume REFUSED (%s): %s -- running in a fresh "
+                "session %s instead", job_name, _wake_refusal.kind,
+                _wake_refusal.reason, _cron_session_id,
+            )
+        elif job.get("wake_session_id"):
+            logger.info(
+                "Job '%s': wake resume -- continuing session %s rather than "
+                "minting a new one", job_name, _cron_session_id,
+            )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])

@@ -89,7 +89,7 @@ arm_src = open(arm, encoding="utf-8").read()
 # unconditional mint must still exist as the ELSE for ordinary cron jobs. A
 # resume that removed the mint would break every non-wake job.
 _reads_field = sched_src.count("wake_session_id") > 0
-_keeps_mint = '_cron_session_id = f"cron_' in sched_src
+_keeps_mint = 'f"cron_{job_id}_' in sched_src
 check("S2 the scheduler READS wake_session_id (the resume branch landed)",
       _reads_field,
       f"wake_session_id occurrences in scheduler: "
@@ -490,6 +490,59 @@ def _run_conversation_kwargs(path):
     return names, found
 
 
+def _resume_wake_callers(root, skip_prefixes=()):
+    """Non-test files that CALL resume_wake (not merely import the module).
+
+    REWRITTEN 2026-09-18 after my own gate extraction broke this arm's proxy.
+    H1's disjunct (c) used to be "a production importer of wake_resume
+    exists", on the reasoning that the only reason to import it was to wire
+    resolution (1), where the accept path hands the prompt to a LIVE session
+    that already owns its transcript -- hydration for free. Then I made
+    cron/scheduler.py import the SAME module for the shared surface gate, and
+    H1 went green without one line of hydration existing anywhere. An
+    importer was never the claim; reaching the enqueue path was.
+    """
+    hits = []
+    examined = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "venv", "node_modules",
+                                    "__pycache__")]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, root)
+            if any(rel.startswith(sp) for sp in skip_prefixes):
+                continue
+            try:
+                raw = open(p, "rb").read()
+            except Exception:
+                continue
+            if b"resume_wake" not in raw:
+                continue
+            examined += 1
+            try:
+                tree_ = _gast.parse(raw)
+            except Exception:
+                continue
+            for n in _gast.walk(tree_):
+                if isinstance(n, _gast.Call):
+                    nm = getattr(n.func, "attr", None) or \
+                        getattr(n.func, "id", None)
+                    # resolve_cron_session_id ENDS with resume_wake's name
+                    # only by accident of English; match exactly.
+                    if nm == "resume_wake":
+                        hits.append(rel)
+                        break
+    return hits, examined
+
+
+_rw_call_hits, _rw_call_examined = _resume_wake_callers(
+    TREE, skip_prefixes=("tests" + os.sep,))
+_rw_test_hits, _rw_test_examined = _resume_wake_callers(
+    os.path.join(TREE, "tests"))
+
 _cron_dir = os.path.join(TREE, "cron")
 _cron_loader_hits, _cron_loader_examined = _loader_calls(_cron_dir)
 _known_loader_hits, _known_loader_examined = _loader_calls(
@@ -498,7 +551,16 @@ _rc_kwargs, _rc_calls = _run_conversation_kwargs(sched)
 
 _carries_history = "conversation_history" in _rc_kwargs
 _loads_transcript = bool(_cron_loader_hits)
-_resume_wired = bool(_prod_hits) and not _prod_trunc
+# DISJUNCT (c) IS A CONJUNCTION, and mutant M10 is why. It first read "a
+# production file CALLS resume_wake", on the reasoning that the accept path
+# hands the prompt to a live api_server turn which loads its own transcript
+# (gateway/platforms/api_server.py::_enqueue_session_chat), so hydration
+# comes for free. That is true ONLY IF the call can reach the enqueue path.
+# M10 adds a caller and nothing else: resume_wake refuses it `no_enqueue`,
+# not one line of hydration exists, and H1 went green. A caller of a module
+# that refuses every invocation is not a wired resolution.
+_resume_wired = bool(_rw_call_hits) and bool(_f_modfile) \
+    and os.path.exists(_f_modfile)
 
 check("H0 NON-VACUITY: the loader scanner finds a KNOWN transcript-loading "
       "caller (hermes_cli resume)",
@@ -511,6 +573,12 @@ check("H2 NON-VACUITY: the kwarg reader actually FOUND the cron fire's "
       _rc_calls > 0 and bool(_rc_kwargs),
       f"calls found={_rc_calls} kwargs seen={sorted(_rc_kwargs)} -- with no "
       f"call or no visible kwargs, H1's history half is vacuous")
+check("H3 NON-VACUITY: the resume_wake CALL scanner finds this suite "
+      "calling resume_wake",
+      bool(_rw_test_hits),
+      f"the call scan found nothing even under tests/ "
+      f"(examined={_rw_test_examined}) -- a scanner that finds nothing "
+      f"anywhere makes H1's third disjunct decide nothing")
 check("H1 a resumed wake is a CONTINUATION: the turn can see the session's "
       "prior transcript",
       _carries_history or _loads_transcript or _resume_wired,
@@ -522,18 +590,197 @@ check("H1 a resumed wake is a CONTINUATION: the turn can see the session's "
       f"(b) transcript loader calls under cron/={_cron_loader_hits} "
       f"(examined={_cron_loader_examined}) -- nothing on the cron path reads "
       f"the session it was told to continue; "
-      f"(c) production importers of wake_resume={_prod_hits} -- resolution "
-      f"(1) is not wired either. CONSEQUENCE: diverting the session id makes "
+      f"(c) production CALLERS of resume_wake={_rw_call_hits} "
+      f"(examined={_rw_call_examined}), enqueue module present="
+      f"{bool(_f_modfile) and os.path.exists(_f_modfile)} -- resolution "
+      f"(1) is not wired "
+      f"either; note this is a CALL scan, not an import scan, because an "
+      f"importer proved nothing once the scheduler imported the same module "
+      f"for its surface gate. CONSEQUENCE: diverting the session id makes "
       f"the turn WRITE INTO the named session while READING NONE OF IT. The "
       f"prompt arrives, the row lands in the right place, and the agent has "
       f"no memory of the turn that armed it -- a shared label, not a "
       f"continuation. Resolution (2) is therefore NOT the smaller of the "
       f"two: it needs hydration as well as the branch.")
 
+# ---- J: THE SCHEDULER MUST USE THE SHARED GATE, NOT A COPY ----------
+# ash862's r25 review, the blocking finding: the scheduler had reimplemented
+# the divert inline while every guard lived in wake_resume.py, which nothing
+# imported. Two mechanisms, divergent guards, and the guarded one was
+# unreachable -- the wake_preflight defect reproduced inside the fix for it.
+#
+# G1 above now passes only if SOME non-test file imports the module. That is
+# necessary and not sufficient: an importer that imports and ignores would
+# satisfy it. These arms DRIVE the extracted resolver, which is the reason it
+# was extracted -- the scheduler's own copy sits ~700 lines into a function
+# that builds a live agent and cannot be called from a test, so every arm on
+# it could only ever be a source-text assertion, and a source-text assertion
+# cannot tell a guarded subject from an unguarded one (ash's own fourth
+# instance, same review).
+resolve_cron = None
+check_gate = None
+try:
+    from gateway.wake_resume import (  # type: ignore
+        check_resume_target as check_gate,
+        resolve_cron_session_id as resolve_cron,
+    )
+except Exception as _jexc:
+    pass
+
+check("J0 the shared gate is importable as check_resume_target()",
+      check_gate is not None,
+      "the guards must exist in ONE place for both callers to share them")
+check("J1 the scheduler-facing resolver resolve_cron_session_id() exists",
+      resolve_cron is not None,
+      "without it the scheduler can only inline its own copy of the gate, "
+      "which is the state this review blocked")
+
+if resolve_cron is not None:
+    _mints = []
+
+    def _mint():
+        _mints.append(1)
+        return "cron_JOB_20260918_000000"
+
+    # EVERY DRIVE BELOW GOES THROUGH _drive, WHICH CATCHES. Mutant M7 made
+    # the resolver raise instead of falling through; the bare calls died at
+    # module scope, the suite ABORTED after 0 cases, and a fail-counting
+    # reader called that SURVIVED (lesson 77, second instance in my hands).
+    # A broken subject must yield a NAMED FAILING CASE, never a corpse.
+    def _drive(job, prompt="p"):
+        try:
+            return resolve_cron(job, prompt, _mint), None
+        except BaseException as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    # J2: a well-formed cron wake is HONOURED -- the mint is not reached.
+    _mints[:] = []
+    _got, _err = _drive({"wake_session_id": "cron_a684507bde00_wake"},
+                        "check the thing")
+    check("J2 a well-formed cron wake target is returned and the mint is "
+          "NOT called",
+          _err is None and _got == "cron_a684507bde00_wake" and not _mints,
+          f"raised={_err} got={_got!r} mint_calls={len(_mints)} -- a resume "
+          f"that still mints is a reminder, not a continuation")
+
+    # J3: an ordinary job (no field) still gets a fresh session, AND leaves
+    # no refusal. The second half is mutant M8: routing the no-field case
+    # through the gate returns the same id and is invisible to a verdict
+    # assertion, but records a refusal for EVERY ordinary cron fire on the
+    # box, so the warning log cries wolf and stops being read.
+    _mints[:] = []
+    _got, _err = _drive({}, "ordinary prompt")
+    _ref = getattr(resolve_cron, "last_refusal", None)
+    check("J3 a job with no wake field still gets a freshly minted session",
+          _err is None and _got == "cron_JOB_20260918_000000" and len(_mints) == 1,
+          f"raised={_err} got={_got!r} mint_calls={len(_mints)}")
+    check("J3b ...and is NOT recorded as a refused wake (an ordinary job is "
+          "not a failed one)",
+          _ref is None,
+          f"refusal={getattr(_ref, 'kind', None)!r} on a job that never "
+          f"asked for a wake -- every non-wake fire would log a refusal")
+
+    # J4: THE ARM THAT MAKES THE SHARING MEAN SOMETHING. A wrong-surface id
+    # was accepted by the inline copy and refused by the module nobody
+    # called. It must now be refused on the LIVE path.
+    _mints[:] = []
+    _got, _err = _drive({"wake_session_id": "google_chat_spaces_AAAA"},
+                        "check the thing")
+    _ref = getattr(resolve_cron, "last_refusal", None)
+    check("J4 a wrong-surface wake id is REFUSED on the scheduler path and "
+          "falls through to the mint",
+          _err is None and _got == "cron_JOB_20260918_000000"
+          and len(_mints) == 1
+          and _ref is not None and getattr(_ref, "kind", "") == "wrong_surface",
+          f"raised={_err} got={_got!r} mint_calls={len(_mints)} refusal="
+          f"{getattr(_ref, 'kind', None)!r} -- measured before this fix: the "
+          f"inline divert had no prefix check at all, so a wake_session_id "
+          f"naming a chat session was accepted on the live path and refused "
+          f"only in the module nothing imported")
+
+    # J5: a blank / non-string field is a malformed record, NOT a reason to
+    # fail an ordinary job. Falls through, and says why.
+    for _bad, _label in ((" ", "blank"), (123, "non-string")):
+        _mints[:] = []
+        _got, _err = _drive({"wake_session_id": _bad})
+        _ref = getattr(resolve_cron, "last_refusal", None)
+        check(f"J5 a {_label} wake field falls through to the mint with a "
+              f"named refusal",
+              _err is None and _got == "cron_JOB_20260918_000000"
+              and len(_mints) == 1
+              and _ref is not None and getattr(_ref, "kind", "") == "no_session",
+              f"raised={_err} got={_got!r} refusal="
+              f"{getattr(_ref, 'kind', None)!r}")
+
+    # J6: THE CHANNEL MUST CLEAR ITSELF. Mutant M5: the first version left
+    # the reset to the caller, so a scheduler that forgot carried the
+    # previous fire's refusal into the next one and logged an honoured wake
+    # as refused. This arm deliberately does NOT pre-clear -- pre-clearing is
+    # what made it blind.
+    _mints[:] = []
+    _drive({"wake_session_id": "google_chat_spaces_BBBB"})   # leave a refusal
+    check("J6 NON-VACUITY: that call really did leave a refusal behind",
+          getattr(resolve_cron, "last_refusal", None) is not None,
+          "nothing was recorded, so the clearing arm below passes for free")
+    _drive({"wake_session_id": "cron_x_y"})
+    check("J6b an honoured wake CLEARS the previous refusal without the "
+          "caller resetting it",
+          getattr(resolve_cron, "last_refusal", None) is None,
+          "last_refusal is sticky across fires: an honoured wake reports the "
+          "PREVIOUS fire's refusal, and the scheduler logs a wake that "
+          "worked as one that did not")
+
+    # J7: the resolver NEVER raises. A malformed wake field must not be able
+    # to kill an ordinary cron fire; this is the whole reason it returns a
+    # refusal instead of propagating one.
+    _raised = None
+    for _j, _p in (({"wake_session_id": object()}, "p"), (None, "p"),
+                   ({"wake_session_id": "cron_x"}, ""),
+                   ({"wake_session_id": ""}, "p")):
+        _g, _e = _drive(_j, _p)
+        if _e is not None:
+            _raised = f"{_e} on job={_j!r} prompt={_p!r}"
+            break
+    check("J7 the resolver never raises, whatever the job record holds",
+          _raised is None,
+          f"raised {_raised} -- a cron fire that dies on a malformed wake "
+          f"field takes an ordinary job down with it")
+
+# J8: STRUCTURAL -- the scheduler IMPORTS the gate rather than spelling its
+# own. ast, never substring: scheduler.py mentions wake_session_id in six
+# comment lines and a substring scan cannot tell a mention from a call.
+_sched_tree = None
+try:
+    _sched_tree = _gast.parse(sched_src)
+except Exception:
+    pass
+_imports_gate = False
+_calls_gate = False
+if _sched_tree is not None:
+    for _n in _gast.walk(_sched_tree):
+        if isinstance(_n, _gast.ImportFrom) and \
+                (_n.module or "").endswith("wake_resume"):
+            for _a in _n.names:
+                if _a.name in ("resolve_cron_session_id", "check_resume_target"):
+                    _imports_gate = True
+        if isinstance(_n, _gast.Call):
+            _f = _n.func
+            _nm = getattr(_f, "id", None) or getattr(_f, "attr", None)
+            if _nm in ("_resolve_wake", "resolve_cron_session_id",
+                       "check_resume_target"):
+                _calls_gate = True
+check("J8 cron/scheduler.py IMPORTS the shared gate from gateway.wake_resume",
+      _imports_gate,
+      "the scheduler spells its own divert -- two mechanisms with divergent "
+      "guards, and the guarded one is unreachable")
+check("J9 ...and CALLS it (an import that is never called is a citation)",
+      _calls_gate,
+      "importing the gate without calling it satisfies G1 for free")
+
 # ---- CASE FLOOR -----------------------------------------------------
 # Set from the MEASURED count after the run (lesson 79e). A script suite can
 # die halfway and a fail-counting reader calls that green.
-_FLOOR = 26
+_FLOOR = 41   # MEASURED after the r26 run, never guessed (lesson 79e)
 check(f"Z0 case floor: at least {_FLOOR} cases executed",
       len(results) >= _FLOOR - 1,
       f"only {len(results)} cases ran; an aborted suite is not a green one")
