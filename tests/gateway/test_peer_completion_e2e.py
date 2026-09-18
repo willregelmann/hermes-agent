@@ -168,6 +168,248 @@ async def drive():
 
 asyncio.run(drive())
 
+
+# ======================================================================
+# ROUND 14 ADDITIONS (mutation audit of merged PR #29).
+# Ten of thirteen mutants survived the original 25 cases. Everything below
+# drives a real entry point; nothing below asserts on source text except E1,
+# which says so in its own name.
+# ======================================================================
+
+import ast  # noqa: E402
+
+# ---- E: THE SPAWN IS UNCONDITIONAL -----------------------------------
+# A2 of the requeue suite reads `_spawn_supervised(self._peer_completion_watcher`
+# out of the source. Wrapping that exact line in `if False:` leaves the
+# substring in place, and the mutant passed all 25 cases. start() is ~1000
+# lines of network setup and cannot be driven here, so this arm is
+# STRUCTURAL rather than behavioural: parse the file and require the spawn
+# call to be a direct statement of its function body, not nested in any
+# conditional. That distinguishes "named" from "reached".
+_tree = ast.parse(run_src)
+_spawn_sites = []
+for _fn in ast.walk(_tree):
+    if not isinstance(_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    for _stmt in _fn.body:  # DIRECT body only — no ast.walk here
+        if not isinstance(_stmt, ast.Expr):
+            continue
+        _c = _stmt.value
+        if not isinstance(_c, ast.Call):
+            continue
+        if getattr(_c.func, "attr", None) != "_spawn_supervised":
+            continue
+        for _a in _c.args:
+            if getattr(_a, "attr", None) == "_peer_completion_watcher":
+                _spawn_sites.append(_fn.name)
+check("E1 STRUCTURAL: the watcher spawn is an unconditional statement",
+      len(_spawn_sites) == 1,
+      f"found {_spawn_sites} — the call may be present but nested under a "
+      f"conditional, which reads exactly like a wired watcher and never runs")
+
+# ---- F: THE WATCHER LOOP REQUEUES ------------------------------------
+# Every earlier case drove _drain_peer_completions (pure) or
+# _deliver_peer_completion (directly). The loop that joins them — the one
+# that decides whether a FAILED delivery is retried or lost — had no arm,
+# and both of its requeue branches were deletable green.
+from tools.process_registry import process_registry as _PR  # noqa: E402
+
+
+class WatchRunner:
+    """Real _peer_completion_watcher body, one iteration."""
+
+    def __init__(self, outcome):
+        self._outcome = outcome        # True | False | "raise"
+        self._iters = 0
+        self.seen = []
+
+    @property
+    def _running(self):
+        return self._iters < 1
+
+    async def _deliver_peer_completion(self, evt):
+        self._iters += 1
+        self.seen.append(evt)
+        if self._outcome == "raise":
+            raise RuntimeError("delivery blew up")
+        return self._outcome
+
+
+WatchRunner._peer_completion_watcher = R.GatewayRunner._peer_completion_watcher
+
+
+async def drive_watcher(outcome):
+    # Drain anything already queued so the arm reads only its own event.
+    while not _PR.completion_queue.empty():
+        _PR.completion_queue.get_nowait()
+    evt = {"type": "peer_completion", "session_id": "sW", "text": "t",
+           "peer": "wren", "handoff_id": "hW"}
+    _PR.completion_queue.put(evt)
+    runner = WatchRunner(outcome)
+    real_sleep = R.asyncio.sleep
+
+    async def _fast(_s):
+        await real_sleep(0)
+
+    R.asyncio.sleep = _fast
+    try:
+        await runner._peer_completion_watcher(interval=0)
+    finally:
+        R.asyncio.sleep = real_sleep
+    left = []
+    while not _PR.completion_queue.empty():
+        left.append(_PR.completion_queue.get_nowait())
+    return runner, left
+
+
+async def drive_all():
+    r_ok, left_ok = await drive_watcher(True)
+    check("F0 NON-VACUITY: the watcher really consumed the event",
+          r_ok.seen and r_ok.seen[0]["handoff_id"] == "hW",
+          f"seen={r_ok.seen!r}")
+    check("F1 a DELIVERED event is not requeued", left_ok == [],
+          f"left {left_ok!r}")
+    _r_no, left_no = await drive_watcher(False)
+    check("F2 a FAILED delivery is REQUEUED (the reply stays owed)",
+          [e.get("handoff_id") for e in left_no] == ["hW"],
+          f"left {left_no!r} — a dropped event is a silently lost reply, the "
+          f"exact shape this feature exists to remove")
+    _r_ex, left_ex = await drive_watcher("raise")
+    check("F3 a RAISING delivery is REQUEUED too",
+          [e.get("handoff_id") for e in left_ex] == ["hW"],
+          f"left {left_ex!r}")
+
+    # ---- G: THE UNROUTABLE EVENT -------------------------------------
+    # The guard that drops an event with no session_id/text was deletable
+    # green, and so was the direction of its return value. Returning False
+    # there makes the watcher requeue an event that can never be routed,
+    # which is a hot loop, not a retry.
+    g = FakeRunner(inject_ok=True)
+    g_ok = await g._deliver_peer_completion(
+        {"type": "peer_completion", "session_id": "", "text": "x"})
+    check("G1 an event with no session_id never reaches the injector",
+          g.injected == [], f"injected {g.injected!r}")
+    check("G2 and is reported TRUE so the watcher drops it rather than spinning",
+          g_ok is True, f"got {g_ok!r}")
+    g2 = FakeRunner(inject_ok=True)
+    g2_ok = await g2._deliver_peer_completion(
+        {"type": "peer_completion", "session_id": "s9", "text": "   "})
+    check("G3 whitespace-only text is unroutable the same way",
+          g2.injected == [] and g2_ok is True,
+          f"injected={g2.injected!r} ok={g2_ok!r}")
+
+    # ---- H: THE MIRROR CALL ------------------------------------------
+    # _inject_peer_completion_turn had no arm at all: role="assistant" and
+    # ignoring the event's chat_id both passed 25 cases. The role one breaks
+    # strict-alternation providers, which is stated in the PR body.
+    import gateway.mirror as _M
+    seen_kw = {}
+
+    def _fake_mirror(**kw):
+        seen_kw.update(kw)
+        return True
+
+    real_mirror = _M.mirror_to_session
+    _M.mirror_to_session = _fake_mirror
+    try:
+        class InjRunner:
+            pass
+        InjRunner._inject_peer_completion_turn = \
+            R.GatewayRunner._inject_peer_completion_turn
+        ok = await InjRunner()._inject_peer_completion_turn(
+            "s-inj", "hello",
+            {"peer": "wren", "platform": "google_chat", "chat_id": "spaces/AAA"})
+    finally:
+        _M.mirror_to_session = real_mirror
+    check("H0 NON-VACUITY: the real mirror primitive was called",
+          ok is True and seen_kw.get("message_text") == "hello",
+          f"kw={sorted(seen_kw)}")
+    check("H1 the peer's words are mirrored with role='user'",
+          seen_kw.get("role") == "user",
+          f"role={seen_kw.get('role')!r} — an assistant-role mirror replays as "
+          f"this agent speaking and produces assistant->assistant pairs")
+    check("H2 the event's chat_id is honoured, not overwritten by session_id",
+          seen_kw.get("chat_id") == "spaces/AAA",
+          f"chat_id={seen_kw.get('chat_id')!r} — delivery would go to the "
+          f"wrong channel")
+    check("H3 and the session_id still routes the append",
+          seen_kw.get("session_id") == "s-inj", f"{seen_kw.get('session_id')!r}")
+
+    # ---- I: THE PRODUCER, driven on the real accept path --------------
+    # A1/C0 read the publish dict out of api_server.py as text. Feeding any
+    # of its values None leaves the key in the file, and M10/M11/M12 all
+    # passed. Drive _enqueue_session_chat for real and read the QUEUE.
+    import gateway.platforms.api_server as A
+
+    async def drive_producer(final_text):
+        while not _PR.completion_queue.empty():
+            _PR.completion_queue.get_nowait()
+        store_p = HandoffStore(path, author="test")
+
+        class FakeAPI:
+            _accepted_chat_tasks = set()
+
+            def _handoff_store(self):
+                return store_p
+
+            async def _conversation_history_for_session(self, sid):
+                return []
+
+            async def _run_agent(self, **kw):
+                return ({"final_response": final_text}, {})
+
+        FakeAPI._enqueue_session_chat = A.APIServerAdapter._enqueue_session_chat
+        api = FakeAPI()
+        resp = await api._enqueue_session_chat(
+            session_id="s-prod", user_message="ping", system_prompt=None,
+            gateway_session_key="k", route=None, session_model=None,
+            runtime_request={}, lock_active=False, agent_overrides={},
+            requesting_user="wren", reply_to=None)
+        for t in list(FakeAPI._accepted_chat_tasks):
+            await t
+        events = []
+        while not _PR.completion_queue.empty():
+            events.append(_PR.completion_queue.get_nowait())
+        return resp, events
+
+    resp, events = await drive_producer("pong from the peer")
+    check("I0 NON-VACUITY: the accept path answered 202",
+          getattr(resp, "status", None) == 202, f"status={getattr(resp,'status',None)}")
+    check("I1 exactly one peer_completion event is published",
+          len(events) == 1 and events[0].get("type") == "peer_completion",
+          f"events={events!r}")
+    ev = events[0] if events else {}
+    check("I2 the published event carries the REAL session_id",
+          ev.get("session_id") == "s-prod",
+          f"session_id={ev.get('session_id')!r} — None here makes every reply "
+          f"unroutable while '\"session_id\":' stays in the file")
+    check("I3 and the REAL handoff id, so the row can be closed",
+          isinstance(ev.get("handoff_id"), str) and ev.get("handoff_id"),
+          f"handoff_id={ev.get('handoff_id')!r} — None leaves the row open "
+          f"forever and stale() reports a reply that was delivered")
+    check("I4 the handoff id names a row that actually exists",
+          any(r.id == ev.get("handoff_id")
+              for r in HandoffStore(path, author="r").all_latest()),
+          "the published id matches no row")
+    check("I5 the text is the turn's final_response",
+          ev.get("text") == "pong from the peer", f"text={ev.get('text')!r}")
+    _resp2, events2 = await drive_producer("   ")
+    check("I6 a turn with NO text publishes NOTHING",
+          events2 == [],
+          f"events={events2!r} — an empty event forces the consumer to decide "
+          f"about a reply that does not exist")
+
+
+asyncio.run(drive_all())
+
+# ---- CASE-COUNT FLOOR ------------------------------------------------
+# A suite that dies halfway prints no FAIL line, and a fail-counting harness
+# reads that as green (lesson 77).
+FLOOR = 33
+check(f"Z1 CASE FLOOR: at least {FLOOR} cases ran", ran >= FLOOR,
+      f"only {ran} ran — a truncated run is not a green run")
+
+
 print()
 if fails:
     print(f"  {len(fails)} FAILED: {', '.join(fails)}")
