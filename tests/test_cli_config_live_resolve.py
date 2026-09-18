@@ -34,10 +34,12 @@ import textwrap
 from pathlib import Path
 
 FAILS: list[str] = []
+_RAN = [0]
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     if cond:
+        _RAN[0] += 1
         print(f"  PASS  {name}")
     else:
         FAILS.append(name)
@@ -284,6 +286,133 @@ else:
           e_slow == "999",
           f"mutant exported {e_slow!r}; if this is 111 the mutation did not "
           f"reach the bridge and D1 proves nothing")
+
+
+
+# ── F. THE LIVE READER, READ FROM INSIDE THE SCOPE ────────────────────────
+# Everything above measures load_cli_config() AFTER the scope exits, where the
+# live home and the PROCESS home are the same value (A).  So the whole suite is
+# satisfied by a reader that resolves get_process_hermes_home(), or that returns
+# the module-global CLI_CONFIG, or that memoises its first answer -- three
+# spellings of the exact defect #11 exists to remove, none of them observable
+# from outside a scope.  (Lesson 82: enumerate every EXPRESSION that produces
+# the forbidden value; the process resolver is the spelling nobody arms.)
+print("\nF. THE LIVE READER — a call INSIDE profile B's scope must return B")
+
+LIVE = """
+    import os
+    os.environ["HERMES_HOME"] = %(A)r
+    from hermes_constants import (set_hermes_home_override,
+                                  reset_hermes_home_override)
+    import cli                      # imported OUTSIDE any scope: home A owns it
+    tok = set_hermes_home_override(%(B)r)
+    print("inside_model:", str(cli.load_cli_config().get("model", {}).get("default")))
+    reset_hermes_home_override(tok)
+    print("after_model:", str(cli.load_cli_config().get("model", {}).get("default")))
+""" % {"A": HOME_A, "B": HOME_B}
+
+rc, out_f = child(LIVE)
+f_in, f_after = field(out_f, "inside_model"), field(out_f, "after_model")
+print(f"    inside scope B  : {f_in}")
+print(f"    after exit to A : {f_after}")
+check("F0 the live-read child ran", rc == 0 and f_in != "<MISSING>",
+      f"rc={rc} out={out_f[-300:]}")
+check("F1 load_cli_config() INSIDE profile B returns B's config",
+      f_in == "PROFILE-B",
+      f"got {f_in!r}; 'PROFILE-A' means the reader resolved the PROCESS home "
+      f"(or returned the frozen module global) and ignored the live scope — "
+      f"the #11 defect in a spelling every other case is blind to")
+check("F2 the SAME reader returns A again after the scope exits (not memoised)",
+      f_after == "PROFILE-A",
+      f"got {f_after!r}; a reader that caches its first answer passes F1 and "
+      f"is still frozen")
+
+# ── G. THE PURITY CLAIM ───────────────────────────────────────────────────
+# load_cli_config()'s docstring states it is a PURE READ and that the env bridge
+# was moved out for exactly this reason: calling it from inside another
+# profile's scope must not leave that profile's settings in the shared
+# environment.  That sentence had no arm (lesson 73: a claim in the prose is a
+# documented invariant with no binding).
+print("\nG. PURITY — a scoped load_cli_config() must not write to os.environ")
+
+PURE = """
+    import os
+    os.environ["HERMES_HOME"] = %(A)r
+    os.environ.pop("HERMES_SEARCH_SLOW_MS", None)
+    from hermes_constants import (set_hermes_home_override,
+                                  reset_hermes_home_override)
+    import cli
+    print("import_slow:", os.environ.get("HERMES_SEARCH_SLOW_MS"))
+    tok = set_hermes_home_override(%(B)r)
+    _cfg = cli.load_cli_config()
+    print("scoped_cfg_slow:", str(_cfg.get("sessions", {}).get("search_slow_ms")))
+    reset_hermes_home_override(tok)
+    print("env_slow:", os.environ.get("HERMES_SEARCH_SLOW_MS"))
+""" % {"A": HOME_A, "B": HOME_B}
+
+rc, out_g = child(PURE)
+g_import, g_cfg, g_env = (field(out_g, "import_slow"), field(out_g, "scoped_cfg_slow"),
+                          field(out_g, "env_slow"))
+print(f"    import-time export : {g_import}")
+print(f"    scoped read value  : {g_cfg}")
+print(f"    env after the call : {g_env}")
+check("G0 the child ran and the import-time bridge fired",
+      rc == 0 and g_import == "111",
+      f"rc={rc} import_slow={g_import!r} out={out_g[-300:]}")
+check("G1 the scoped call really read B (so there was something to leak)",
+      g_cfg == "999",
+      f"got {g_cfg!r}; if this is 111 the reader never saw B and G2 passes "
+      f"for free")
+check("G2 the scoped call left the shared environment on A's value",
+      g_env == "111",
+      f"got {g_env!r}; '999' means load_cli_config() is not the pure read its "
+      f"docstring claims and re-exported B into the process environment")
+
+# ── H. THE SCOPE-IMPORT WARNING ───────────────────────────────────────────
+# The pin at the bottom of cli.py makes a scoped import HARMLESS; the warning
+# beside it is what makes it VISIBLE.  Its only observable effect is a log line,
+# so no verdict-reading case can see it deleted (lesson 66).
+print("\nH. THE SCOPE-IMPORT WARNING — 'harmless' must still be 'visible'")
+
+WARN_PHRASE = "imported inside a profile scope"
+WARNED = """
+    import logging, sys
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+    import os
+    os.environ["HERMES_HOME"] = %(A)r
+    from hermes_constants import (set_hermes_home_override,
+                                  reset_hermes_home_override)
+    tok = set_hermes_home_override(%(B)r)
+    import cli
+    reset_hermes_home_override(tok)
+    print("imported_ok: 1")
+"""
+
+rc, out_h = child(WARNED % {"A": HOME_A, "B": HOME_B})
+check("H0 the scoped-import child ran", rc == 0 and field(out_h, "imported_ok") == "1",
+      f"rc={rc} out={out_h[-300:]}")
+check("H1 importing inside a foreign scope is WARNED about",
+      WARN_PHRASE in out_h,
+      "the pin makes a scoped import harmless; without the warning it is also "
+      "invisible, and nobody learns that a call path reaches cli.py from "
+      "inside a scope")
+
+rc, out_h2 = child(WARNED % {"A": HOME_A, "B": HOME_A})
+check("H2 the control child ran", rc == 0 and field(out_h2, "imported_ok") == "1",
+      f"rc={rc} out={out_h2[-300:]}")
+check("H3 an import with NO foreign scope does not warn (H1 is not vacuous)",
+      WARN_PHRASE not in out_h2,
+      "the warning fires even when the import home IS the process home — it "
+      "carries no information")
+
+# ── CASE FLOOR ───────────────────────────────────────────────────────────
+# A script suite can die halfway and a fail-counting reader calls that a pass
+# (lesson 77).  Floor set from the MEASURED count AFTER the run, and it counts
+# itself (lesson 86c).
+_CASES = 28
+check(f"Z1 case floor: at least {_CASES} cases ran",
+      (len(FAILS) + _RAN[0]) >= _CASES,
+      f"only {len(FAILS) + _RAN[0]} cases observed; the suite aborted early")
 
 
 def test_cli_config_live_resolve() -> None:
