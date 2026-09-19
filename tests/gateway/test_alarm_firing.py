@@ -80,25 +80,31 @@ async def test_busy_session_or_moved_chat_leaves_the_alarm_pending(home):
 
 
 
+
 @pytest.mark.parametrize("reply, forwarded", [("Ash, the deploy is green.", True), ("[SILENT]", False)])
 @pytest.mark.asyncio
 async def test_alarm_reply_in_an_agent_pair_session_reaches_that_agent(home, monkeypatch, reply, forwarded):
     """A stateless (api_server) session has no chat to push into; in ``Peer: <agent>`` the woken
-    turn's words are for that agent, so they are sent there (#52). [SILENT] sends nothing. The wake
-    runs under the profile the alarm was set in, so a served profile's session resumes in its own
-    store."""
+    turn's words are for that agent, so the turn is told so and they are sent there, labelled with
+    who sent them and why (#52). [SILENT] sends nothing. The wake runs under the profile the alarm
+    was set in, so a served profile's session resumes in its own store.
+
+    Found live 2026-09-18: without the notice saying where the reply goes, the woken turn also
+    used tell_partner, and the peer got the same news twice (once unlabelled)."""
     import asyncio
+    import json
 
     import gateway.wake
     from hermes_cli.subcommands import peer
 
+    (home / "identity.json").write_text(json.dumps({"agent": "wren"}), encoding="utf-8")
     db = goals._get_session_db()
     db.create_session("s1", "api_server")
     db.set_session_title("s1", "Peer: ash")
     woken, sent = [], []
 
     async def woken_turn(adapter, *, text, session_id, profile=None, **kw):
-        woken.append((session_id, profile))
+        woken.append((session_id, profile, text))
         return reply
 
     monkeypatch.setattr(gateway.wake, "deliver_wake", woken_turn)
@@ -113,5 +119,11 @@ async def test_alarm_reply_in_an_agent_pair_session_reaches_that_agent(home, mon
     assert await GatewayRunner._alarm_fire_one(runner, alarm) is True
     await asyncio.gather(*runner._alarm_tasks)
 
-    assert woken == [("s1", "house")]
-    assert sent == ([("ash", reply)] if forwarded else [])
+    [(session_id, profile, notice)] = woken
+    assert (session_id, profile) == ("s1", "house")
+    assert "reply is sent to ash" in notice
+    if forwarded:
+        [(target, text)] = sent
+        assert target == "ash" and text.startswith("[from wren") and alarm.alarm_id in text and reply in text
+    else:
+        assert sent == []

@@ -327,7 +327,10 @@ class GatewayPeerCompletionMixin:
         if not exe:
             logger.error("cannot return peer completion: no hermes on PATH")
             return False
-        body = f"[reply from {evt.get('peer') or 'peer'}]\n\n{text}"
+        # The label names who is replying: THIS agent. ``evt["peer"]`` is the agent that asked, and
+        # stating that as the origin tells the receiver it is reading its own words.
+        from hermes_cli.partners import own_agent_name
+        body = f"[reply from {own_agent_name() or 'peer'}]\n\n{text}"
         try:
             proc = await _asyncio.create_subprocess_exec(
                 exe, "peer", "dm", agent, body,

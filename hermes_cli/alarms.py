@@ -266,14 +266,16 @@ def _span(seconds: float) -> str:
     return f"{seconds / 86400:.1f}d".replace(".0d", "d")
 
 
-def wake_notice(alarm: AlarmState, now: Optional[float] = None) -> str:
+def wake_notice(alarm: AlarmState, now: Optional[float] = None, *, reply_goes_to: str = "") -> str:
     """The user-role text that starts the woken turn: marked as the agent's own alarm, never as a
-    message from the partner, with lateness stated when it fires late."""
+    message from the partner, with lateness stated when it fires late. ``reply_goes_to`` names the
+    agent a reply is sent to when that isn't obvious (an agent-pair session)."""
     at = time.time() if now is None else now
     late = at - alarm.due_at
     late_note = (f" · firing {_span(late)} late (nothing could run this session when it came due)"
                  if late > LATE_AFTER_SECONDS else "")
+    goes_to = f"Your reply is sent to {reply_goes_to}. " if reply_goes_to else ""
     return (f"[Alarm {alarm.alarm_id} · you set this {_span(at - alarm.set_at)} ago in this conversation"
             f"{late_note}]\n{alarm.note}\n\n"
-            "(This is your own alarm, not a message from anyone. If there is nothing worth saying, "
-            "reply with exactly [SILENT].)")
+            f"(This is your own alarm, not a message from anyone. {goes_to}If there is nothing worth "
+            "saying, reply with exactly [SILENT].)")

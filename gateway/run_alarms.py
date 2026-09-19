@@ -111,32 +111,45 @@ class GatewayAlarmsMixin:
         from gateway.wake import deliver_wake
         from hermes_cli.alarms import release_alarm, wake_notice
 
+        # A stateless session has no chat to reply into. In an agent-pair session (``Peer: <agent>``)
+        # the reply belongs to that agent, so the woken turn is told so and the reply is sent there.
+        peer = await self._run_in_executor_with_context(_pair_peer, alarm.session_id)
         try:
             # ``profile`` routes a served secondary's session in-process, into its own store.
-            reply = await deliver_wake(adapter, text=wake_notice(alarm), session_id=alarm.session_id,
-                                       profile=profile)
+            reply = await deliver_wake(adapter, text=wake_notice(alarm, reply_goes_to=peer[0] if peer else ""),
+                                       session_id=alarm.session_id, profile=profile)
         except Exception as exc:
             logger.warning("alarm %s self-post failed: %s", alarm.alarm_id, exc)
             with suppress(Exception):
                 await self._run_in_executor_with_context(release_alarm, alarm)
             return
-        # A stateless session has no chat to reply into. In an agent-pair session (``Peer: <agent>``)
-        # the reply belongs to that agent, so send it there; [SILENT] sends nothing.
         from gateway.response_filters import is_intentional_silence_response
-        if reply and not is_intentional_silence_response(reply):
-            await self._run_in_executor_with_context(_forward_to_pair_peer, alarm.session_id, reply)
+        if peer and reply and not is_intentional_silence_response(reply):
+            await self._run_in_executor_with_context(_send_alarm_reply, peer, alarm, reply)
 
 
-def _forward_to_pair_peer(session_id: str, reply: str) -> None:
-    from hermes_cli.partners import PEER_SESSION_TITLE_PREFIX, _session_title
-    from hermes_cli.subcommands.peer import send_to_peer
+def _pair_peer(session_id: str) -> Optional[tuple]:
+    """``(agent name, hermes peer target)`` when ``session_id`` is an agent-pair session, else None.
+    The target comes from the partner directory when the agent is listed there."""
+    from hermes_cli.partners import AGENT, PEER_SESSION_TITLE_PREFIX, _session_title, load_partners
 
     title = _session_title(session_id)
     if not title.startswith(PEER_SESSION_TITLE_PREFIX):
-        return
+        return None
     agent = title[len(PEER_SESSION_TITLE_PREFIX):].strip()
+    target = next((e["peer"] for e in load_partners().values()
+                   if e["kind"] == AGENT and e["peer"].split("/", 1)[0].lower() == agent.lower()), agent)
+    return agent, target
+
+
+def _send_alarm_reply(peer: tuple, alarm: Any, reply: str) -> None:
+    from hermes_cli.partners import own_agent_name
+    from hermes_cli.subcommands.peer import send_to_peer
+
+    agent, target = peer
+    me = own_agent_name() or "your peer"
     try:
-        send_to_peer(agent, reply)
+        send_to_peer(target, f"[from {me} · woken by its own alarm {alarm.alarm_id}]\n\n{reply}")
     except Exception as exc:
-        logger.warning("alarm reply in %s could not reach peer %r: %s (it is in the session's history)",
-                       session_id, agent, exc)
+        logger.warning("alarm %s reply could not reach %s: %s (it is in the session's history)",
+                       alarm.alarm_id, agent, exc)
