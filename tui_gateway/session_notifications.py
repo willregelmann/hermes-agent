@@ -297,6 +297,37 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             mgr.abandon_tick()
 
 
+def _maybe_fire_tui_alarm(sid: str, session: dict) -> None:
+    """Fire a due self-wake alarm set in this TUI/Desktop/dashboard session (hermes_cli/alarms.py).
+
+    Route-less alarms only: one set from a messaging chat belongs to that chat and the gateway fires it
+    (mirrors ``_loop_route_is_gateway_chat``). Claims the idle session first so a racing user prompt
+    wins, then claims the alarm (compare-and-set, so it fires once across processes). A dispatch that
+    never starts a turn releases both, and the alarm stays due."""
+    try:
+        from hermes_cli.alarms import claim_alarm, due_alarms_for_session, release_alarm, wake_notice
+    except Exception:
+        return
+    if not (sid_key := session.get("session_key") or ""):
+        return
+    due = [a for a in due_alarms_for_session(sid_key) if not a.route]
+    if not due or not _notif_claim_turn(session):
+        return
+    if (claimed := claim_alarm(due[0])) is None:
+        _notif_release_turn(session)
+        return
+    started = False
+    try:
+        _emit("status.update", sid, {"kind": "alarm", "text": f"⏰ alarm {claimed.alarm_id} firing…"})
+        started = bool(_run_prompt_submit(f"__alarm__{int(time.time() * 1000)}", sid, session, wake_notice(claimed)))
+    except Exception as exc:
+        _notif_log_failure("alarm dispatch failed", exc)
+    if not started:
+        _notif_release_turn(session)
+        with contextlib.suppress(Exception):
+            release_alarm(claimed)
+
+
 def _kb_first_line(value: Any, limit: int) -> str:
     lines = str(value).strip().splitlines()
     return f"\n{lines[0][:limit]}" if lines else ""
@@ -687,7 +718,8 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
             last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick),
+                               ("alarm", _maybe_fire_tui_alarm)):
                 try:
                     fire(sid, session)
                 except Exception as tick_exc:

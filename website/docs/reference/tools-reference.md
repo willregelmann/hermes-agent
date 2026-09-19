@@ -126,6 +126,12 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 | `ha_list_entities` | List Home Assistant entities. Optionally filter by domain (light, switch, climate, sensor, binary_sensor, cover, fan, etc.) or by area name (living room, kitchen, bedroom, etc.). | — |
 | `ha_list_services` | List available Home Assistant services (actions) for device control. Shows what actions can be performed on each device type and what parameters they accept. Use this to discover how to control devices found via ha_list_entities. | — |
 
+## `alarms` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `alarm` | Set, list or cancel a one-shot alarm that wakes THIS conversation later (`when`: `in 20m`, `in 1h`, `at 17:00`, or an ISO timestamp). When it goes off the agent takes another turn in the same conversation, with its full history, starting from the note. `/new` and `/reset` cancel pending alarms. | — |
+
 ## `peers` toolset
 
 | Tool | Description | Requires environment |

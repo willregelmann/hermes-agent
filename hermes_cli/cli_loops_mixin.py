@@ -598,6 +598,32 @@ class CLILoopsMixin:
             except Exception:
                 pass
 
+    def _maybe_fire_alarm(self) -> None:
+        """Idle hook: fire one due self-wake alarm set in THIS session (hermes_cli/alarms.py).
+
+        Route-less alarms only (a gateway-routed one belongs to the chat it was set in), and only
+        while idle with nothing queued, so a real user message always goes first. The claim is a
+        compare-and-set: another process holding the same session can't fire it twice.
+        """
+        now = time.time()
+        if now - getattr(self, "_last_alarm_check", 0.0) < 2.0:
+            return
+        self._last_alarm_check = now
+        sid = getattr(self, "session_id", None)
+        if not sid or not self._pending_input.empty():
+            return
+        from hermes_cli.alarms import claim_alarm, due_alarms_for_session, wake_notice
+        for alarm in due_alarms_for_session(sid, now):
+            if alarm.route:
+                continue
+            claimed = claim_alarm(alarm, now)
+            if claimed is None:
+                continue
+            from cli import _DIM, _RST, _cprint
+            _cprint(f"  {_DIM}⏰ alarm {claimed.alarm_id} firing…{_RST}")
+            self._pending_input.put(wake_notice(claimed, now))
+            return
+
     def _last_assistant_response_text(self) -> str:
         """Text of the most recent assistant message ("" when none); multimodal parts are flattened."""
         try:

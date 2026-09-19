@@ -39,6 +39,8 @@ _HERMES_CORE_TOOLS = [
     "manage_connections",
     # Service-gated: only when this profile has registered peers (bot_peers).
     "restart_peer_gateway",
+    # Self-wake: one-shot alarms that wake the current session later.
+    "alarm",
 ]
 
 # Webhook payloads are untrusted third-party content: no file/system execution.
@@ -147,6 +149,10 @@ TOOLSETS = {
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
     "homeassistant": _ts("Home Assistant smart home control and monitoring", _HA_TOOLS),
+    "alarms": _ts(
+        "Self-wake: set a one-shot alarm that wakes this conversation later, starting from a note.",
+        ["alarm"],
+    ),
     "peers": _ts(
         "Peer agents on other gateways: ask a registered peer's gateway to restart gracefully. "
         "Only active when bot_peers is configured.",

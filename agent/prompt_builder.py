@@ -252,6 +252,20 @@ PEER_RESTART_GUIDANCE = (
     "gateway that is down can't be asked; tell a person who can reach that machine."
 )
 
+# Fork capability (docs/capabilities/self-wake.md). The failure it fixes is a sentence standing in for
+# an action ("I'll check back in an hour" with nothing arranged), so the prompt says so directly.
+SELF_WAKE_GUIDANCE = (
+    "\n\n## Waking yourself later\n"
+    "You can set an alarm that wakes this same conversation later: alarm(action='set', when='in 1h' | 'in 20m' | "
+    "'at 17:00', note=...). When it goes off you take another turn here, with this conversation's full history, "
+    "starting from your note. Whenever you say you'll check back, follow up or look again later, set an alarm in "
+    "the same turn; saying it without one means it won't happen. Write the note for your future self: what to "
+    "check and what to do with the result. The woken turn is marked as your own alarm, not a message from anyone. "
+    "If there is nothing worth saying then, reply with exactly [SILENT] and nothing is sent. To keep going, set "
+    "another alarm from the woken turn. alarm(action='list') shows pending alarms and alarm(action='cancel', "
+    "alarm_id=...) cancels one; /new or /reset cancels them all."
+)
+
 # The opening sentence is worded deliberately: Anthropic's server-side filter rejected the previous phrasing
 # ("After completing a complex task (5+ tool calls)... save the approach as a skill...") on subscription OAuth
 # credentials, surfacing as a billing-shaped HTTP 400. If you rewrite it, re-verify with a subscription OAuth

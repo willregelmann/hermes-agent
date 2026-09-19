@@ -1566,6 +1566,12 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def compare_and_set_meta(self, key: str, expected: str, value: str) -> bool:
+        """Replace state_meta[key] only if it still holds ``expected``; True when this call won.
+        The claim primitive for rows several processes may act on (self-wake alarms)."""
+        return bool(self._execute_write(lambda conn: conn.execute(
+            "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?", (value, key, expected)).rowcount))
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""

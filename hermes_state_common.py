@@ -163,6 +163,13 @@ _RESET_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RESET_END_REASON
 # never heal one of these (#106459); tools/session_search_tool.py derives its fresh-reset set from it.
 _BOUNDARY_END_REASONS = frozenset(_RESET_END_REASONS) | {"new_session"}
 
+# Self-wake alarms (hermes_cli/alarms.py) live in state_meta under this prefix, keyed
+# ``alarm:<session_id>:<alarm_id>``. An explicit /new or /reset ends the conversation an alarm belonged
+# to, so it cancels that session's pending alarms; every other end (restart, eviction, compression,
+# suspension, switching sessions) leaves them pending.
+ALARM_META_PREFIX = "alarm:"
+ALARM_CANCELLING_END_REASONS = frozenset({"new_session", "session_reset"})
+
 # Accidental end reasons recovery treats as resumable (website/docs/developer-guide/gateway-session-lifecycle.md); single source of truth for
 # recovery SQL and SessionDB.RECOVERABLE_END_REASONS.  superseded_by_resume = sentinel-parked runtime replaced
 # by a fresh session.resume; startup_orphan_reap = dead-gateway sweep, same class as ws_orphan_reap but kept

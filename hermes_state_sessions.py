@@ -15,6 +15,7 @@ from agent.session_activity import (
 )
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_common import (
+    ALARM_CANCELLING_END_REASONS, ALARM_META_PREFIX,
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
     _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
@@ -33,6 +34,17 @@ def workspace_key(row: Dict[str, Any]) -> Optional[str]:
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return _sql_json_extract(col, "$._delegate_from")
+
+
+def _cancel_pending_alarms(conn, session_id: str) -> None:
+    """Cancel ``session_id``'s pending self-wake alarms inside the boundary's own transaction.
+    Rows are kept (status ``cancelled``) so what the agent had arranged stays auditable."""
+    prefix = f"{ALARM_META_PREFIX}{session_id}:"
+    conn.execute(
+        "UPDATE state_meta SET value = json_set(value, '$.status', 'cancelled') "
+        "WHERE substr(key, 1, ?) = ? AND json_valid(value) AND json_extract(value, '$.status') = 'pending'",
+        (len(prefix), prefix),
+    )
 
 
 # _merge_model_config_json's "no such row" result — distinct from the legal None
@@ -460,6 +472,8 @@ class SessionSessionsMixin:
         changed = conn.execute(sql, params).rowcount
         if changed:
             self._bump_conversation_generation(conn, session_id, reason)
+            if reason in ALARM_CANCELLING_END_REASONS:
+                _cancel_pending_alarms(conn, session_id)
         return changed
 
     def reopen_session(self, session_id: str) -> None:
