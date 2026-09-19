@@ -528,6 +528,7 @@ hermes peer dm <peer>[/<agent>] "message"
 hermes peer run <peer>[/<agent>] --idempotency-key <key> "message"
 hermes peer status <peer>[/<agent>] <run_id>
 hermes peer stop <peer>[/<agent>] <run_id>
+hermes peer restart <peer>[/<agent>]
 hermes peer remove <name>
 ```
 
@@ -550,6 +551,7 @@ its `/p/<profile>/` mirror).
 | `run <peer>[/<agent>] [message]` | Start a long canonical Bot Chat turn asynchronously and return its `run_id`, session ID, and idempotency key (`--json` supported). Reuse `--idempotency-key` when retrying the same request. |
 | `status <peer>[/<agent>] <run_id>` | Poll an asynchronous peer run and print its final output when complete (`--json` supported). |
 | `stop <peer>[/<agent>] <run_id>` | Stop the exact asynchronous peer run without targeting another turn (`--json` supported). |
+| `restart <peer>[/<agent>]` | Ask the peer's gateway to restart gracefully over its API server (`POST /api/gateway/restart`, authenticated with the peer's key): its active turns finish, then it restarts under its service manager. No ssh. The whole gateway restarts, including every profile it serves (`--json` supported). Agents use the `restart_peer_gateway` tool for the same thing. |
 | `remove <name>` | Remove a peer from the registry (the `.env` key entry is left in place). |
 
 When at least one peer is registered, the Bot Mode messaging protocol

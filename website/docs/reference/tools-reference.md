@@ -126,6 +126,12 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 | `ha_list_entities` | List Home Assistant entities. Optionally filter by domain (light, switch, climate, sensor, binary_sensor, cover, fan, etc.) or by area name (living room, kitchen, bedroom, etc.). | — |
 | `ha_list_services` | List available Home Assistant services (actions) for device control. Shows what actions can be performed on each device type and what parameters they accept. Use this to discover how to control devices found via ha_list_entities. | — |
 
+## `peers` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `restart_peer_gateway` | Ask a registered peer agent's gateway to restart gracefully: its turns in progress finish first, then it restarts under its service manager. Every agent that gateway serves restarts. Returns once the peer has accepted the request; message the peer afterwards to confirm it came back. Only shown when `bot_peers` is configured. | — |
+
 ## `computer_use` toolset
 
 | Tool | Description | Requires environment |

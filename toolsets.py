@@ -37,6 +37,8 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
+    # Service-gated: only when this profile has registered peers (bot_peers).
+    "restart_peer_gateway",
 ]
 
 # Webhook payloads are untrusted third-party content: no file/system execution.
@@ -145,6 +147,11 @@ TOOLSETS = {
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
     "homeassistant": _ts("Home Assistant smart home control and monitoring", _HA_TOOLS),
+    "peers": _ts(
+        "Peer agents on other gateways: ask a registered peer's gateway to restart gracefully. "
+        "Only active when bot_peers is configured.",
+        ["restart_peer_gateway"],
+    ),
     "kanban": _ts(
         "Kanban multi-agent coordination — only active when the agent is spawned by "
         "the kanban dispatcher (HERMES_KANBAN_TASK env set). The dispatcher runs "

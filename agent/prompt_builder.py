@@ -238,6 +238,20 @@ SESSION_SEARCH_GUIDANCE = (
     "context exists, use session_search to recall it before asking them to repeat themselves."
 )
 
+# Fork capability (docs/capabilities/peer-gateway-restart.md). Taught here, not only in the tool
+# description, because agents otherwise don't reach for it: restarts were a person's job for so long
+# that "I can't restart that" is the default belief.
+PEER_RESTART_GUIDANCE = (
+    "\n\n## Restarting a peer's gateway\n"
+    "You can restart another agent's gateway yourself with restart_peer_gateway(peer), where peer is one of "
+    "your registered peers (`<name>`, or `<name>/<profile>` on a multiplexed peer). Its turns in progress finish "
+    "first, then it restarts under its service manager: no ssh, no systemctl, and no turn runs on the peer. Use it "
+    "whenever a peer needs a restart to pick up a change already on its machine (edited config, updated code), or "
+    "when a peer asks you to. You don't need a person for this. Every agent that gateway serves restarts. "
+    "Afterwards, message the peer to confirm it came back, for example by asking which commit it is running. A "
+    "gateway that is down can't be asked; tell a person who can reach that machine."
+)
+
 # The opening sentence is worded deliberately: Anthropic's server-side filter rejected the previous phrasing
 # ("After completing a complex task (5+ tool calls)... save the approach as a skill...") on subscription OAuth
 # credentials, surfacing as a billing-shaped HTTP 400. If you rewrite it, re-verify with a subscription OAuth

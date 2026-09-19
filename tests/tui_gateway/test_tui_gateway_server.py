@@ -2602,13 +2602,15 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     # _load_enabled_toolsets. Toolsets inside their first release
     # (_RECENTLY_SHIPPED_TOOLSETS) are back-filled onto saved lists that never
     # offered them — allow those too.
-    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
+    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS, _configurable_keys
 
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    # Only a CONFIGURABLE toolset can be a user opt-out; non-configurable native toolsets
+    # (`peers`, platform ones) are recovered onto saved lists by design.
+    assert (set(result) - {"memory", "project"}) & _configurable_keys() <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2629,13 +2631,15 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
+    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS, _configurable_keys
 
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    # Only a CONFIGURABLE toolset can be a user opt-out; non-configurable native toolsets
+    # (`peers`, platform ones) are recovered onto saved lists by design.
+    assert (set(result) - {"memory", "project"}) & _configurable_keys() <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 

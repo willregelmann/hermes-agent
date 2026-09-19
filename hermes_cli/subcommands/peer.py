@@ -485,6 +485,51 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
     return _emit(args, payload, [reply or "(no reply)"])
 
 
+class PeerRestartUnsupported(RuntimeError):
+    """The peer's gateway predates POST /api/gateway/restart."""
+
+
+def request_peer_gateway_restart(target: str) -> dict:
+    """Ask a registered peer's gateway to restart gracefully; return its answer.
+
+    The one transport behind the ``restart_peer_gateway`` tool and ``hermes peer restart``.
+    ``target`` is ``<peer>`` or ``<peer>/<profile>``; a profile-prefixed request still restarts the
+    peer's whole gateway process. Resolves the registry and key under the CURRENT profile, so a
+    multiplexed caller uses its own ``bot_peers`` and ``.env``. Raises ValueError (bad target),
+    LookupError / PermissionError (unknown peer, no key), PeerRestartUnsupported (old peer), and
+    urllib / OS errors for transport failures.
+    """
+    peer_name, profile, peer, key = _resolve_peer_target(target)
+    try:
+        result = _request(f"{_base_url(peer, profile)}/api/gateway/restart", key,
+                          method="POST", body={}, timeout=ACCEPT_TIMEOUT_S)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405):
+            raise PeerRestartUnsupported(
+                f"Peer '{peer_name}' does not support gateway restart (its Hermes predates it); "
+                "someone with access to that machine has to restart it") from exc
+        raise
+    return {"peer": peer_name, "profile": profile, **result}
+
+
+def _peer_restart(args) -> int:
+    try:
+        result = request_peer_gateway_restart(args.target)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except (LookupError, PermissionError, PeerRestartUnsupported) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+        return _peer_failure(args.target, exc)
+    if result.get("already"):
+        line = f"{result['peer']}: a restart is already under way"
+    else:
+        line = f"{result['peer']}: restarting after {result.get('draining', 0)} active turn(s) finish"
+    return _emit(args, result, [line])
+
+
 _REGISTRY_ACTIONS = {
     "add": _peer_add, "set": _peer_add, "remove": _peer_remove, "rm": _peer_remove,
     "list": _peer_list, "ls": _peer_list, None: _peer_list}
@@ -492,6 +537,8 @@ _REGISTRY_ACTIONS = {
 
 def cmd_peer(args) -> int:
     action = getattr(args, "peer_action", None)
+    if action == "restart":
+        return _peer_restart(args)
     if action == "deploy":
         from hermes_cli.subcommands.peer_deploy import deploy
 
@@ -539,6 +586,7 @@ def build_peer_parser(subparsers) -> None:
             "  hermes peer run spark --idempotency-key ticket-123 < long-task.txt\n"
             "  hermes peer status spark run_abc123\n"
             "  hermes peer stop spark run_abc123\n"
+            "  hermes peer restart spark              # graceful restart of the peer's gateway\n"
             "  hermes peer remove spark\n"
             "\n"
             "Exit codes: 0 ok, 1 delivery/peer error, 2 usage error."),
@@ -582,6 +630,12 @@ def build_peer_parser(subparsers) -> None:
     _remote("run", "Start a long peer turn asynchronously and return its run ID", run_id=False)
     _remote("status", "Read the status and final output of an asynchronous peer run", run_id=True)
     _remote("stop", "Stop one asynchronous peer run without affecting another turn", run_id=True)
+
+    rst_p = peer_sub.add_parser(
+        "restart",
+        help="Ask a peer's gateway to restart gracefully (no ssh; its active turns finish first)")
+    rst_p.add_argument("target", help="<peer> or <peer>/<agent>; either way the whole gateway restarts")
+    rst_p.add_argument("--json", action="store_true", default=False, help="Emit a JSON result")
 
     dep_p = peer_sub.add_parser(
         "deploy",
