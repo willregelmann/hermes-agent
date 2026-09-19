@@ -12,6 +12,7 @@ on transient errors) so callers can rewind cursors / retry instead of silently l
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Optional
 
@@ -89,9 +90,11 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
-    """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
-    (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
+                       notification_category: str = "result", profile: Optional[str] = None) -> Optional[str]:
+    """Deliver a wake turn to the session behind ``adapter``. For a non-push adapter the woken
+    turn's reply text is returned, since nothing else delivers it (None for push adapters).
+    ``session_id`` is the RAW session id (``X-Hermes-Session-Id`` / state.db key) — required for
+    non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
@@ -112,7 +115,16 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
+    return await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
+
+
+def _completion_text(raw: bytes) -> Optional[str]:
+    """The assistant text of a ``/v1/chat/completions`` response body, or None."""
+    try:
+        choices = json.loads(raw.decode("utf-8", "replace")).get("choices") or []
+        return str(((choices[0] or {}).get("message") or {}).get("content") or "") or None
+    except Exception:
+        return None
 
 
 def _delegation_display_metadata(evt: dict) -> dict:
@@ -184,9 +196,9 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
-    """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
-    own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
+                                      profile: Optional[str] = None) -> Optional[str]:
+    """POST the wake text to the in-pod API server as a normal session turn and return the reply
+    text, using the adapter's own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
     nobody watches.
 
@@ -203,9 +215,8 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
             raise RuntimeError(
                 f"wake self-post for served profile {profile!r} requires in-process session "
                 "delivery; refusing to self-post as the default profile")
-        await in_process(session_id=session_id, text=text, profile=str(profile),
-                         notification_category=notification_category)
-        return
+        return await in_process(session_id=session_id, text=text, profile=str(profile),
+                                notification_category=notification_category)
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
@@ -244,9 +255,9 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                         raise RuntimeError(
                             f"wake self-post failed for session {session_id}: HTTP {resp.status}: {body}"
                         )
-                    await resp.read()
+                    raw = await resp.read()
                     logger.info("wake self-post delivered for session %s (attempt %d)", session_id, attempt + 1)
-                    return
+                    return _completion_text(raw)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             last_err = exc
             logger.warning("wake self-post transient failure for session %s (attempt %d/%d): %s",

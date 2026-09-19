@@ -67,6 +67,7 @@ Or in-session:
 | `file` | `patch`, `read_file`, `search_files`, `write_file` | File reading, writing, searching, and editing. |
 | `homeassistant` | `ha_call_service`, `ha_get_state`, `ha_list_entities`, `ha_list_services` | Smart home control via Home Assistant. Only available when `HASS_TOKEN` is set. |
 | `alarms` | `alarm` | Self-wake: set, list or cancel a one-shot alarm that wakes the current conversation later, starting from a note the agent writes. Always available in sessions that can be woken (gateway chats, CLI, desktop); refused in cron runs and subagents. |
+| `partners` | `tell_partner` | Hand an intent to a partner (a person or another agent) in their own conversation with this agent, which wakes and acts on it. Only available when `partners` is configured. |
 | `peers` | `restart_peer_gateway` | Ask a registered peer's gateway to restart gracefully (no ssh). Only available when `bot_peers` is configured. |
 | `computer_use` | `computer_use` | Background desktop control via cua-driver — does not steal cursor/focus. Works with any tool-capable model. macOS, Windows, and Linux; requires `cua-driver` on `$PATH`. |
 | `context_engine` | (varies) | Runtime tools exposed by the active context-engine plugin (empty until a plugin populates it). |

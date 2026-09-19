@@ -319,6 +319,13 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        if getattr(event, "_hermes_handoff_id", None):
+            # A tell-partner handoff closes when the turn it woke has finished, not when it was queued.
+            from gateway.partner_handoff import close_after_turn
+            try:
+                await self._run_in_executor_with_context(close_after_turn, event, agent_result)
+            except Exception as exc:
+                logger.debug("handoff close failed: %s", exc)
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(

@@ -77,3 +77,41 @@ async def test_busy_session_or_moved_chat_leaves_the_alarm_pending(home):
     assert await GatewayRunner._alarm_fire_one(_runner(adapter, lane_session="s2"), alarm) is False
     assert adapter.events == []
     assert [a.alarm_id for a in alarms.due_alarms_for_session("s1")] == [alarm.alarm_id]
+
+
+
+@pytest.mark.parametrize("reply, forwarded", [("Ash, the deploy is green.", True), ("[SILENT]", False)])
+@pytest.mark.asyncio
+async def test_alarm_reply_in_an_agent_pair_session_reaches_that_agent(home, monkeypatch, reply, forwarded):
+    """A stateless (api_server) session has no chat to push into; in ``Peer: <agent>`` the woken
+    turn's words are for that agent, so they are sent there (#52). [SILENT] sends nothing. The wake
+    runs under the profile the alarm was set in, so a served profile's session resumes in its own
+    store."""
+    import asyncio
+
+    import gateway.wake
+    from hermes_cli.subcommands import peer
+
+    db = goals._get_session_db()
+    db.create_session("s1", "api_server")
+    db.set_session_title("s1", "Peer: ash")
+    woken, sent = [], []
+
+    async def woken_turn(adapter, *, text, session_id, profile=None, **kw):
+        woken.append((session_id, profile))
+        return reply
+
+    monkeypatch.setattr(gateway.wake, "deliver_wake", woken_turn)
+    monkeypatch.setattr(peer, "send_to_peer", lambda target, text: sent.append((target, text)))
+    runner = object.__new__(GatewayRunner)
+    runner._get_executor = lambda: None
+    runner._adapters_for_profile = lambda profile: {Platform.API_SERVER: SimpleNamespace(supports_async_delivery=False)}
+    alarm = alarms.set_alarm("s1", "in 1h", "tell ash how the deploy went",
+                             route={"platform": "api_server", "profile": "house"})
+    alarm.due_at = time.time() - 1
+
+    assert await GatewayRunner._alarm_fire_one(runner, alarm) is True
+    await asyncio.gather(*runner._alarm_tasks)
+
+    assert woken == [("s1", "house")]
+    assert sent == ([("ash", reply)] if forwarded else [])

@@ -41,6 +41,8 @@ _HERMES_CORE_TOOLS = [
     "restart_peer_gateway",
     # Self-wake: one-shot alarms that wake the current session later.
     "alarm",
+    # Service-gated: only when this profile has a partner directory (partners:).
+    "tell_partner",
 ]
 
 # Webhook payloads are untrusted third-party content: no file/system execution.
@@ -152,6 +154,11 @@ TOOLSETS = {
     "alarms": _ts(
         "Self-wake: set a one-shot alarm that wakes this conversation later, starting from a note.",
         ["alarm"],
+    ),
+    "partners": _ts(
+        "Tell a partner (a person or another agent) something in their own conversation with this "
+        "agent. Only active when partners is configured.",
+        ["tell_partner"],
     ),
     "peers": _ts(
         "Peer agents on other gateways: ask a registered peer's gateway to restart gracefully. "

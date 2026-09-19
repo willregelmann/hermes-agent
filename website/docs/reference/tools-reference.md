@@ -132,6 +132,12 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 |------|-------------|----------------------|
 | `alarm` | Set, list or cancel a one-shot alarm that wakes THIS conversation later (`when`: `in 20m`, `in 1h`, `at 17:00`, or an ISO timestamp). When it goes off the agent takes another turn in the same conversation, with its full history, starting from the note. `/new` and `/reset` cancel pending alarms. | — |
 
+## `partners` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `tell_partner` | Hand an intent to one of this agent's partners (a person or another agent, listed under `partners:` in `config.yaml`) in their own conversation with the agent. A person's live chat session wakes as an internal turn and says it in its own words; another agent gets it in its `Peer: <this agent>` session via `hermes peer`, and its answer comes back as a turn. Every handoff is recorded in `handoffs.jsonl`. Only shown when `partners` is configured. | — |
+
 ## `peers` toolset
 
 | Tool | Description | Requires environment |

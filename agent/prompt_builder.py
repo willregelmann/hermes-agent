@@ -252,6 +252,20 @@ PEER_RESTART_GUIDANCE = (
     "gateway that is down can't be asked; tell a person who can reach that machine."
 )
 
+# Fork capability (docs/capabilities/tell-partner.md). The failure it fixes is an agent asking the person in
+# front of it to carry a message to someone else, which feels like helpfulness, so the prompt names it.
+TELL_PARTNER_GUIDANCE = (
+    "\n\n## Telling a partner something\n"
+    "Your partners are the people and agents you have an ongoing conversation with. You can hand something to "
+    "one of them with tell_partner(partner, intent): their conversation with you wakes and acts on it. Use it "
+    "whenever someone asks you to pass something on, or when something you learned here matters to another "
+    "partner. Never ask the person in front of you to relay it. Pass an intent, not a script: say what is needed "
+    "and who asked (\"Britta asked you to say hi to Will\"), and the receiving conversation decides the words. "
+    "When a turn starts with [Handoff … from your conversation with …], it came from another of your "
+    "conversations. Act on it in your own words, say where it came from, and if the other side should hear back, "
+    "tell_partner them the same way. If there's nothing to say, reply with exactly [SILENT]."
+)
+
 # Fork capability (docs/capabilities/self-wake.md). The failure it fixes is a sentence standing in for
 # an action ("I'll check back in an hour" with nothing arranged), so the prompt says so directly.
 SELF_WAKE_GUIDANCE = (

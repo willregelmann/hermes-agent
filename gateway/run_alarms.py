@@ -7,9 +7,9 @@ alarms) are fired by their own process; the claim is a compare-and-set, so an al
 * Chat platforms: the note is injected as an internal event through the adapter, like a /loop
   tick: one user row (``internal_notification``), queued behind nothing because the session is idle,
   and a bare ``[SILENT]`` reply is not delivered (``gateway/response_filters.py``).
-* Stateless adapters (api_server, e.g. an agent-to-agent Bot Chat): the note is self-posted into the
-  session (``gateway.wake.deliver_wake``). That reply is not delivered anywhere, so the agent
-  messages its peer itself when there is something to say.
+* Stateless adapters (api_server): the note is self-posted into the session
+  (``gateway.wake.deliver_wake``). In an agent-pair session (``Peer: <agent>``) a non-silent reply is
+  sent to that agent (``hermes peer``); elsewhere it stays in the session's history.
 
 An alarm fires only in the session it was set in: if the chat now routes to a different session
 (it was suspended, or rotated without migration), the alarm stays pending until that session is
@@ -73,7 +73,7 @@ class GatewayAlarmsMixin:
             claimed = await self._run_in_executor_with_context(claim_alarm, alarm)
             if claimed is None:
                 return False
-            task = asyncio.create_task(self._alarm_self_post(adapter, claimed))
+            task = asyncio.create_task(self._alarm_self_post(adapter, claimed, profile))
             # asyncio holds only a weak reference to a task; keep it until the turn finishes.
             tasks = self.__dict__.setdefault("_alarm_tasks", set())
             tasks.add(task)
@@ -107,13 +107,36 @@ class GatewayAlarmsMixin:
             raise
         return True
 
-    async def _alarm_self_post(self, adapter: Any, alarm: Any) -> None:
+    async def _alarm_self_post(self, adapter: Any, alarm: Any, profile: Optional[str] = None) -> None:
         from gateway.wake import deliver_wake
         from hermes_cli.alarms import release_alarm, wake_notice
 
         try:
-            await deliver_wake(adapter, text=wake_notice(alarm), session_id=alarm.session_id)
+            # ``profile`` routes a served secondary's session in-process, into its own store.
+            reply = await deliver_wake(adapter, text=wake_notice(alarm), session_id=alarm.session_id,
+                                       profile=profile)
         except Exception as exc:
             logger.warning("alarm %s self-post failed: %s", alarm.alarm_id, exc)
             with suppress(Exception):
                 await self._run_in_executor_with_context(release_alarm, alarm)
+            return
+        # A stateless session has no chat to reply into. In an agent-pair session (``Peer: <agent>``)
+        # the reply belongs to that agent, so send it there; [SILENT] sends nothing.
+        from gateway.response_filters import is_intentional_silence_response
+        if reply and not is_intentional_silence_response(reply):
+            await self._run_in_executor_with_context(_forward_to_pair_peer, alarm.session_id, reply)
+
+
+def _forward_to_pair_peer(session_id: str, reply: str) -> None:
+    from hermes_cli.partners import PEER_SESSION_TITLE_PREFIX, _session_title
+    from hermes_cli.subcommands.peer import send_to_peer
+
+    title = _session_title(session_id)
+    if not title.startswith(PEER_SESSION_TITLE_PREFIX):
+        return
+    agent = title[len(PEER_SESSION_TITLE_PREFIX):].strip()
+    try:
+        send_to_peer(agent, reply)
+    except Exception as exc:
+        logger.warning("alarm reply in %s could not reach peer %r: %s (it is in the session's history)",
+                       session_id, agent, exc)

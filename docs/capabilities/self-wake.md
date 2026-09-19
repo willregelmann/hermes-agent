@@ -48,9 +48,7 @@ ends.
 
 **Partners can be people or other agents.** Self-wake works the same way in a conversation with
 another agent as in one with a person: the woken turn runs in that conversation with its full
-history. There is one difference for now. In an agent conversation, the woken turn's reply isn't
-sent to the other agent automatically, so the agent messages it when there's something to say.
-Tell partner (#52) makes that delivery automatic.
+history, and its reply is sent to the other agent just as it would be to a person.
 
 **It waits its turn.** If the conversation is busy when the alarm goes off, the alarm fires once
 the current turn finishes. A new message from the partner is always handled first.

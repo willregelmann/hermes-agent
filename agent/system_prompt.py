@@ -22,7 +22,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE, PEER_RESTART_GUIDANCE, PLATFORM_HINTS, SELF_WAKE_GUIDANCE,
-    SESSION_SEARCH_GUIDANCE,
+    SESSION_SEARCH_GUIDANCE, TELL_PARTNER_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
@@ -271,6 +271,17 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _tell_partner_guidance() -> str:
+    """TELL_PARTNER_GUIDANCE plus this profile's partner roster. Built once, at session start, like the
+    rest of the system prompt, so a directory edit takes effect in the next session."""
+    try:
+        from hermes_cli.partners import roster_line
+        roster = roster_line()
+    except Exception:
+        roster = ""
+    return f"{TELL_PARTNER_GUIDANCE} {roster}".rstrip()
+
+
 def _tool_guidance_block(agent: Any) -> Optional[str]:
     """Tool-aware behavioral guidance, injected only when the tools are loaded."""
     names = agent.valid_tool_names
@@ -296,6 +307,7 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
         _kanban_guidance,
         PEER_RESTART_GUIDANCE if "restart_peer_gateway" in names else None,
         SELF_WAKE_GUIDANCE if "alarm" in names else None,
+        _tell_partner_guidance() if "tell_partner" in names else None,
     ]
     return " ".join(g for g in tool_guidance if g) or None
 

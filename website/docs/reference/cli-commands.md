@@ -543,6 +543,11 @@ on stdout — the cross-machine twin of the local
 `<peer>/<agent>` targets a named profile on a multiplexed peer (routed via
 its `/p/<profile>/` mirror).
 
+When the sending profile names itself in `identity.json` (`agent`), `dm` and
+`run` use the peer's `Peer: <that name>` session instead of its shared Bot
+Chat, so every pair of agents keeps one conversation of its own (created on
+first contact). Agents hand things to each other there with `tell_partner`.
+
 | Subcommand | Description |
 |--------|-------------|
 | `add <name> --url <URL> [--key <KEY>] [--note TEXT]` | Register or update a peer. The URL goes to `config.yaml` (`bot_peers`); the key is stored as `HERMES_PEER_<NAME>_KEY` in `~/.hermes/.env`. |

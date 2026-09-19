@@ -152,8 +152,10 @@ class HandoffStore:
         to_session: str,
         requesting_user: str,
         intent: str,
+        extra: Optional[dict] = None,
     ) -> Handoff:
-        """Record a new handoff in ``open`` state and return it."""
+        """Record a new handoff in ``open`` state and return it. ``extra`` is free-form provenance
+        (partner, kind, routing key, the ``parent`` handoff that caused this one)."""
         for name, val in (
             ("from_session", from_session),
             ("to_session", to_session),
@@ -177,6 +179,7 @@ class HandoffStore:
             intent=intent,
             status=OPEN,
             author=self.author,
+            extra=dict(extra or {}),
         )
         self._append(h)
         return h

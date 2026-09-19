@@ -148,8 +148,17 @@ def _base_url(peer: dict, profile: str | None) -> str:
     return url
 
 
-def _find_bot_chat(base: str, key: str) -> str | None:
-    """The remote canonical Bot Chat's session id, or None.
+def _peer_chat_title() -> str:
+    """The session THIS agent talks to a peer in: ``Peer: <this agent>`` on the peer, so every agent
+    pair has its own session there (#52). Without an ``identity.json`` name, the peer's shared
+    canonical ``Bot Chat``, as before."""
+    origin = _self_origin() or {}
+    agent = str(origin.get("agent") or "").strip()
+    return f"Peer: {agent}" if agent else BOT_CHAT_TITLE
+
+
+def _find_bot_chat(base: str, key: str, title: str | None = None) -> str | None:
+    """The remote session this agent talks to the peer in (see ``_peer_chat_title``), or None.
 
     Bot Mode always HIDES canonical chats, so the plain listing (which
     excludes hidden sessions) misses an existing Bot Chat and the caller
@@ -159,22 +168,24 @@ def _find_bot_chat(base: str, key: str) -> str | None:
     return the ordinary visible listing, so this single request degrades
     to exactly the previous behavior against them.
     """
-    query = urllib.parse.urlencode({"limit": 200, "title": BOT_CHAT_TITLE, "include_hidden": 1})
+    title = title or _peer_chat_title()
+    query = urllib.parse.urlencode({"limit": 200, "title": title, "include_hidden": 1})
     listing = _request(f"{base}/api/sessions?{query}", key)
     for session in listing.get("data") or []:
-        if isinstance(session, dict) and (session.get("title") or "").strip() == BOT_CHAT_TITLE:
+        if isinstance(session, dict) and (session.get("title") or "").strip() == title:
             return str(session.get("id") or "") or None
     return None
 
 
 def _ensure_bot_chat(base: str, key: str) -> str:
-    existing = _find_bot_chat(base, key)
+    title = _peer_chat_title()
+    existing = _find_bot_chat(base, key, title)
     if existing:
         return existing
     try:
         created = _request(
             f"{base}/api/sessions", key, method="POST",
-            body={"title": BOT_CHAT_TITLE, "source": "bot_peer_dm"})
+            body={"title": title, "source": "bot_peer_dm"})
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
         if exc.code == 400 and "title" in detail.lower():
@@ -182,7 +193,7 @@ def _ensure_bot_chat(base: str, key: str) -> str:
             # canonical Bot Chat exists but is hidden, so we couldn't see it
             # and the create collided with the UNIQUE(title) guard.
             raise RuntimeError(
-                f"Peer already has a '{BOT_CHAT_TITLE}' session but it is hidden and the "
+                f"Peer already has a '{title}' session but it is hidden and the "
                 f"peer's gateway is too old to expose hidden sessions to this lookup "
                 f"(HTTP 400: {detail}). Update the peer's hermes-agent, or unhide the "
                 f"session there: PATCH /api/sessions/<id> {{\"hidden\": false}}.") from exc
@@ -191,7 +202,7 @@ def _ensure_bot_chat(base: str, key: str) -> str:
     session = created.get("session") if isinstance(created.get("session"), dict) else created
     session_id = str(session.get("id") or session.get("session_id") or "")
     if not session_id:
-        raise RuntimeError("Peer did not return a session id for the new Bot Chat")
+        raise RuntimeError(f"Peer did not return a session id for the new '{title}' session")
     return session_id
 
 
@@ -483,6 +494,32 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
                                      f"session_id: {effective_session_id}"])
     payload = {"peer": peer_name, "profile": profile, "session_id": effective_session_id, "reply": reply}
     return _emit(args, payload, [reply or "(no reply)"])
+
+
+def send_to_peer(target: str, text: str) -> dict:
+    """Deliver ``text`` into this agent's session on a peer (``Peer: <this agent>``) without waiting
+    for the peer's turn; the peer's answer comes back through ``reply_to`` as a normal peer message.
+
+    The programmatic core of ``hermes peer dm --no-wait``, used by ``tell_partner`` and by self-wake
+    alarms that fire in an agent-pair session. Returns ``{peer, profile, session_id, accepted,
+    reply}``; ``reply`` is non-empty only when an older peer ran the turn synchronously. Raises like
+    ``request_peer_gateway_restart`` does.
+    """
+    peer_name, profile, peer, key = _resolve_peer_target(target)
+    base = _base_url(peer, profile)
+    session_id = _ensure_bot_chat(base, key)
+    extra: dict = {"wait": False}
+    origin = _self_origin()
+    if origin:
+        extra["reply_to"] = origin
+        extra["from"] = origin.get("agent")
+    result = _request(
+        f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
+        method="POST", body=_turn_body(text, message_key="message", **extra), timeout=ACCEPT_TIMEOUT_S)
+    msg = result.get("message")
+    reply = str(msg.get("content") or "") if isinstance(msg, dict) else ""
+    return {"peer": peer_name, "profile": profile, "session_id": result.get("session_id") or session_id,
+            "accepted": True, "reply": reply}
 
 
 class PeerRestartUnsupported(RuntimeError):
