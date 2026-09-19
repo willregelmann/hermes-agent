@@ -9,6 +9,8 @@ proves the target is not this machine (see test_peer_deploy_target.py). What
 must hold here is that only that verb, unchained and unprefixed, gets through.
 """
 
+import socket
+
 import pytest
 
 from cron.lifecycle_guard import (
@@ -21,6 +23,9 @@ from cron.lifecycle_guard import (
 # the guard to block tooling that merely discusses it.
 R = "rest" + "art"
 GW = "hermes" + "-gateway"
+# This machine. An ssh to ANOTHER host is exempt (PR #24, tests/test_lifecycle_guard_peer_target.py);
+# one that lands back here is still the self-restart the guard exists for.
+SELF = socket.gethostname().split(".", 1)[0]
 
 
 class TestExemptionAccepts:
@@ -84,8 +89,8 @@ class TestGuardStillBlocksEverythingElse:
     @pytest.mark.parametrize("cmd", [
         f"systemctl --user {R} {GW}",
         f"sudo systemctl {R} {GW}",
-        f"ssh will@ha-pi.local 'sudo systemctl {R} {GW}'",
-        f"ssh will@ha-pi.local 'sudo systemd-run --on-active=5 systemctl {R} {GW}'",
+        f"ssh will@{SELF}.local 'sudo systemctl {R} {GW}'",
+        f"ssh will@{SELF}.local 'sudo systemd-run --on-active=5 systemctl {R} {GW}'",
         "hermes gateway stop",
     ])
     def test_free_form_lifecycle_is_still_blocked(self, cmd):
