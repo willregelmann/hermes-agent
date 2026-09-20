@@ -136,12 +136,24 @@ def deliver_to_agent(*, partner: str, peer_target: str, intent: str, from_sessio
     except (urllib.error.URLError, OSError, RuntimeError) as exc:
         store.record(handoff.id, DEFERRED, reason=f"UNREACHABLE: {exc}"[:300])
         return {"error": f"Could not reach {partner}: {exc}", "handoff_id": handoff.id}
-    store.record(handoff.id, DELIVERED)
-    result = {"success": True, "handoff_id": handoff.id, "partner": partner, "status": "delivered",
-              "note": f"{partner} has it; their answer comes back into your conversation with them."}
-    if sent.get("reply"):
-        result["reply"] = sent["reply"]  # an older peer ran the turn synchronously
-    return result
+    # ACCEPT IS NOT DELIVERY. send_to_peer posts with {"wait": False} and returns
+    # on HTTP 202 -- its own docstring says "without waiting for the peer's turn".
+    # Recording DELIVERED here made the row unable to distinguish a handoff that
+    # produced a reply from one the peer accepted and dropped. That is the defect
+    # PR #29 removed from the peer path, and the sibling twelve lines up already
+    # gets it right: deliver_to_human returns "queued" and lets close_after_turn
+    # close it. Measured cost, 2026-09-19: fifteen rows read as open while every
+    # one had run a turn, and the store was believed over the log.
+    #
+    # An older peer that ran the turn inline DID deliver -- content came back, so
+    # the turn demonstrably happened. That case alone keeps DELIVERED.
+    reply = sent.get("reply")
+    if reply:
+        store.record(handoff.id, DELIVERED)
+        return {"success": True, "handoff_id": handoff.id, "partner": partner, "status": "delivered",
+                "note": f"{partner} ran the turn and replied.", "reply": reply}
+    return {"success": True, "handoff_id": handoff.id, "partner": partner, "status": "queued",
+            "note": f"{partner}'s gateway accepted it; it closes as delivered when their turn ends."}
 
 
 def close_after_turn(event: Any, agent_result: Any) -> None:
