@@ -18,20 +18,35 @@ completion rather than real delivery -- reintroduced in the partner path.
 Its own sibling twelve lines up already does the right thing:
 ``deliver_to_human`` returns status "queued" with the note "it closes as
 delivered when that turn ends", and ``close_after_turn`` closes it later from
-``event._hermes_handoff_id``.
+``event._hermes_handoff_id``. (The sibling is the reference for the STATUS
+vocabulary only -- this suite asserts on behaviour here, never on that
+function's source text.)
 
-WHY IT MATTERS, measured 2026-09-19: fifteen inbound handoffs sat at status
-``open`` in handoffs.jsonl while every one of them had in fact run a turn
-(agent.log). Reading the store, I told Will twelve of Ash's replies had never
-been delivered. They all had. The store's status and the real event are not
-connected in EITHER direction -- outbound over-reports, inbound under-reports
--- and both readings were confidently wrong.
+WHY IT MATTERS, measured 2026-09-19 on my own store: outbound and inbound are
+wrong in OPPOSITE directions, and both readings were confidently wrong.
+Outbound over-reports -- at that date all 21 outbound peer rows had reached
+DELIVERED, every close written by the sender, median ~0.1s after open: a close
+that timed an HTTP round trip, not a turn. Inbound under-reports -- 14 rows sat
+at ``open`` while every one of them had demonstrably run a turn (agent.log, and
+the replies exist). Reading the store, I told Will a dozen of Ash's replies had
+never been delivered. They all had. (Counts are as of that date; re-derive
+before quoting them.)
 
 WHAT THIS SUITE PINS, and deliberately not more: the accept path must not
 record a terminal DELIVERED, and must not TELL the caller "delivered", when
 the transport only got an accept. The synchronous case -- an older peer that
 ran the turn inline and returned content -- is genuinely delivered and must
 stay so; that distinction is the whole contract.
+
+WHAT IT DOES NOT FIX, and the note must not claim otherwise: nothing on the
+sending box closes the row afterwards. ``deliver_to_human`` earns its "queued"
+by stamping ``event._hermes_handoff_id`` for ``close_after_turn`` to read back;
+there is no such thread here, because ``send_to_peer``'s extra carries only
+wait/reply_to/from and the id never leaves this box. The peer opens its own row
+under its own id, and the completion watcher closes the RECEIVER's. So after
+this change the outbound row stays open -- which is the honest state, since an
+accepted-and-dropped handoff genuinely is indistinguishable from an accepted
+one until something observes the turn. Closing the loop is a separate change.
 """
 
 from __future__ import annotations
@@ -121,15 +136,6 @@ with tempfile.TemporaryDirectory() as home:
     check("A4 the note does not promise the partner HAS it",
           "has it" not in str(res.get("note", "")).lower(),
           f"note={res.get('note')!r}")
-
-    # --- the honest sibling, as the reference contract ---------------------
-    import inspect
-
-    from gateway import partner_handoff as ph
-    human_src = inspect.getsource(ph.deliver_to_human)
-    check("B1 REFERENCE: the human path still reports 'queued', not delivered",
-          '"queued"' in human_src,
-          "if this fails the sibling changed and this suite's premise is stale")
 
     # --- the synchronous case must NOT be downgraded -----------------------
     res2, rec2 = _run("a real reply body", home)
