@@ -709,7 +709,9 @@ class GatewayModelCommandsMixin:
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
         session_key = self._session_key_for_source(event.source)
-        self._service_tier = self._resolve_session_service_tier(session_key=session_key)
+        # Pass the source: without it the status ignores agent.service_tier_by_platform and
+        # reports the global default in a chat whose platform runs at a different tier.
+        self._service_tier = self._resolve_session_service_tier(source=event.source, session_key=session_key)
         if not model_supports_fast_mode(_resolve_gateway_model(_load_gateway_config())):
             return t("gateway.fast.not_supported")
         if args and args != "status":

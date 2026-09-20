@@ -120,6 +120,10 @@ DEFAULT_CONFIG = {
         # turn), "cold" (first turn of a session only).
         "service_tier": "",
         "fast_auto_seconds": 60,
+        # Per-surface override, keyed by the same platform name as gateway.platforms /
+        # platform_toolsets ("cli" for local). Presence decides, so {"cli": "normal"} keeps the
+        # terminal on standard speed under a global "fast". Gateway turns only.
+        "service_tier_by_platform": {},
         # System-prompt guidance telling the model to call tools instead of describing actions.
         # "auto" = gpt/codex models; true/false = force for all models; or a list of model-name
         # substrings (e.g. ["gpt", "codex", "gemini", "qwen"]).

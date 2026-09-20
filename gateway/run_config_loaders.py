@@ -38,6 +38,15 @@ logger = logging.getLogger("gateway.run")
 
 _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 
+# Configured service-tier spellings -> the tier the agent runs with. Table rather than a
+# branch ladder so the global key and the per-platform map can never drift apart: a value
+# accepted by one is accepted by the other, with the same meaning.
+_SERVICE_TIER_ALIASES: Dict[str, Optional[str]] = {
+    "": None, "normal": None, "default": None, "standard": None, "off": None, "none": None,
+    "fast": "priority", "priority": "priority", "on": "priority",
+    "auto": "auto", "cold": "cold",
+}
+
 
 class GatewayConfigLoadersMixin:
     """Config/env loaders (busy modes, reasoning, service tier, timeouts, fallback) for GatewayRunner."""
@@ -196,15 +205,25 @@ class GatewayConfigLoadersMixin:
         )
 
     def _resolve_session_service_tier(self, source=None, session_key: Optional[str] = None) -> Optional[str]:
-        """Effective service tier: a session-scoped /fast override beats the config default.
+        """Effective service tier: session /fast override, else this platform's tier, else the default.
 
-        The override stores "priority" or None (explicit normal), so presence — not truthiness — decides.
+        The override stores "priority" or None (explicit normal), so presence — not truthiness — decides;
+        ``agent.service_tier_by_platform`` reads the same way, so a platform mapped to ``normal`` stays
+        standard under a global ``fast``. Resolved once per turn, never mid-conversation: a turn that
+        changed speed partway would move ``speed`` under a live prompt cache.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
         if resolved_session_key:
             _t_state = self._peek_session_state(resolved_session_key)
             if _t_state is not None and _t_state.conversation.service_tier_override is not _SERVICE_TIER_UNSET:
                 return _t_state.conversation.service_tier_override
+        platform = getattr(source, "platform", None)
+        if platform is not None:
+            from gateway.run import _platform_config_key
+
+            present, tier = self._load_platform_service_tier(_platform_config_key(platform))
+            if present:
+                return tier
         return self._load_service_tier()
 
     def _set_session_service_tier_override(self, session_key: str, service_tier, clear: bool = False) -> None:
@@ -217,19 +236,42 @@ class GatewayConfigLoadersMixin:
             _SERVICE_TIER_UNSET if clear else service_tier
         )
 
+    @staticmethod
+    def _parse_service_tier(raw: Any) -> tuple[bool, str | None]:
+        """``(recognized, tier)`` for a configured service-tier spelling (see ``_SERVICE_TIER_ALIASES``)."""
+        value = str(raw if raw is not None else "").strip().lower()
+        if value in _SERVICE_TIER_ALIASES:
+            return True, _SERVICE_TIER_ALIASES[value]
+        return False, None
+
     @classmethod
     def _load_service_tier(cls) -> str | None:
         """``agent.service_tier``: fast/priority/on => "priority"; normal/off => None; None when unset/unknown."""
         raw = cls._cfg_str("agent", "service_tier")
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        if value in {"auto", "cold"}:
-            return value
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        recognized, tier = cls._parse_service_tier(raw)
+        if not recognized:
+            logger.warning("Unknown service_tier '%s', ignoring", raw)
+        return tier
+
+    @classmethod
+    def _load_platform_service_tier(cls, platform_key: str) -> tuple[bool, str | None]:
+        """``agent.service_tier_by_platform.<platform_key>`` as ``(present, tier)``.
+
+        Presence decides, so ``{google_chat: fast, cli: normal}`` reads as written under any global
+        default. A typo is warned about and treated as ABSENT rather than silently resolving to
+        standard — a misspelt tier should fall back to the global setting, not quietly change it.
+        """
+        from gateway.run import _load_gateway_config
+
+        mapping = cfg_get(_load_gateway_config(), "agent", "service_tier_by_platform", default={})
+        if not isinstance(mapping, dict) or not platform_key or platform_key not in mapping:
+            return False, None
+        raw = mapping[platform_key]
+        recognized, tier = cls._parse_service_tier(raw)
+        if not recognized:
+            logger.warning("Unknown agent.service_tier_by_platform.%s value %r, ignoring", platform_key, raw)
+            return False, None
+        return True, tier
 
     @staticmethod
     def _load_show_reasoning() -> bool:

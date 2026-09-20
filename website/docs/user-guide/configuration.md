@@ -1845,6 +1845,9 @@ Fast mode asks the provider for faster output at a premium price: OpenAI [Priori
 agent:
   service_tier: ""          # "" / normal | fast | auto | cold
   fast_auto_seconds: 60     # window for auto / cold
+  service_tier_by_platform: # optional, per surface — overrides service_tier
+    google_chat: fast
+    cli: normal
 ```
 
 | Mode | When fast params are sent | Use it for |
@@ -1855,6 +1858,8 @@ agent:
 | `cold` | Same window, but only on the **first turn** of a session (no prior history) | Fast onboarding reply, standard pricing afterwards |
 
 `/fast normal|fast|auto|cold` switches the mode for the session; add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode.
+
+**Per-surface modes (`service_tier_by_platform`)** let one surface run fast while the rest stay standard — the usual case being a chat platform you talk to live, with the terminal, cron jobs and the API server left on standard pricing. Keys are the same platform names used by `gateway.platforms` and `platform_toolsets` (`"cli"` for local), including plugin platforms such as `google_chat`. Resolution order per gateway turn is **session `/fast` override → `service_tier_by_platform[<platform>]` → `service_tier`**. Presence decides rather than truthiness, so mapping a platform to `normal` keeps it standard under a global `fast`; an unrecognized value is logged and ignored, falling back to the global setting rather than silently changing it. Unmapped platforms use `service_tier` as before, and the map applies to gateway turns only — the CLI's own startup reads `agent.service_tier`.
 
 **Cost note:** both providers bill fast requests at a multiplier on standard rates (Anthropic: $10 / $50 per MTok in/out on Opus 4.8 and Opus 5), stacking with prompt-cache pricing. `auto`/`cold` bound that premium to the window only. Fast params are only sent to the first-party endpoint that supports them (`api.openai.com` / Codex subscription, `api.anthropic.com`, `api.x.ai`); OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive them in any mode. Only the per-request parameter changes between requests — the system prompt, tools, and messages stay byte-identical, so the prompt cache survives the window boundary.
 

@@ -174,3 +174,54 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
 
 
+
+
+def _source_for(platform: Platform) -> SessionSource:
+    return SessionSource(platform=platform, chat_id="c-1", chat_type="dm", user_id="user-1")
+
+
+def test_platform_service_tier_beats_global_default_and_presence_decides(monkeypatch):
+    """``agent.service_tier_by_platform`` is read by presence, not truthiness.
+
+    A mapped platform uses its own tier whatever the global default says — including a platform
+    mapped back to ``normal`` under a global ``fast`` — and an unmapped platform still gets the
+    global default. ``google_chat`` is a plugin platform whose enum member is registered at import
+    time, so the config key is its ``Platform`` value exactly as written elsewhere in config.yaml.
+    """
+    Platform("google_chat")  # same dynamic registration the adapter performs
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {
+            "service_tier": "fast",
+            "service_tier_by_platform": {"google_chat": "fast", "cli": "normal", "discord": "nonsense"},
+        }},
+    )
+
+    # Mapped to fast under a global fast: still fast.
+    assert runner._resolve_session_service_tier(source=_source_for(Platform("google_chat"))) == "priority"
+    # Mapped back to normal under a global fast: presence wins over truthiness.
+    assert runner._resolve_session_service_tier(source=_source_for(Platform.LOCAL)) is None
+    # Unmapped: the global default still applies.
+    assert runner._resolve_session_service_tier(source=_source_for(Platform.TELEGRAM)) == "priority"
+    # Unrecognized value falls back to the global default rather than silently forcing normal.
+    assert runner._resolve_session_service_tier(source=_source_for(Platform.DISCORD)) == "priority"
+
+
+def test_session_fast_override_beats_platform_service_tier(monkeypatch):
+    """A session-scoped /fast still wins over the platform map, which still wins over the global."""
+    Platform("google_chat")
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {"service_tier_by_platform": {"google_chat": "fast"}}},
+    )
+    source = _source_for(Platform("google_chat"))
+    session_key = runner._session_key_for_source(source)
+
+    assert runner._resolve_session_service_tier(source=source) == "priority"
+
+    runner._set_session_service_tier_override(session_key, None)  # explicit normal for this session
+    assert runner._resolve_session_service_tier(source=source, session_key=session_key) is None
