@@ -797,7 +797,7 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
 
 # Tasks that may opt into ``auxiliary.<task>.prefer_fast_model``.
-_FAST_MODEL_TASKS: frozenset = frozenset({"title_generation"})
+_FAST_MODEL_TASKS: frozenset = frozenset({"title_generation", "dream"})
 
 
 def _task_prefers_fast_model(task: Optional[str]) -> bool:

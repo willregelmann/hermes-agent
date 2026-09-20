@@ -733,6 +733,9 @@ DEFAULT_CONFIG = {
             "reasoning_effort": "",
             "language": "",
         },
+        # Dreaming: the small model that writes the opening scene and answers every tool call
+        # inside a dream (hermes_cli/dreams.py). A cheap, fast model is the point.
+        "dream": _aux(60, prefer_fast_model=True),
         "memory_query_rewrite": _aux(8, reasoning_effort=False),
         "tts_audio_tags": _aux(30),
         # Kanban: triage_specifier expands a Triage one-liner into a spec (cheap model OK);
