@@ -24,6 +24,7 @@ from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.response_filters import is_machinery_display_kind
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -1915,7 +1916,12 @@ class TurnRunner:
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
-        runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
+        # A self-injected turn (background completion, peer reply, heartbeat) carries the original
+        # source, so the platform alone cannot tell it apart from the human turn it answers.
+        runner._service_tier = runner._resolve_session_service_tier(
+            source=ctx.source, session_key=ctx.session_key,
+            self_injected=is_machinery_display_kind(ctx.persist_user_display_kind),
+        )
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(

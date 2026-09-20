@@ -225,3 +225,32 @@ def test_session_fast_override_beats_platform_service_tier(monkeypatch):
 
     runner._set_session_service_tier_override(session_key, None)  # explicit normal for this session
     assert runner._resolve_session_service_tier(source=source, session_key=session_key) is None
+
+
+def test_self_injected_turn_skips_the_platform_service_tier(monkeypatch):
+    """Machine turns fall through to the global default, whatever the platform is mapped to.
+
+    A background-process completion, a peer reply and a heartbeat all reconstruct the ORIGINAL
+    source — same platform, same chat id — so the platform cannot tell them apart from the human
+    turn they answer. The second assertion ties the resolver's flag to the signal the turn runner
+    actually derives it from, so the two halves cannot drift.
+    """
+    from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
+
+    Platform("google_chat")
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {"service_tier_by_platform": {"google_chat": "fast"}}},
+    )
+    source = _source_for(Platform("google_chat"))
+
+    assert runner._resolve_session_service_tier(source=source) == "priority"
+    assert runner._resolve_session_service_tier(source=source, self_injected=True) is None
+
+    # MessageEvent(internal=True) is what a background-completion wake carries.
+    woken = MessageEvent(text="peer replied", source=source, message_id="m2", internal=True)
+    assert is_machinery_display_kind(display_kind_for_event(woken)) is True
+    human = MessageEvent(text="hi", source=source, message_id="m3")
+    assert is_machinery_display_kind(display_kind_for_event(human)) is False

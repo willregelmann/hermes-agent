@@ -204,13 +204,21 @@ class GatewayConfigLoadersMixin:
             None if reasoning_config is None else dict(reasoning_config)
         )
 
-    def _resolve_session_service_tier(self, source=None, session_key: Optional[str] = None) -> Optional[str]:
+    def _resolve_session_service_tier(
+        self, source=None, session_key: Optional[str] = None, self_injected: bool = False,
+    ) -> Optional[str]:
         """Effective service tier: session /fast override, else this platform's tier, else the default.
 
         The override stores "priority" or None (explicit normal), so presence — not truthiness — decides;
         ``agent.service_tier_by_platform`` reads the same way, so a platform mapped to ``normal`` stays
         standard under a global ``fast``. Resolved once per turn, never mid-conversation: a turn that
         changed speed partway would move ``speed`` under a live prompt cache.
+
+        ``self_injected`` skips the per-platform step. A background-process completion, a peer reply
+        or a heartbeat reconstructs the ORIGINAL source — same platform, same chat id — so a machine
+        turn is otherwise indistinguishable from the human one that started the thread. Nobody is
+        waiting on those, so premium output speed buys nothing; they fall through to the global
+        default. A session ``/fast`` still wins: that one was asked for explicitly.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
         if resolved_session_key:
@@ -218,7 +226,7 @@ class GatewayConfigLoadersMixin:
             if _t_state is not None and _t_state.conversation.service_tier_override is not _SERVICE_TIER_UNSET:
                 return _t_state.conversation.service_tier_override
         platform = getattr(source, "platform", None)
-        if platform is not None:
+        if platform is not None and not self_injected:
             from gateway.run import _platform_config_key
 
             present, tier = self._load_platform_service_tier(_platform_config_key(platform))
