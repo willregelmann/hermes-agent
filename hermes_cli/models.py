@@ -1132,6 +1132,16 @@ def _fast_mode_route_supported(
     return not host or host in allowed.values()
 
 
+# The exact (key, value) pairs resolve_fast_mode_overrides() below can emit. Anything reading a
+# parent agent's request_overrides to decide what a CHILD inherits matches on this mapping, so
+# the two can never drift as providers are added.
+#
+# Pairs, not bare keys: ``service_tier`` is a general OpenAI request field whose other values
+# ("default", "flex", "auto") are ordinary — and "flex" is CHEAPER than standard. Filtering by
+# key name would strip those from every subagent too, which is the opposite of the intent.
+FAST_MODE_REQUEST_OVERRIDES = {"speed": "fast", "service_tier": "priority"}
+
+
 def resolve_fast_mode_overrides(
     model_id: Optional[str], *, provider: Optional[str] = None, base_url: Optional[str] = None
 ) -> dict[str, Any] | None:

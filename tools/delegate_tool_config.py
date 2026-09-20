@@ -245,6 +245,28 @@ def _resolve_child_credential_pool(
             logger.debug("Could not load credential pool for child provider '%s': %s", effective_provider, exc)
     return None
 
+def inherited_request_overrides(parent_agent) -> dict:
+    """The parent's ``request_overrides`` minus the fast-mode params.
+
+    A subagent is background work by construction — nobody is watching its token stream, and a
+    backgrounded child outlives the turn that spawned it — so it must not silently inherit the
+    premium tier from a fast parent turn and bill at it for its whole run. Explicit
+    ``delegation.request_overrides`` still merges OVER this, so a child can be opted in
+    deliberately; that is the supported way to ask for a fast subagent.
+    """
+    from hermes_cli.models import FAST_MODE_REQUEST_OVERRIDES
+
+    parent = getattr(parent_agent, "request_overrides", None)
+    if not isinstance(parent, dict):
+        return {}
+    # Match the value too: only "service_tier": "priority" is fast mode. "default"/"flex"/"auto"
+    # are ordinary OpenAI tiers a parent may carry deliberately, and "flex" is cheaper.
+    return {
+        k: v for k, v in parent.items()
+        if not (k in FAST_MODE_REQUEST_OVERRIDES and v == FAST_MODE_REQUEST_OVERRIDES[k])
+    }
+
+
 def _merge_request_overrides(runtime_overrides, explicit_overrides):
     """Merge explicit ``delegation.request_overrides`` OVER runtime-derived ones. Explicit top-level keys win;
     ``extra_body`` is deep-merged ONE level so provider personality (e.g. ``thinking: {type: disabled}``) survives
@@ -379,7 +401,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
         return _credential_bundle(
             values["model"], None, None, None, None,
-            _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
+            _merge_request_overrides(inherited_request_overrides(parent_agent), explicit_request_overrides),
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
