@@ -299,7 +299,12 @@ jobs:
           # because the account cannot run it: the suite never executed, so
           # a green here would assert coverage that does not exist.
           # Name them explicitly rather than letting them read as success.
-          LARGE_RUNNER_LANES = ('tests', 'tests-os', 'js-tests', 'rust-tests')
+          #
+          # This literal is kept honest by tests/ci/test_large_runner_lane_list.py,
+          # which derives the true list from the sub-workflow YAML and fails
+          # when the two drift. It is a literal because this job has no
+          # actions/checkout step and so cannot read those files at runtime.
+          LARGE_RUNNER_LANES = ('tests', 'tests-os', 'js-tests', 'rust-tests', 'e2e-desktop')
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
