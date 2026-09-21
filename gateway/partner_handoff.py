@@ -40,17 +40,48 @@ def parent_handoff_id(store: Any, session_id: str) -> Optional[str]:
     return pending[-1].id if pending else None
 
 
-def human_notice(handoff_id: str, requester: str, partner: str, intent: str) -> str:
+def _reply_clause(reply_to: str, handoff_id: str) -> str:
+    """How the receiving turn sends an answer back, or "" when no answer was asked for.
+
+    A handoff is one-way: the sender's tool call returns once the intent is accepted, and nothing
+    on the sending side can observe the receiving turn. So a handoff that asks a QUESTION is
+    unanswerable unless the envelope itself says how to answer -- the receiving turn otherwise does
+    exactly as told (act, or [SILENT]) and the asker waits forever.
+
+    Measured 2026-09-21: Wren asked Britta, via tell_partner, whether she wanted her own Google
+    credentials. She answered in her own words and her turn closed. The asking conversation had
+    already promised Will it would report her answer and had no path to it.
+
+    Empty when ``reply_to`` is falsy: ``tell_partner`` falls back to a bare display name when
+    ``partner_for_session`` resolves nothing, and addressing a reply to a name that is not in the
+    partner directory would emit an instruction the receiving turn cannot carry out.
+    """
+    if not reply_to:
+        return ""
+    return (f" This one is a question: when you have the answer, send it back with "
+            f"tell_partner('{reply_to}', ...) quoting handoff {handoff_id[:8]}, because nothing "
+            f"else carries it back.")
+
+
+def human_notice(handoff_id: str, requester: str, partner: str, intent: str,
+                 reply_to: str = "") -> str:
     who = requester or "someone"
     return (f"[Handoff {handoff_id[:8]} · from your conversation with {who}]\n{intent}\n\n"
             f"(This came from another of your conversations, not from {partner}. Act on it in your own "
-            f"words and say where it came from. If there is nothing to tell {partner}, reply with exactly "
-            "[SILENT].)")
+            f"words and say where it came from.{_reply_clause(reply_to, handoff_id)} If there is "
+            f"nothing to tell {partner}, reply with exactly [SILENT].)")
 
 
-def agent_notice(self_agent: str, requester: str, intent: str) -> str:
+def agent_notice(self_agent: str, requester: str, intent: str, handoff_id: str = "",
+                 reply_to: str = "") -> str:
+    """Carries the handoff id so a peer can quote a correlation token it was actually given.
+
+    The human sibling above has always rendered the id; this path did not, so a peer agent could
+    not refer to the handoff it was answering even when it wanted to.
+    """
     where = f"{self_agent}'s conversation with {requester}" if requester else f"{self_agent}"
-    return f"[Handoff from {where}]\n{intent}"
+    stamp = f"[Handoff {handoff_id[:8]} · from {where}]" if handoff_id else f"[Handoff from {where}]"
+    return f"{stamp}\n{intent}{_reply_clause(reply_to, handoff_id)}"
 
 
 def primary_entry(entries: Any, platform: Any, primary: dict, profile: Optional[str]) -> Any:
@@ -74,7 +105,8 @@ def primary_entry(entries: Any, platform: Any, primary: dict, profile: Optional[
 
 
 async def deliver_to_human(runner: Any, *, partner: str, primary: dict, intent: str, from_session: str,
-                           requester: str, profile: Optional[str], home: str) -> dict:
+                           requester: str, profile: Optional[str], home: str,
+                           expect_reply: bool = False) -> dict:
     """Queue the intent into ``partner``'s primary chat session. Returns the tool result dict."""
     from gateway.config import Platform
     from gateway.handoff import DEFERRED
@@ -99,8 +131,9 @@ async def deliver_to_human(runner: Any, *, partner: str, primary: dict, intent: 
         from_session=from_session, to_session=entry.session_id, requesting_user=requester or "unknown",
         intent=intent, extra={"partner": partner, "kind": "human", "to_key": entry.session_key,
                               "parent": parent_handoff_id(store, from_session)})
-    event = runner._synthetic_prompt_event(entry.origin, human_notice(handoff.id, requester, partner, intent),
-                                           internal=True)
+    notice = human_notice(handoff.id, requester, partner, intent,
+                          reply_to=requester if expect_reply else "")
+    event = runner._synthetic_prompt_event(entry.origin, notice, internal=True)
     event._hermes_handoff_id = handoff.id
     event._hermes_handoff_home = home
     try:
@@ -113,7 +146,7 @@ async def deliver_to_human(runner: Any, *, partner: str, primary: dict, intent: 
 
 
 def deliver_to_agent(*, partner: str, peer_target: str, intent: str, from_session: str, requester: str,
-                     self_agent: str, home: str) -> dict:
+                     self_agent: str, home: str, expect_reply: bool = False) -> dict:
     """Send the intent into this agent's session on the partner agent. Returns the tool result dict."""
     import urllib.error
     from gateway.handoff import DEFERRED, DELIVERED
@@ -125,7 +158,9 @@ def deliver_to_agent(*, partner: str, peer_target: str, intent: str, from_sessio
         requesting_user=requester or "unknown", intent=intent,
         extra={"partner": partner, "kind": "agent", "parent": parent_handoff_id(store, from_session)})
     try:
-        sent = send_to_peer(peer_target, agent_notice(self_agent or "another agent", requester, intent))
+        sent = send_to_peer(peer_target, agent_notice(
+            self_agent or "another agent", requester, intent, handoff_id=handoff.id,
+            reply_to=requester if expect_reply else ""))
     except (ValueError, LookupError, PermissionError) as exc:
         store.record(handoff.id, DEFERRED, reason=f"NOT_SENT: {exc}"[:300])
         return {"error": str(exc), "handoff_id": handoff.id}
