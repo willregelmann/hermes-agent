@@ -82,9 +82,16 @@ def test_b1_agent_notice_carries_the_handoff_id():
 
 
 def test_b2_agent_question_names_the_reply_route():
-    out = agent_notice("wren", "will", "Did the cycle land?", handoff_id=HID, reply_to="will")
-    assert "tell_partner" in out
-    assert "will" in out
+    """The reply clause must name the route, and the assertion must read the CLAUSE.
+
+    ``assert "will" in out`` was the original form and it cannot fail: the stamp already says
+    "from wren's conversation with will", so the substring is present whatever the reply target
+    is. Split the clause off and assert on it alone.
+    """
+    out = agent_notice("wren", "will", "Did the cycle land?", handoff_id=HID, reply_to="wren")
+    clause = out.split("This one is a question:", 1)[1]
+    assert "tell_partner('wren'" in clause
+    assert "tell_partner('will'" not in clause
 
 
 def test_b3_agent_statement_carries_the_id_but_asks_for_nothing():
@@ -162,3 +169,73 @@ def test_d2_expect_reply_defaults_off_through_the_handler():
     finally:
         tp.tell_partner = real
     assert seen["expect_reply"] is False
+
+
+# --- E: the CALL SITE, which is where the routing decision actually lives ---------------------
+
+def test_e1_agent_path_addresses_the_reply_to_this_agent_not_the_requester():
+    """The agent path must tell the peer to answer THIS AGENT, never the requester.
+
+    B2 tests the notice builder, which takes ``reply_to`` as a parameter and will faithfully
+    render whatever it is handed. The routing decision is at the CALL SITE, so only an arm that
+    drives ``_deliver_to_agent`` can see it -- which is why the defect survived a suite that was
+    green. Ash found it by rendering the string, not by reading the diff.
+
+    Why the requester is wrong here and right on the human path: a name resolves in the
+    directory of whoever is told to use it. Britta answering 'will' stays inside this agent and
+    lands in the asking conversation. A PEER answering 'will' reaches ITS OWN conversation with
+    Will -- valid, silent, and not the session that asked.
+    """
+    import gateway.partner_handoff as ph
+
+    captured = {}
+
+    def fake_send_to_peer(target, text):
+        captured.update(target=target, text=text)
+        return {"status": "queued"}
+
+    class _Handoff:
+        id = HID
+
+    class _Store:
+        def open_handoff(self, **kw):
+            return _Handoff()
+
+        def record(self, *a, **kw):
+            return None
+
+    import sys
+    import types
+    peer_mod = types.ModuleType("hermes_cli.subcommands.peer")
+    peer_mod.send_to_peer = fake_send_to_peer
+    handoff_mod = types.ModuleType("gateway.handoff")
+    handoff_mod.DEFERRED = "deferred"
+    handoff_mod.DELIVERED = "delivered"
+
+    saved = {k: sys.modules.get(k) for k in ("hermes_cli.subcommands.peer", "gateway.handoff")}
+    sys.modules["hermes_cli.subcommands.peer"] = peer_mod
+    sys.modules["gateway.handoff"] = handoff_mod
+    real_store = ph.handoff_store
+    real_parent = ph.parent_handoff_id
+    ph.handoff_store = lambda home: _Store()
+    ph.parent_handoff_id = lambda store, sess: None
+    try:
+        ph.deliver_to_agent(
+            partner="ash", peer_target="ash", intent="Did the cycle land?",
+            from_session="s1", requester="will", self_agent="wren", home="/tmp",
+            expect_reply=True)
+    finally:
+        ph.handoff_store = real_store
+        ph.parent_handoff_id = real_parent
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    clause = captured["text"].split("This one is a question:", 1)[1]
+    assert "tell_partner('wren'" in clause, (
+        "the peer must be told to answer this agent; got: " + clause)
+    assert "tell_partner('will'" not in clause, (
+        "addressing the requester across an agent boundary reaches the PEER's own conversation "
+        "with that human -- a third conversation that never saw the question")

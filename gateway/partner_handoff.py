@@ -158,9 +158,16 @@ def deliver_to_agent(*, partner: str, peer_target: str, intent: str, from_sessio
         requesting_user=requester or "unknown", intent=intent,
         extra={"partner": partner, "kind": "agent", "parent": parent_handoff_id(store, from_session)})
     try:
+        # THE REPLY TARGET IS THIS AGENT, NOT THE REQUESTER, AND THE TWO PATHS DIFFER.
+        # On the human path the requester's name resolves INSIDE this agent, so replying to
+        # them lands in the asking conversation. Across an agent boundary the same name
+        # resolves in the PEER's directory: a peer told to answer 'will' reaches its own
+        # conversation with Will — a third conversation that never saw the question. The
+        # name is valid there, so the misroute is silent rather than an error. The peer's
+        # route back to the asking session is this agent's own name.
         sent = send_to_peer(peer_target, agent_notice(
             self_agent or "another agent", requester, intent, handoff_id=handoff.id,
-            reply_to=requester if expect_reply else ""))
+            reply_to=(self_agent if expect_reply else "")))
     except (ValueError, LookupError, PermissionError) as exc:
         store.record(handoff.id, DEFERRED, reason=f"NOT_SENT: {exc}"[:300])
         return {"error": str(exc), "handoff_id": handoff.id}
