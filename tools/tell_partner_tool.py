@@ -15,7 +15,7 @@ from tools.registry import registry, tool_error
 HUMAN_DELIVERY_TIMEOUT_S = 60
 
 
-def tell_partner(partner: str, intent: str) -> str:
+def tell_partner(partner: str, intent: str, expect_reply: bool = False) -> str:
     from gateway.session_context import get_session_env
     from hermes_cli.partners import AGENT, load_partners, own_agent_name, partner_for_session
     from hermes_constants import get_hermes_home
@@ -40,15 +40,17 @@ def tell_partner(partner: str, intent: str) -> str:
         from gateway.partner_handoff import deliver_to_agent
         result = deliver_to_agent(partner=name, peer_target=entry["peer"], intent=intent,
                                   from_session=from_session, requester=requester,
-                                  self_agent=own_agent_name(), home=home)
+                                  self_agent=own_agent_name(), home=home, expect_reply=expect_reply)
     else:
-        result = _deliver_to_human(name, entry["primary"], intent, from_session, requester, home)
+        result = _deliver_to_human(name, entry["primary"], intent, from_session, requester, home,
+                                   expect_reply=expect_reply)
     if "error" in result:
         return tool_error(result.pop("error"), **result)
     return json.dumps(result, ensure_ascii=False)
 
 
-def _deliver_to_human(name: str, primary: dict, intent: str, from_session: str, requester: str, home: str) -> dict:
+def _deliver_to_human(name: str, primary: dict, intent: str, from_session: str, requester: str, home: str,
+                      expect_reply: bool = False) -> dict:
     """Run the delivery on the gateway's loop; a person is only reachable through the gateway."""
     from gateway.partner_handoff import deliver_to_human
     from gateway.session_context import get_session_env
@@ -64,7 +66,7 @@ def _deliver_to_human(name: str, primary: dict, intent: str, from_session: str, 
                          f"this conversation isn't one. Reach {name} from one of your chat conversations."}
     coro = deliver_to_human(runner, partner=name, primary=primary, intent=intent, from_session=from_session,
                             requester=requester, profile=get_session_env("HERMES_SESSION_PROFILE") or None,
-                            home=home)
+                            home=home, expect_reply=expect_reply)
     try:
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=HUMAN_DELIVERY_TIMEOUT_S)
     except Exception as exc:
@@ -86,6 +88,16 @@ TELL_PARTNER_SCHEMA = {
                 "type": "string",
                 "description": "What is needed and who asked, e.g. 'Britta asked you to say hi to Will'.",
             },
+            "expect_reply": {
+                "type": "boolean",
+                "description": (
+                    "Set true when you are ASKING something and need the answer back. The handoff "
+                    "is one-way: nothing in this conversation can observe their turn, so without "
+                    "this their answer lands in their conversation and never reaches you. Their "
+                    "notice then tells them to tell_partner the answer back to you. Leave false "
+                    "for statements and requests that need no answer."
+                ),
+            },
         },
         "required": ["partner", "intent"],
     },
@@ -101,5 +113,6 @@ def check_partners_configured() -> bool:
 registry.register(
     name="tell_partner", toolset="partners", schema=TELL_PARTNER_SCHEMA,
     check_fn=check_partners_configured,
-    handler=lambda args, **kw: tell_partner(args.get("partner", ""), args.get("intent", "")),
+    handler=lambda args, **kw: tell_partner(args.get("partner", ""), args.get("intent", ""),
+                                            bool(args.get("expect_reply", False))),
     emoji="📨")
