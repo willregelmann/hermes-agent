@@ -67,21 +67,40 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
+  #
+  # LARGE-RUNNER LANES AND `vars.HAS_LARGE_RUNNERS`
+  # Four lanes request GitHub's large runners (`ubuntu-latest-32-core`,
+  # `ubuntu-latest-96-core`, `windows-latest-32-core`). Those labels are a
+  # paid feature. An account without the entitlement does not FAIL such a
+  # job — it queues it forever, so the lane shows "pending" indefinitely
+  # and is indistinguishable on the status line from a real failure that
+  # has not finished. Measured on this fork: run 7b342c4c had 4 of 24 jobs
+  # queued for 20h; every job on a standard label completed normally.
+  #
+  # Standard GitHub-hosted runners are free and unlimited on PUBLIC repos,
+  # so the rest of CI is unaffected and costs nothing.
+  #
+  # These lanes are therefore gated on a repository variable. Unset (or
+  # anything but 'true') skips them; the jobs report as skipped rather
+  # than hanging. To re-enable after acquiring the entitlement:
+  #     gh variable set HAS_LARGE_RUNNERS --body true
+  # No code change is needed to revert this — it is one variable.
   # ─────────────────────────────────────────────────────────────────────
   tests:
     name: Python tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: needs.detect.outputs.python == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
     uses: ./.github/workflows/tests.yml
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
   # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
   # Same `python` lane gate: if no Python changed, neither runs.
+  # Windows leg needs `windows-latest-32-core`; see HAS_LARGE_RUNNERS above.
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: needs.detect.outputs.python == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -100,7 +119,8 @@ jobs:
   js-tests:
     name: JS & TS checks
     needs: detect
-    if: needs.detect.outputs.frontend == 'true'
+    # Needs `ubuntu-latest-32-core`; see HAS_LARGE_RUNNERS above.
+    if: needs.detect.outputs.frontend == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
     uses: ./.github/workflows/js-tests.yml
 
   installer-tests:
@@ -115,7 +135,8 @@ jobs:
     needs: detect
     # Only for PRs that touch a Rust crate. `.rs` is under apps/, so these
     # changes used to run the TypeScript matrix and nothing that compiles them.
-    if: needs.detect.outputs.rust == 'true'
+    # Needs `ubuntu-latest-32-core`; see HAS_LARGE_RUNNERS above.
+    if: needs.detect.outputs.rust == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
     uses: ./.github/workflows/rust-tests.yml
 
   e2e-desktop:
@@ -272,14 +293,31 @@ jobs:
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
           failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          # Lanes disabled by HAS_LARGE_RUNNERS are SKIPPED, and this gate
+          # treats skipped as passing. That is correct for a lane skipped
+          # because nothing in its area changed, and wrong for one skipped
+          # because the account cannot run it: the suite never executed, so
+          # a green here would assert coverage that does not exist.
+          # Name them explicitly rather than letting them read as success.
+          LARGE_RUNNER_LANES = ('tests', 'tests-os', 'js-tests', 'rust-tests')
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
+              if result == 'skipped' and name in LARGE_RUNNER_LANES:
+                  icon = '⚠️'
               print(f'{icon} {name}: {result}')
+          disabled = [n for n in LARGE_RUNNER_LANES
+                      if needs.get(n, {}).get('result') == 'skipped']
+          if disabled:
+              print(f'::warning::NOT RUN (no large-runner entitlement): {\", \".join(disabled)}. '
+                    'These lanes were skipped, not passed. This run does NOT carry their signal.')
           if failed:
               print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          if disabled:
+              print(f'Checks passed EXCEPT {len(disabled)} lane(s) that could not run.')
+          else:
+              print('All checks passed (or were skipped)')
           "
 
   # ─────────────────────────────────────────────────────────────────────
