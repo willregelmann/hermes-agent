@@ -68,39 +68,42 @@ jobs:
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
   #
-  # LARGE-RUNNER LANES AND `vars.HAS_LARGE_RUNNERS`
-  # Four lanes request GitHub's large runners (`ubuntu-latest-32-core`,
+  # LARGE-RUNNER JOBS AND `vars.HAS_LARGE_RUNNERS`
+  # Some jobs request GitHub's large runners (`ubuntu-latest-32-core`,
   # `ubuntu-latest-96-core`, `windows-latest-32-core`). Those labels are a
   # paid feature. An account without the entitlement does not FAIL such a
-  # job — it queues it forever, so the lane shows "pending" indefinitely
-  # and is indistinguishable on the status line from a real failure that
-  # has not finished. Measured on this fork: run 7b342c4c had 4 of 24 jobs
-  # queued for 20h; every job on a standard label completed normally.
+  # job - it queues it forever, so it shows "pending" indefinitely and is
+  # indistinguishable on the status line from a real run that has not
+  # finished. Measured on this fork: run 7b342c4c had 4 of 24 jobs queued
+  # for 20h; every job on a standard label completed normally.
   #
-  # Standard GitHub-hosted runners are free and unlimited on PUBLIC repos,
-  # so the rest of CI is unaffected and costs nothing.
+  # The gate lives on each JOB (or matrix LEG) that requests a large
+  # runner, in the file that defines it - never on a lane here. A lane can
+  # mix paid and free work: tests-os runs macOS on the free macos-latest
+  # beside a paid Windows leg, and tests.yml runs a free e2e job beside the
+  # paid suite. Gating the lane silently switched that free coverage off.
+  # tests/ci/test_large_runner_lane_list.py enforces both directions.
   #
-  # These lanes are therefore gated on a repository variable. Unset (or
-  # anything but 'true') skips them; the jobs report as skipped rather
-  # than hanging. To re-enable after acquiring the entitlement:
+  # Unset (or anything but 'true') skips those jobs; all-checks-pass then
+  # names them as NOT RUN instead of letting them read as passed.
+  # To re-enable after acquiring the entitlement:
   #     gh variable set HAS_LARGE_RUNNERS --body true
-  # No code change is needed to revert this — it is one variable.
+  # No code change is needed to revert this - it is one variable.
   # ─────────────────────────────────────────────────────────────────────
   tests:
     name: Python tests
     needs: detect
-    if: needs.detect.outputs.python == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
+    if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
   # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
   # Same `python` lane gate: if no Python changed, neither runs.
-  # Windows leg needs `windows-latest-32-core`; see HAS_LARGE_RUNNERS above.
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
+    if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -119,8 +122,7 @@ jobs:
   js-tests:
     name: JS & TS checks
     needs: detect
-    # Needs `ubuntu-latest-32-core`; see HAS_LARGE_RUNNERS above.
-    if: needs.detect.outputs.frontend == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
+    if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
 
   installer-tests:
@@ -135,8 +137,7 @@ jobs:
     needs: detect
     # Only for PRs that touch a Rust crate. `.rs` is under apps/, so these
     # changes used to run the TypeScript matrix and nothing that compiles them.
-    # Needs `ubuntu-latest-32-core`; see HAS_LARGE_RUNNERS above.
-    if: needs.detect.outputs.rust == 'true' && vars.HAS_LARGE_RUNNERS == 'true'
+    if: needs.detect.outputs.rust == 'true'
     uses: ./.github/workflows/rust-tests.yml
 
   e2e-desktop:
@@ -283,9 +284,10 @@ jobs:
         id: evaluate
         env:
           NEEDS: ${{ toJSON(needs) }}
+          HAS_LARGE_RUNNERS: ${{ vars.HAS_LARGE_RUNNERS }}
         run: |
           echo "$NEEDS" | python3 -c "
-          import json, sys
+          import json, os, sys
           needs = json.load(sys.stdin)
           # Emit compact {job_name: result} for the comment assembler.
           compact = {name: info['result'] for name, info in needs.items()}
@@ -293,34 +295,36 @@ jobs:
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
           failed = [name for name, info in needs.items() if info['result'] == 'failure']
-          # Lanes disabled by HAS_LARGE_RUNNERS are SKIPPED, and this gate
-          # treats skipped as passing. That is correct for a lane skipped
-          # because nothing in its area changed, and wrong for one skipped
-          # because the account cannot run it: the suite never executed, so
-          # a green here would assert coverage that does not exist.
-          # Name them explicitly rather than letting them read as success.
-          #
+          # A job skipped for want of a large runner never executed, so a
+          # green here must not imply its coverage. Its caller lane cannot
+          # show that: tests-os reports success once macOS has run, whatever
+          # happened to the Windows leg. So the warning is driven by the
+          # variable itself, and names every large-runner job it disables.
           # This literal is kept honest by tests/ci/test_large_runner_lane_list.py,
-          # which derives the true list from the sub-workflow YAML and fails
-          # when the two drift. It is a literal because this job has no
-          # actions/checkout step and so cannot read those files at runtime.
-          LARGE_RUNNER_LANES = ('tests', 'tests-os', 'js-tests', 'rust-tests', 'e2e-desktop')
+          # which derives the real list from the workflow files and fails when
+          # they drift. It is a literal because this job has no checkout.
+          LARGE_RUNNER_JOBS = (
+              'e2e-desktop.yml:e2e',
+              'js-tests.yml:check',
+              'nix.yml:flake-check',
+              'rust-tests.yml:bootstrap-installer',
+              'tests-os.yml:os-tests[Windows-only tests]',
+              'tests.yml:test',
+          )
+          entitled = os.environ.get('HAS_LARGE_RUNNERS', '') == 'true'
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
-              if result == 'skipped' and name in LARGE_RUNNER_LANES:
-                  icon = '⚠️'
               print(f'{icon} {name}: {result}')
-          disabled = [n for n in LARGE_RUNNER_LANES
-                      if needs.get(n, {}).get('result') == 'skipped']
-          if disabled:
-              print(f'::warning::NOT RUN (no large-runner entitlement): {\", \".join(disabled)}. '
-                    'These lanes were skipped, not passed. This run does NOT carry their signal.')
+          if not entitled:
+              print('::warning::NOT RUN (no large-runner entitlement): '
+                    + ', '.join(LARGE_RUNNER_JOBS)
+                    + '. These jobs were skipped, not passed. This run does NOT carry their signal.')
           if failed:
               print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
               sys.exit(1)
-          if disabled:
-              print(f'Checks passed EXCEPT {len(disabled)} lane(s) that could not run.')
+          if not entitled:
+              print(f'Checks passed EXCEPT {len(LARGE_RUNNER_JOBS)} large-runner job(s) that could not run.')
           else:
               print('All checks passed (or were skipped)')
           "
