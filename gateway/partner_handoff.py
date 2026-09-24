@@ -163,8 +163,15 @@ def deliver_to_agent(*, partner: str, peer_target: str, intent: str, from_sessio
         # them lands in the asking conversation. Across an agent boundary the same name
         # resolves in the PEER's directory: a peer told to answer 'will' reaches its own
         # conversation with Will — a third conversation that never saw the question. The
-        # name is valid there, so the misroute is silent rather than an error. The peer's
-        # route back to the asking session is this agent's own name.
+        # name is valid there, so the misroute is silent rather than an error.
+        #
+        # WHAT THIS DOES *NOT* BUY, because the first version of this comment implied it:
+        # the reply reaches the right AGENT, not the asking SESSION. `send_to_peer`
+        # "deliver[s] text into this agent's session on a peer", so a reply addressed to
+        # `self_agent` lands in the peer's conversation with THIS AGENT — which is where
+        # the question arrived, but is not the session that asked. No name addresses a
+        # session, so `self_agent` is the closest correct target available; the handoff id
+        # is the only thing tying the answer back to the originating conversation.
         sent = send_to_peer(peer_target, agent_notice(
             self_agent or "another agent", requester, intent, handoff_id=handoff.id,
             reply_to=(self_agent if expect_reply else "")))
