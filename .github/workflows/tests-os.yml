@@ -56,13 +56,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: macOS-only tests
-            runner: macos-latest
-            marker: macos_only
-          - name: Windows-only tests
-            runner: windows-latest-32-core
-            marker: windows_only
+        # The Windows leg requests a paid large runner; the macOS leg runs on
+        # the free macos-latest. Gate the LEG, not the job: a job-level `if:`
+        # cannot read `matrix`, and gating the whole job (or its caller in
+        # ci.yaml) would silently drop working macOS coverage too.
+        # Unless HAS_LARGE_RUNNERS is 'true', the matrix is macOS alone.
+        include: ${{ fromJSON(vars.HAS_LARGE_RUNNERS == 'true' && '[{"name":"macOS-only tests","runner":"macos-latest","marker":"macos_only"},{"name":"Windows-only tests","runner":"windows-latest-32-core","marker":"windows_only"}]' || '[{"name":"macOS-only tests","runner":"macos-latest","marker":"macos_only"}]') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
