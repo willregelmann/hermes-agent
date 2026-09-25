@@ -9,10 +9,14 @@ it in its own words, stating where it came from. Partners are people or other ag
 
 import asyncio
 import json
+import re
 
 from tools.registry import registry, tool_error
 
 HUMAN_DELIVERY_TIMEOUT_S = 60
+# The compressor's cut markers, as they end a string: " ...[truncated]", " …[truncated]",
+# "\n...[truncated]...". See agent/context_compressor.py.
+_TRUNCATION_TAIL = re.compile(r"(?:\.\.\.|…)\s*\[truncated\](?:\.\.\.)?\s*$")
 
 
 def tell_partner(partner: str, intent: str, expect_reply: bool = False) -> str:
@@ -25,6 +29,15 @@ def tell_partner(partner: str, intent: str, expect_reply: bool = False) -> str:
     if not name or not intent:
         return tool_error("tell_partner needs a partner (a name from your partner list) and an intent "
                           "(what is needed, in a sentence or two).")
+    # Context compression cuts old tool-call args and appends "...[truncated]". A model that sees
+    # its own earlier tell_partner call in that shape can imitate it and cut a fresh intent the
+    # same way (measured on ha-pi: msg 23836, then three ~200-char intents). Sending one hands the
+    # partner half a message and reports success. Anchored at the END: every compressor site
+    # appends the marker, and an intent that merely mentions it (e.g. reporting this bug) is fine.
+    if _TRUNCATION_TAIL.search(intent):
+        return tool_error("This intent ends in a truncation marker ('...[truncated]'), so it was cut, "
+                          "most likely copied from a compressed earlier call in your history. Nothing "
+                          "was sent. Write the intent out in full and call tell_partner again.")
     partners = load_partners()
     entry = partners.get(name)
     if entry is None:
