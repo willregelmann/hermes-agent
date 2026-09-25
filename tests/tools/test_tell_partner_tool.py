@@ -103,6 +103,22 @@ def test_agent_partner_gets_the_intent_in_its_pair_session(wren):
     assert row.status == DELIVERED and row.from_session == "britta-sess" and row.extra["partner"] == "ash"
 
 
+def test_intent_copied_from_a_compressed_call_is_refused_not_sent(wren):
+    """An agent imitating compressor-truncated history (msg 23836 on ha-pi) wrote intents cut at
+    ~200 chars ending in the compressor's marker. Sending one hands the partner half a message and
+    reports success; it must fail loud, before any handoff opens, and say to write it in full."""
+    home, ash = wren
+    cut = ("Britta asked me to pass on the plan for Saturday: the grocery run moves to the morning "
+           "because the toddler's nap shifted, and she wants you to check whether the Costco list "
+           "from last week still ...[truncated]")
+
+    result = json.loads(tell_partner("ash", cut))
+
+    assert "error" in result and not result.get("success"), result
+    assert "truncated" in result["error"] and "full" in result["error"]
+    assert ash.sessions == {} and ash.chats == []  # nothing reached the partner
+
+
 def test_refusals_say_what_to_do_instead(wren, tmp_path, monkeypatch):
     unknown = json.loads(tell_partner("carol", "hi"))
     assert "ash" in unknown["error"] and "britta" in unknown["error"]
