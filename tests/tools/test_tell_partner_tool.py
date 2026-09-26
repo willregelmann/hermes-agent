@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from gateway.handoff import DELIVERED
+from gateway.handoff import OPEN
 from gateway.partner_handoff import handoff_store
 from gateway.session_context import clear_session_vars, set_session_vars
 from tools.tell_partner_tool import check_partners_configured, tell_partner
@@ -91,7 +91,9 @@ def test_agent_partner_gets_the_intent_in_its_pair_session(wren):
 
     for _ in range(2):  # the second handoff reuses the pair session, it doesn't mint another
         result = json.loads(tell_partner("ash", "Britta wants tomorrow's grocery list"))
-        assert result.get("success") and result["status"] == "delivered", result
+        # Ash's server accepts (202) without running the turn, so this box cannot know the turn
+        # happened: the tool says queued and the row stays open (gateway/partner_handoff.py).
+        assert result.get("success") and result["status"] == "queued", result
 
     assert list(ash.sessions) == ["Peer: wren"]
     assert [path for path, _ in ash.chats] == ["/api/sessions/s1/chat"] * 2
@@ -100,7 +102,33 @@ def test_agent_partner_gets_the_intent_in_its_pair_session(wren):
     assert "Britta wants tomorrow's grocery list" in body["message"]
     assert "britta" in body["message"]  # who asked, resolved from this conversation
     row = handoff_store(str(home)).get(result["handoff_id"])
-    assert row.status == DELIVERED and row.from_session == "britta-sess" and row.extra["partner"] == "ash"
+    assert row.status == OPEN and row.from_session == "britta-sess" and row.extra["partner"] == "ash"
+
+
+def test_intent_copied_from_a_compressed_call_is_refused_not_sent(wren):
+    """An agent imitating compressor-truncated history (msg 23836 on ha-pi) wrote intents cut at
+    ~200 chars ending in the compressor's marker. Sending one hands the partner half a message and
+    reports success; it must fail loud, before any handoff opens, and say to write it in full."""
+    home, ash = wren
+    cut = ("Britta asked me to pass on the plan for Saturday: the grocery run moves to the morning "
+           "because the toddler's nap shifted, and she wants you to check whether the Costco list "
+           "from last week still ...[truncated]")
+
+    result = json.loads(tell_partner("ash", cut))
+
+    assert "error" in result and not result.get("success"), result
+    assert "truncated" in result["error"] and "full" in result["error"]
+    assert ash.sessions == {} and ash.chats == []  # nothing reached the partner
+
+
+def test_intent_that_only_mentions_the_marker_is_sent(wren):
+    """The control for the refusal above: reporting this bug means quoting the marker mid-text
+    (handoff b811d4077ab4 did), and that intent is whole. Only a trailing marker is a cut."""
+    home, ash = wren
+    result = json.loads(tell_partner("ash", "Review the intents cut at ~200 chars that end in "
+                                            "'...[truncated]' and say which fix you'd ship."))
+    assert result.get("success") and result["status"] == "queued", result
+    assert len(ash.chats) == 1
 
 
 def test_refusals_say_what_to_do_instead(wren, tmp_path, monkeypatch):
