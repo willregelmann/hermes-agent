@@ -239,3 +239,158 @@ def test_e1_agent_path_addresses_the_reply_to_this_agent_not_the_requester():
     assert "tell_partner('will'" not in clause, (
         "addressing the requester across an agent boundary reaches the PEER's own conversation "
         "with that human -- a third conversation that never saw the question")
+
+
+# --- F: the plumbing BETWEEN the handler and the call site (mutation audit, wren:i27) ---------
+#
+# D1 fakes ``tell_partner`` whole and E1 calls ``deliver_to_agent`` directly, so nothing drove the
+# three hops in between. Audited 2026-09-26: with expect_reply dropped at any of them
+# (tell_partner -> deliver_to_agent, tell_partner -> _deliver_to_human, _deliver_to_human ->
+# the coroutine) all twelve cases above stayed green -- the inert-caller shape D1's docstring
+# says it guards, one layer further in. Same for the human call site's reply target (R3/R4) and
+# the id inside the reply clause (R6). Each arm below was run against its mutant and failed.
+
+
+def _clause(text):
+    assert "This one is a question:" in text, "no reply clause rendered: " + text
+    return text.split("This one is a question:", 1)[1]
+
+
+def _patch_directory(monkeypatch, kind):
+    import gateway.session_context as sc
+    import hermes_cli.partners as hp
+
+    entry = ({"kind": hp.AGENT, "peer": "ash"} if kind == "agent"
+             else {"kind": hp.HUMAN, "primary": {"platform": "telegram", "chat_id": "c1"}})
+    monkeypatch.setattr(hp, "load_partners", lambda: {"target": entry})
+    monkeypatch.setattr(hp, "partner_for_session", lambda *a, **k: "will")
+    monkeypatch.setattr(hp, "own_agent_name", lambda: "wren")
+    monkeypatch.setattr(sc, "get_session_env", lambda name, default="": "s1" if name == "HERMES_SESSION_ID" else "")
+
+
+def test_f1_tell_partner_forwards_expect_reply_to_the_agent_path(monkeypatch):
+    import gateway.partner_handoff as ph
+    import tools.tell_partner_tool as tp
+
+    _patch_directory(monkeypatch, "agent")
+    seen = []
+    monkeypatch.setattr(ph, "deliver_to_agent", lambda **kw: seen.append(kw["expect_reply"]) or {"success": True})
+    tp.tell_partner("target", "Did the cycle land?", expect_reply=True)
+    tp.tell_partner("target", "Deployed.")
+    assert seen == [True, False], f"tell_partner did not forward expect_reply to deliver_to_agent: {seen}"
+
+
+def test_f2_tell_partner_forwards_expect_reply_to_the_human_path(monkeypatch):
+    import tools.tell_partner_tool as tp
+
+    _patch_directory(monkeypatch, "human")
+    seen = []
+    monkeypatch.setattr(tp, "_deliver_to_human",
+                        lambda *a, expect_reply=False, **k: seen.append(expect_reply) or {"success": True})
+    tp.tell_partner("target", "Do you want this?", expect_reply=True)
+    tp.tell_partner("target", "Said hi.")
+    assert seen == [True, False], f"tell_partner did not forward expect_reply to _deliver_to_human: {seen}"
+
+
+def test_f3_deliver_to_human_wrapper_forwards_expect_reply_to_the_coroutine(monkeypatch):
+    import asyncio
+    import threading
+    import gateway.partner_handoff as ph
+    import gateway.run as gr
+    import gateway.session_context as sc
+    import tools.tell_partner_tool as tp
+
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+    runner = type("R", (), {"_gateway_loop": loop})()
+    seen = []
+
+    async def fake_deliver(runner, **kw):
+        seen.append(kw["expect_reply"])
+        return {"success": True}
+
+    monkeypatch.setattr(gr, "_gateway_runner_ref", lambda: runner, raising=False)
+    monkeypatch.setattr(ph, "deliver_to_human", fake_deliver)
+    monkeypatch.setattr(sc, "get_session_env", lambda name, default="": "")
+    try:
+        tp._deliver_to_human("britta", {}, "Do you want this?", "s1", "will", "/tmp", expect_reply=True)
+        tp._deliver_to_human("britta", {}, "Said hi.", "s1", "will", "/tmp")
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=5)
+        loop.close()
+    assert seen == [True, False], f"_deliver_to_human did not forward expect_reply: {seen}"
+
+
+def _drive_real_deliver_to_human(monkeypatch, expect_reply):
+    """Run the REAL deliver_to_human with every collaborator faked; return the notice it built."""
+    import asyncio
+    import sys
+    import types
+    import gateway.partner_handoff as ph
+    import gateway.wake as gw
+    from gateway.config import Platform
+
+    captured = {}
+
+    class _Handoff:
+        id = HID
+
+    class _Store:
+        def open_handoff(self, **kw):
+            return _Handoff()
+
+        def record(self, *a, **kw):
+            return None
+
+    origin = types.SimpleNamespace(platform=Platform.TELEGRAM, chat_id="c1", thread_id=None,
+                                   user_id=None, profile=None)
+    entry = types.SimpleNamespace(origin=origin, session_id="s-britta", session_key="k", updated_at=1)
+
+    class _Runner:
+        session_store = types.SimpleNamespace(list_sessions=lambda: [entry])
+
+        def _adapters_for_profile(self, profile):
+            return {Platform.TELEGRAM: object()}
+
+        def _synthetic_prompt_event(self, origin, text, internal=False):
+            captured["text"] = text
+            return types.SimpleNamespace()
+
+    async def fake_admit(adapter, event):
+        return None
+
+    handoff_mod = types.ModuleType("gateway.handoff")
+    handoff_mod.DEFERRED, handoff_mod.DELIVERED = "deferred", "delivered"
+    monkeypatch.setitem(sys.modules, "gateway.handoff", handoff_mod)
+    monkeypatch.setattr(gw, "adapter_supports_push", lambda a: True)
+    monkeypatch.setattr(gw, "admit_internal_event", fake_admit)
+    monkeypatch.setattr(ph, "handoff_store", lambda home: _Store())
+    monkeypatch.setattr(ph, "parent_handoff_id", lambda store, sess: None)
+    out = asyncio.run(ph.deliver_to_human(
+        _Runner(), partner="britta", primary={"platform": "telegram", "chat_id": "c1"},
+        intent="Do you want this?", from_session="s-will", requester="will", profile=None,
+        home="/tmp", expect_reply=expect_reply))
+    assert out.get("success"), out
+    return captured["text"]
+
+
+def test_f4_human_call_site_addresses_the_requester_when_a_reply_is_asked(monkeypatch):
+    """On the human path the requester's name resolves inside THIS agent -- the asking
+    conversation. Addressing the partner (britta) would tell her to message herself."""
+    clause = _clause(_drive_real_deliver_to_human(monkeypatch, expect_reply=True))
+    assert "tell_partner('will'" in clause, clause
+    assert "tell_partner('britta'" not in clause, clause
+
+
+def test_f5_human_call_site_asks_for_nothing_on_a_statement(monkeypatch):
+    assert "tell_partner" not in _drive_real_deliver_to_human(monkeypatch, expect_reply=False)
+
+
+def test_f6_the_reply_clause_itself_quotes_the_handoff_id():
+    """A1/B1 find HID[:8] in the STAMP, so they stay green with the id dropped from the clause --
+    the one place the replier is told what to quote."""
+    for out in (human_notice(HID, "will", "britta", "Q?", reply_to="will"),
+                agent_notice("wren", "will", "Q?", handoff_id=HID, reply_to="wren")):
+        assert HID[:8] in _clause(out), out
