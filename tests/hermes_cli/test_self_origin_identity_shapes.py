@@ -43,10 +43,11 @@ def test_parses_but_not_an_object_yields_none_not_an_exception(
     tmp_path, monkeypatch, body
 ):
     """The whole failing class: json.loads succeeds, the result is not a dict."""
-    # Pin the premise: these bodies really do parse, so they are NOT covered by
-    # the open/parse try/except. A body that failed to parse would make this
-    # test vacuous.
-    assert json.loads(body) is not None or body == "null"
+    # Pin BOTH halves of the premise: the body must PARSE (otherwise the
+    # open/parse try/except handles it and the arm proves nothing) AND must
+    # not be an object (a dict body returns None on unfixed code, so it would
+    # pass green while exercising nothing).
+    assert not isinstance(json.loads(body), dict)
 
     _home_with_identity(tmp_path, monkeypatch, body)
     assert _self_origin() is None
