@@ -137,6 +137,20 @@ with tempfile.TemporaryDirectory() as home:
           "has it" not in str(res.get("note", "")).lower(),
           f"note={res.get('note')!r}")
 
+    # A5/A6 pin the two properties the review-fix commit 668604f3f3 stated in
+    # prose and no case held: mutation audit ~/i68-pr56/mutate.py M4 and M6
+    # survived A1-A4 + C1-C2.
+    note = str(res.get("note", "")).lower()
+    check("A5 the note does not promise a close or a delivery that no code performs",
+          "close" not in note and "deliver" not in note,
+          f"note={res.get('note')!r}; nothing on this box observes the peer's "
+          f"turn, so any promised close is a lie the row will never keep")
+
+    check("A6 the accept path leaves the row OPEN -- no terminal write of any kind",
+          rec == [],
+          f"store writes were {rec!r}; DEFERRED or any other terminal status "
+          f"would claim knowledge of the peer's turn this box does not have")
+
     # --- the synchronous case must NOT be downgraded -----------------------
     res2, rec2 = _run("a real reply body", home)
     check("C1 an older peer that ran the turn inline IS delivered",
