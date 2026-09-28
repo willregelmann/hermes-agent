@@ -61,6 +61,14 @@ def _self_origin() -> "dict | None":
     except Exception:
         return None
 
+    # A file that PARSES but is not an object (a JSON list, string, number,
+    # bool or null) reaches here with `data` unusable. The try above guards the
+    # open and the parse only, so without this the .get() below raises
+    # AttributeError out of a function documented to return None instead —
+    # see issue #66, where `own_agent_name()` crashed on identity.json=["ash"].
+    if not isinstance(data, dict):
+        return None
+
     agent = data.get("agent")
     if isinstance(agent, dict):
         agent = agent.get("name")
