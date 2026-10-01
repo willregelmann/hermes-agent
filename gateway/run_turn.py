@@ -2719,7 +2719,7 @@ class GatewayTurnMixin:
         _adapter = self._adapter_for_source(source)
         if _adapter and not scheduled_heartbeat:
             with suppress(Exception):
-                await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
+                await _adapter.typing_if_enabled(source.chat_id, metadata=_thread_metadata)
 
         full_response = ""
         _start = time.time()
@@ -3760,7 +3760,7 @@ class GatewayTurnMixin:
         # Restart the typing indicator; the outer typing task may be stale.
         if _clear_adapter:
             with suppress(Exception):
-                await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
+                await _clear_adapter.typing_if_enabled(source.chat_id, metadata=_status_thread_metadata)
 
         # Re-baseline the cached agent's message_count before recursing, else the coherence guard
         # rebuilds on OUR OWN flushed rows (the outer handler re-baselines only after the chain).

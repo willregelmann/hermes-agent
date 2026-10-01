@@ -2737,6 +2737,13 @@ class BasePlatformAdapter(ABC):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send a typing indicator; ``metadata`` carries platform context (Slack thread_id)."""
 
+    async def typing_if_enabled(self, chat_id: str, metadata=None) -> None:
+        """``send_typing`` unless this platform's ``typing_indicator`` is off. Every caller outside
+        ``_keep_typing`` goes through here: gating only the refresh-loop spawn left the turn-start,
+        retry and post-progress calls posting Google Chat's visible "is thinking…" card anyway."""
+        if getattr(self.config, "typing_indicator", True):
+            await self.send_typing(chat_id, metadata=metadata)
+
     async def stop_typing(self, chat_id: str) -> None:
         """Stop a persistent typing indicator; override where typing runs as a loop."""
 
