@@ -35,8 +35,17 @@ def _identity(home, name):
 
 
 @pytest.fixture()
-def receiver(tmp_path):
-    """The receiving gateway: its own home (identity ``bob``) and state.db on a real socket."""
+def receiver(tmp_path, monkeypatch):
+    """The receiving gateway: its own home (identity ``bob``) and state.db on a real socket.
+
+    ``wait=False`` turns run in the background and post a peer_completion event to the
+    process-global ``process_registry.completion_queue``; a fresh queue keeps that event from
+    leaking into later tests in the same process."""
+    import queue as _queue
+
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(process_registry, "completion_queue", _queue.Queue())
     home = tmp_path / "receiver_home"
     _identity(home, RECEIVER)
     db = SessionDB(home / "state.db")
@@ -49,7 +58,25 @@ def receiver(tmp_path):
         return {"final_response": "ok", "session_id": kwargs.get("session_id")}, {}
 
     adapter._run_agent = fake_run_agent
+
+    # /v1/runs builds its own agent instead of calling _run_agent; capture run_conversation there.
+    from unittest.mock import MagicMock
+
+    def _capturing_agent(*_a, **_k):
+        agent = MagicMock()
+
+        def _run(**kwargs):
+            seen.append({"message": kwargs.get("user_message"), "turn_author": kwargs.get("turn_author")})
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = _run
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        return agent
+
+    monkeypatch.setattr(adapter, "_create_agent", _capturing_agent)
     app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
@@ -111,6 +138,25 @@ def test_peer_dm_carries_sender_bot_author(receiver, sender):
     _assert_sender_bot(receiver.seen[0]["turn_author"])
 
 
+def _wait_seen(receiver):
+    for _ in range(200):
+        if receiver.seen:
+            return
+        threading.Event().wait(0.05)
+    raise AssertionError("the turn never reached the receiver")
+
+
+def test_peer_run_carries_sender_bot_author(receiver, sender):
+    """``hermes peer run`` posts to /v1/runs, a separate handler from session chat."""
+    rc = peer_cmd.cmd_peer(SimpleNamespace(
+        peer_action="run", target="bob", message="long task", idempotency_key="t-1", json=True))
+
+    assert rc == 0
+    _wait_seen(receiver)
+    assert receiver.seen[0]["message"] == "long task"
+    _assert_sender_bot(receiver.seen[0]["turn_author"])
+
+
 def test_send_to_peer_handoff_path_carries_sender_bot_author(receiver, sender):
     # send_to_peer is what tell_partner's deliver_to_agent and alarm-woken peer replies call.
     # wait=False is honoured by the real gateway with a background run; poll for the stubbed turn.
@@ -157,7 +203,8 @@ def test_dispatcher_author_still_wins(receiver, sender, monkeypatch):
 
 def test_human_over_api_server_is_not_labelled_a_bot(receiver):
     """Contrast arm: a person's own client (no author in the body) still arrives authorless,
-    which providers record as the user. Without this, labelling every turn a bot would pass."""
+    which providers record as the user. This diff is client-side and cannot make this arm fail;
+    it pins the server so a later fix that labels authorless turns a bot server-side goes red."""
     import urllib.request
 
     sid = receiver.db.create_session("will-chat", "api_server")
