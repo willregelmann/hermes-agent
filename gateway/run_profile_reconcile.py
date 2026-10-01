@@ -164,9 +164,12 @@ class GatewayProfileReconcileMixin:
         return claimed
 
     async def _after_profiles_added(self, profile_homes) -> None:
-        """Per-profile startup side effects for hot-added profiles: log routing + scoped MCP discovery."""
+        """Per-profile startup side effects for hot-added profiles: signing keypair, log routing +
+        scoped MCP discovery."""
         from gateway.run import _enable_multiplex_log_routing, _profile_runtime_scope
+        from gateway.run_startup import ensure_profile_keypairs
         from contextvars import copy_context
+        ensure_profile_keypairs([Path(home) for _name, home in profile_homes])
         with _log_suppressed(logging.DEBUG, "log routing refresh failed", exc_info=True):
             _enable_multiplex_log_routing(self.config)
         from tools.mcp_oauth import suppress_interactive_oauth
