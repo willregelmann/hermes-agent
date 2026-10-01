@@ -315,6 +315,18 @@ class TestCreateProfile:
         assert not any((profile_dir / "cron").iterdir())
         assert yaml.safe_load((profile_dir / "config.yaml").read_text())["model"] == "test"
 
+    def test_clone_all_does_not_copy_the_signing_keypair(self, profile_env):
+        # A copied private key would let two profiles sign as one identity.
+        from agent.profile_keypair import ensure_keypair, private_key_path
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
+        ensure_keypair(default_home)
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert private_key_path(default_home).exists()
+        assert not private_key_path(profile_dir).exists()
+
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="special files need a POSIX filesystem")
     def test_clone_all_skips_special_files(self, profile_env):
         # A live source profile holds special files copytree cannot copy (e.g. a suffixless

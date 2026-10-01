@@ -37,6 +37,19 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("gateway.run")
 
 
+def ensure_profile_keypairs(homes) -> None:
+    """Give each served profile home a signing keypair (``agent/profile_keypair.py``); existing
+    keys are kept. A home that cannot take one (read-only mount, profile deleted mid-scan) is
+    logged and skipped: nothing consumes the key yet, so it must not cost the gateway its startup."""
+    from agent.profile_keypair import ensure_keypair
+    for home in homes:
+        try:
+            if ensure_keypair(home):
+                logger.info("Generated profile signing keypair under %s", home)
+        except Exception:
+            logger.warning("Could not create profile signing keypair under %s", home, exc_info=True)
+
+
 class GatewayStartupMixin:
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
@@ -967,6 +980,16 @@ class GatewayStartupMixin:
         except Exception:
             logger.log(level, fail_fmt, *fail_args, exc_info=True)
 
+    def _ensure_served_profile_keypairs(self) -> None:
+        """Launch profile plus, under multiplex, every served profile (hot-added ones get theirs in
+        ``run_profile_reconcile.py::_after_profiles_added``)."""
+        from gateway.run import _multiplex_profile_homes
+        from hermes_constants import get_process_hermes_home
+        homes = [get_process_hermes_home()]
+        if getattr(self.config, "multiplex_profiles", False):
+            homes += [Path(home) for _name, home in _multiplex_profile_homes(self.config)]
+        ensure_profile_keypairs(homes)
+
     def _recover_secondary_process_checkpoints(self, process_registry) -> int:
         """Replay every SERVED secondary profile's ``processes.json`` under its own scope.
         The launch profile's file was already read by ``recover_from_checkpoint`` above."""
@@ -1428,6 +1451,7 @@ class GatewayStartupMixin:
         if self._start_check_access_policy():
             return True
         await self._start_recover_previous_run()
+        self._ensure_served_profile_keypairs()
         # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
         # demand-time site (provider resolution, /login, the connector token) is a read that needs the
         # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
