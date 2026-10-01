@@ -397,7 +397,10 @@ class MemoryManager:
         return next((p for p in self._providers if p.name == name), None)
 
     def memory_context_guidance(self) -> str:
-        """The first provider-declared note for recalled context ("" = the default)."""
+        """The external provider's declared note for recalled context ("" = the default).
+
+        "First declared" is in practice "the external provider's": add_provider admits at most
+        one external, and the builtin declares nothing."""
         return next((str(g) for g in (getattr(p, "memory_context_guidance", "")
                                       for p in self._providers) if g), "")
 
