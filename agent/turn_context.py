@@ -235,8 +235,14 @@ def _recall_indicator_enabled(agent: Any) -> bool:
         return True
 
 
+def memory_guidance(agent: Any) -> str:
+    """The active memory provider's note for its recalled context ("" = the default)."""
+    manager = getattr(agent, "_memory_manager", None)
+    return manager.memory_context_guidance() if manager is not None else ""
+
+
 def compose_user_api_content(
-    content: Any, ext_prefetch_cache: str, plugin_user_context: str
+    content: Any, ext_prefetch_cache: str, plugin_user_context: str, guidance: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
@@ -244,7 +250,7 @@ def compose_user_api_content(
     (what turn N sends is what turn N+1 replays). ``None`` when nothing is injected."""
     if not isinstance(content, str):
         return None
-    fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
+    fenced = build_memory_context_block(ext_prefetch_cache, guidance) if ext_prefetch_cache else ""
     injections = [part for part in (fenced, plugin_user_context) if part]
     if not injections:
         return None
@@ -980,7 +986,8 @@ def _stamp_api_content_sidecar(
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
     durable_content, _api_content = durable_user_row_content(
         agent, _turn_user_msg, live_content,
-        compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context),
+        compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context,
+                                 memory_guidance(agent)),
     )
     if _api_content is None or _api_content == durable_content:
         return
@@ -1282,7 +1289,8 @@ def build_api_messages(
             else:
                 # Callers that bypass the prologue stamping: compose live.
                 _composed = compose_user_api_content(
-                    api_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+                    api_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
+                    memory_guidance(agent),
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed

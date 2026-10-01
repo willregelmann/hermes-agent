@@ -104,6 +104,11 @@ class MemoryProvider(ABC):
         """User-facing hint for the "provider unavailable" warning (``initialize()`` never runs then)."""
         return ""
 
+    # How the agent should read this provider's prefetch, as the one sentence that follows
+    # "NOT new user input." in the <memory-context> note. "" keeps the default ("authoritative
+    # reference data"); a provider whose recall carries its own trust labels declares its own.
+    memory_context_guidance: str = ""
+
     def system_prompt_block(self) -> str:
         """STATIC system-prompt text; "" to skip. Recalled context goes through prefetch(), not here."""
         return ""

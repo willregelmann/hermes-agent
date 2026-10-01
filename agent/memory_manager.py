@@ -162,8 +162,9 @@ def inject_memory_provider_tools(agent: Any) -> int:
 
 _FENCE_TAG_RE = re.compile(r'</?\s*memory-context\s*>', re.IGNORECASE)
 _INTERNAL_CONTEXT_RE = re.compile(r'<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>', re.IGNORECASE)
+# Any guidance sentence: the note's tail is provider-declared (``memory_context_guidance``).
 _INTERNAL_NOTE_RE = re.compile(
-    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
+    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.[^\]]*\]\s*',
     re.IGNORECASE,
 )
 
@@ -263,18 +264,32 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._ends_at_block_boundary(text)
 
 
-def build_memory_context_block(raw_context: str) -> str:
-    """Wrap prefetched memory in a fenced block with system note."""
+DEFAULT_MEMORY_CONTEXT_GUIDANCE = (
+    "Treat as authoritative reference data — "
+    "this is the agent's persistent memory and should inform all responses."
+)
+
+
+def build_memory_context_block(raw_context: str, guidance: str = "") -> str:
+    """Wrap prefetched memory in a fenced block with a system note. ``guidance`` is how the
+    provider says its recall should be read (``MemoryProvider.memory_context_guidance``); a
+    provider whose results carry their own trust labels says so here, so one generic note
+    never contradicts them."""
     if not raw_context or not raw_context.strip():
         return ""
     clean = sanitize_context(raw_context)
     if clean != raw_context:
         logger.warning("memory provider returned pre-wrapped context; stripped")
+    note = (guidance or "").strip()
+    if not note or "]" in note or "\n" in note:
+        # "]" would close the note early; a newline would split it. Both break sanitize_context.
+        if note:
+            logger.warning("memory_context_guidance must be one line without ']'; using the default")
+        note = DEFAULT_MEMORY_CONTEXT_GUIDANCE
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        f"NOT new user input. {note}]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
@@ -380,6 +395,11 @@ class MemoryManager:
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         return next((p for p in self._providers if p.name == name), None)
+
+    def memory_context_guidance(self) -> str:
+        """The first provider-declared note for recalled context ("" = the default)."""
+        return next((str(g) for g in (getattr(p, "memory_context_guidance", "")
+                                      for p in self._providers) if g), "")
 
     def build_system_prompt(self) -> str:
         """Join every provider's non-empty ``system_prompt_block()`` with blank lines."""
