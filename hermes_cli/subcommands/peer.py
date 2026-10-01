@@ -369,12 +369,27 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
     return 0
 
 
-def _turn_body(message: str, *, message_key: str, **extra) -> dict:
-    """Request body for one turn. ``author`` is added only when a dispatcher set HERMES_TURN_AUTHOR."""
+def _self_author() -> "dict | None":
+    """This agent as the author of a turn it sends to a peer: ``bot:<host>/<agent>``, a bot.
+
+    Without it the receiver had no author and its memory providers filed the peer's words as the
+    user's (measured on three live Tapestry minds). None when ``identity.json`` declares no agent:
+    an unnamed sender stays unnamed rather than being invented."""
+    from agent.turn_author import bot_author_id, local_origin
+
+    origin = _self_origin()
+    if not origin:
+        return None
+    return {"id": bot_author_id(origin["agent"], local_origin()), "name": origin["agent"], "is_bot": True}
+
+
+def _turn_body(message: str, *, message_key: str, author: "dict | None" = None, **extra) -> dict:
+    """Request body for one turn. A dispatcher's HERMES_TURN_AUTHOR wins (it names the relayed
+    sender more precisely); otherwise ``author``, the sending agent itself."""
     from agent.turn_author import turn_author_from_env
 
     body = {message_key: message, **extra}
-    author = turn_author_from_env()
+    author = turn_author_from_env() or author
     if author is not None:
         body["author"] = author
     return body
@@ -395,7 +410,7 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
         session_id = _ensure_bot_chat(base, key)
         result = _request(
             f"{base}/v1/runs", key, method="POST",
-            body=_turn_body(message, message_key="input", session_id=session_id),
+            body=_turn_body(message, message_key="input", author=_self_author(), session_id=session_id),
             headers={"Idempotency-Key": idempotency_key})
     except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
         return _peer_failure(peer_name, exc)
@@ -448,7 +463,8 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
     try:
         result = _request(
             f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
-            method="POST", body=_turn_body(message, message_key="message", **extra), timeout=timeout)
+            method="POST", body=_turn_body(message, message_key="message", author=_self_author(), **extra),
+            timeout=timeout)
     except urllib.error.HTTPError as exc:
         _peer_failure(peer_name, exc)
         print(f"session_id: {session_id}", file=sys.stderr)
@@ -523,7 +539,8 @@ def send_to_peer(target: str, text: str) -> dict:
         extra["from"] = origin.get("agent")
     result = _request(
         f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
-        method="POST", body=_turn_body(text, message_key="message", **extra), timeout=ACCEPT_TIMEOUT_S)
+        method="POST", body=_turn_body(text, message_key="message", author=_self_author(), **extra),
+        timeout=ACCEPT_TIMEOUT_S)
     msg = result.get("message")
     reply = str(msg.get("content") or "") if isinstance(msg, dict) else ""
     return {"peer": peer_name, "profile": profile, "session_id": result.get("session_id") or session_id,
