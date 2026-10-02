@@ -387,6 +387,39 @@ class GatewayPeerCompletionMixin:
                 sender, declared_host, agent, known_host, route,
             )
             return False
+
+        if not declared_host:
+            # OUTCOME 3b: WITHHOLDING, which is not the same as CONTRADICTING.
+            # Wren's finding (handoff 3a37322d). The box knows what this peer's
+            # host should be, and the sender declined to say — so the `and` in
+            # the 3a test above short-circuits and, before this arm existed,
+            # fell straight through to `return True`: delivered, SILENTLY, with
+            # no log at any level. That made an ABSENT attacker-controlled
+            # field quieter than outcome 4, where the box knows nothing at all
+            # and still warns. Exactly inverted: the more this box knows, the
+            # less it said.
+            #
+            # Refusing rather than warning, because the two cases are different
+            # propositions. Outcome 4 delivers because the box has nothing to
+            # check against; here it HAS the knowledge and the sender withheld
+            # the one field the check needs. A fail-closed predicate cannot
+            # treat "declined to answer" as "nothing to verify".
+            #
+            # NOT unreachable, and Wren's own premise for calling this
+            # non-blocking does not hold — I read `_self_origin()` rather than
+            # taking it: peer.py:86-88 builds `{"agent": ...}` and adds "host"
+            # ONLY `if host`, where host falls back to socket.gethostname().
+            # With no host in identity.json AND gethostname() raising or
+            # returning "", a LEGITIMATE sender emits agent-without-host.
+            # Measured on both arms. Rare, but not hand-crafted-only.
+            logger.error(
+                "peer completion from %r declared NO host but this box knows "
+                "%r as %r (route: %s) — refusing; dropping (handoff stays "
+                "open). Withholding the field is not the same as this box "
+                "having no record of it",
+                sender, agent, known_host, route,
+            )
+            return False
         return True
 
     def _own_agent_name(self) -> str:

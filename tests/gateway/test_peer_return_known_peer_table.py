@@ -420,5 +420,76 @@ def test_identity_host_for_a_peer_absent_from_bot_peers_refuses_at_outcome_1(
     assert "but this box knows" not in blob
 
 
+def test_declared_host_withheld_while_known_is_refused_distinctly(
+    tmp_path, monkeypatch, caplog
+):
+    """Wren's defect, handoff 3a37322d: WITHHOLDING is not CONTRADICTING.
+
+    Before outcome 3b existed, `if declared_host and declared_host != known`
+    short-circuited on an omitted/blank host and fell through to `return
+    True` — delivered with NO log at any level. That made an absent
+    attacker-controlled field strictly QUIETER than outcome 4, where the box
+    knows nothing and still warns.
+
+    Three shapes of "declined to say" (omitted key, empty string,
+    whitespace) must all refuse, and the message must be distinguishable
+    from 3a so a reader can tell a spoof from a withheld field.
+    """
+    import logging
+
+    for label, reply_to in (
+        ("omitted", {"agent": "wren"}),
+        ("empty", {"agent": "wren", "host": ""}),
+        ("whitespace", {"agent": "wren", "host": "   "}),
+    ):
+        r = _runner(
+            tmp_path,
+            monkeypatch,
+            bot_peers={"wren": {"url": "http://ha-pi.local:8642"}},
+            identity={"peers": {"wren": {"host": "ha-pi.local"}}},
+            self_agent="ash",
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert r._reply_to_is_trustworthy(
+                reply_to, {"peer": "wren"}
+            ) is False, label
+        blob = " ".join(rec.getMessage() for rec in caplog.records)
+        # Refused, and LOUDLY — the silent-delivery path is what this closes.
+        assert "declared NO host" in blob, label
+        assert "ha-pi.local" in blob, label
+        # Distinct from 3a, whose message quotes the contradicting value.
+        assert "declared host" not in blob.replace("declared NO host", ""), label
+
+
+def test_withholding_refuses_only_when_a_host_is_actually_recorded(
+    tmp_path, monkeypatch, caplog
+):
+    """The 3b arm must not swallow outcome 4.
+
+    A peer this box records NO host for still delivers on a missing host
+    field — the box has nothing to compare against, which is a different
+    proposition from withholding. Without this, 3b would re-refuse the very
+    population the per-peer rule exists to deliver: all 118 real refusals
+    declared ash/refsdal/pair, none of which has a recorded host here.
+    """
+    import logging
+
+    r = _runner(
+        tmp_path,
+        monkeypatch,
+        bot_peers={"refsdal": {"url": "http://127.0.0.1:8644"}},
+        identity={"peers": {"wren": {"host": "ha-pi.local"}}},
+        self_agent="ash",
+    )
+    with caplog.at_level(logging.WARNING):
+        assert r._reply_to_is_trustworthy(
+            {"agent": "refsdal"}, {"peer": "refsdal"}
+        ) is True
+    blob = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "records no identity host" in blob
+    assert "declared NO host" not in blob
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
