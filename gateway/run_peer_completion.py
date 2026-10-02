@@ -357,9 +357,24 @@ class GatewayPeerCompletionMixin:
             try:
                 if proc is not None:
                     proc.kill()
-                    # Reap it. Without the wait the child becomes a zombie held by
-                    # this process and the kill is only half done.
-                    await proc.wait()
+                    # Reap it, BUT WITH A BOUND. asyncio's Process.wait() returns
+                    # when the process has exited AND its pipes have closed, so a
+                    # grandchild that inherited our stdout keeps it open and an
+                    # unbounded wait() hangs forever on a child that is already
+                    # dead. Measured: identical child, `sh -c "dd ...; sleep 60"`
+                    # never reaps (grandchild holds the pipe) while
+                    # `sh -c "dd ...; exec sleep 60"` reaps in 0.001s. `hermes
+                    # peer dm` is free to spawn helpers, so this is reachable.
+                    # The SIGKILL is what guarantees no further delivery; the
+                    # reap only avoids a zombie, so giving up on it after 5s is
+                    # strictly better than hanging the gateway's return leg.
+                    await _asyncio.wait_for(proc.wait(), timeout=5)
+            except _asyncio.TimeoutError:
+                logger.warning(
+                    "killed the dm child for %s but it did not reap within 5s "
+                    "(a grandchild is probably holding its stdout); continuing",
+                    agent,
+                )
             except ProcessLookupError:
                 pass  # already exited between the timeout and the kill
             except Exception:

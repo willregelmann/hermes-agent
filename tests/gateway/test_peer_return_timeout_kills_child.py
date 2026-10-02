@@ -129,6 +129,86 @@ def test_timeout_does_not_orphan_the_child(slow_child, monkeypatch):
     )
 
 
+def test_reap_is_bounded_when_a_grandchild_holds_stdout(tmp_path, monkeypatch):
+    """The reap must not hang on a dead child whose pipe is still open.
+
+    Wren's review of this PR (handoff 3e8151e3) asked whether the unbounded
+    ``await proc.wait()`` could deadlock, citing the subprocess docs' warning
+    about a full pipe buffer. Her measurement said no. Mine said yes, and the
+    disagreement was real: her fixture left no survivor holding the pipe.
+
+    asyncio's ``Process.wait()`` completes when the process has exited AND its
+    pipes have closed. A grandchild that inherited stdout keeps it open, so
+    ``wait()`` never returns even though ``os.kill(pid, 0)`` says the child is
+    gone. Measured on the same child shape:
+
+        sh -c "dd ...; sleep 60"        -> never reaps (grandchild holds pipe)
+        sh -c "dd ...; exec sleep 60"   -> reaps in 0.001s
+
+    ``hermes peer dm`` is a CLI that may spawn helpers, so this is reachable in
+    production. Without a bound the gateway's return leg hangs forever on a
+    child it has already killed — strictly worse than the duplicate delivery
+    this PR exists to prevent.
+
+    The whole call is bounded here, so an unbounded regression fails this test
+    by timing out rather than hanging the suite.
+    """
+    marker = tmp_path / "never"
+    script = tmp_path / "grandchild-hermes"
+    # 500KB past the pipe buffer, then a GRANDCHILD inheriting stdout.
+    script.write_text(
+        "#!/bin/sh\n"
+        "dd if=/dev/zero bs=1024 count=500 2>/dev/null\n"
+        "sleep 60\n"
+        f"echo delivered > {marker}\n"
+    )
+    script.chmod(0o755)
+
+    monkeypatch.setattr(shutil, "which", lambda _n: str(script))
+    monkeypatch.setattr(
+        "hermes_cli.partners.own_agent_name", lambda: "ash", raising=False
+    )
+
+    real_wait_for = asyncio.wait_for
+    created = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _short(aw, timeout=None):
+        # Shorten ONLY the 120s communicate() wait. The reap's own bound is the
+        # thing under test and must come from production, not from here.
+        return await real_wait_for(aw, timeout=1.0 if timeout == 120 else timeout)
+
+    async def _spy(*a, **kw):
+        p = await real_exec(*a, **kw)
+        created.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "wait_for", _short)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spy)
+
+    runner = _Runner()
+
+    async def _bounded():
+        return await real_wait_for(
+            runner._return_peer_completion(
+                {"agent": "wren"}, "a reply body", {"peer": "wren"}
+            ),
+            timeout=20.0,
+        )
+
+    started = time.time()
+    ok = asyncio.run(_bounded())
+    elapsed = time.time() - started
+
+    assert created, "fixture did not spawn a child; the test is measuring nothing"
+    assert ok is False
+    assert elapsed < 15, (
+        f"the return leg took {elapsed:.1f}s: the reap is unbounded and hung on "
+        "a dead child whose grandchild still holds stdout"
+    )
+    assert not _pid_alive(created[0].pid)
+
+
 def test_orphan_delivers_after_the_gateway_gave_up(slow_child, monkeypatch):
     """THE CONSEQUENCE, measured end to end rather than argued.
 
