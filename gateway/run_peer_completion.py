@@ -331,6 +331,7 @@ class GatewayPeerCompletionMixin:
         # stating that as the origin tells the receiver it is reading its own words.
         from hermes_cli.partners import own_agent_name
         body = f"[reply from {own_agent_name() or 'peer'}]\n\n{text}"
+        proc = None
         try:
             proc = await _asyncio.create_subprocess_exec(
                 exe, "peer", "dm", agent, body,
@@ -338,6 +339,32 @@ class GatewayPeerCompletionMixin:
                 stderr=_asyncio.subprocess.PIPE,
             )
             _out, err = await _asyncio.wait_for(proc.communicate(), timeout=120)
+        except _asyncio.TimeoutError:
+            # wait_for cancels the AWAIT, not the PROCESS. Without this the child
+            # survives, finishes its delivery, and the peer gets the reply TWICE:
+            # once from the orphan and once from the requeued attempt below, with
+            # nothing recording the first. A drop would at least be consistent.
+            #
+            # This NARROWS the window, it does not close it: a child killed after
+            # the far side accepted the DM but before the ack was read has still
+            # delivered. Telling "accepted, ack lost" from "never arrived" needs an
+            # idempotency key on the reply, which this does not add.
+            logger.error(
+                "returning peer completion to %s timed out after 120s; "
+                "killing the dm child to stop a duplicate delivery",
+                agent,
+            )
+            try:
+                if proc is not None:
+                    proc.kill()
+                    # Reap it. Without the wait the child becomes a zombie held by
+                    # this process and the kill is only half done.
+                    await proc.wait()
+            except ProcessLookupError:
+                pass  # already exited between the timeout and the kill
+            except Exception:
+                logger.exception("could not kill the dm child for %s", agent)
+            return False
         except Exception:
             logger.exception("returning peer completion to %s raised", agent)
             return False
