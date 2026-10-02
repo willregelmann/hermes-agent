@@ -380,5 +380,45 @@ def test_divergence_between_tables_is_logged_at_error(tmp_path, monkeypatch, cap
     assert "127.0.0.1" in blob
 
 
+def test_identity_host_for_a_peer_absent_from_bot_peers_refuses_at_outcome_1(
+    tmp_path, monkeypatch, caplog
+):
+    """Wren's review target (a), handoff 497206e0: order in code, not prose.
+
+    bot_peers is the known-peer AUTHORITY. So a peer that identity.json
+    records a host for, but which bot_peers does not list at all, must be
+    refused as an unknown peer BEFORE the host arm is ever consulted —
+    otherwise identity.json could smuggle a name past the authority by
+    recording a host for it.
+
+    This pins the ORDER of the two checks, which is why it asserts on the
+    outcome-1 phrase rather than only on the False: both branches refuse,
+    so the verdict alone cannot tell them apart and would pass even if the
+    checks were swapped.
+    """
+    import logging
+
+    r = _runner(
+        tmp_path,
+        monkeypatch,
+        bot_peers={"wren": {"url": "http://ha-pi.local:8642"}},
+        identity={
+            "peers": {
+                "ghost": {"host": "ghost.local"},
+                "wren": {"host": "ha-pi.local"},
+            }
+        },
+        self_agent="ash",
+    )
+    with caplog.at_level(logging.WARNING):
+        assert r._reply_to_is_trustworthy(
+            {"agent": "ghost", "host": "ghost.local"}, {"peer": "ghost"}
+        ) is False
+    blob = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "not a known peer on this box" in blob
+    # And NOT via the host arm, whose messages name the recorded host.
+    assert "but this box knows" not in blob
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
