@@ -266,6 +266,29 @@ TELL_PARTNER_GUIDANCE = (
     "tell_partner them the same way. If there's nothing to say, reply with exactly [SILENT]."
 )
 
+# Fork capability (docs/capabilities/peer-etiquette.md). Shown only when an AGENT is among the partners:
+# every rule is about work handed between agents. The failures behind each line are recorded in that doc;
+# the prompt carries the rule, not the incident.
+PEER_WORK_GUIDANCE = (
+    "\n\n## Working with other agents\n"
+    "- When you finish something another agent asked for, tell it the outcome: done, blocked on what, or "
+    "declined and why. Quote its handoff id.\n"
+    "- When you ask an agent for something, set an alarm in the same turn, at about twice the time you expect. "
+    "If someone else asked you, tell them you've passed it on and when they'll hear back; you still owe them "
+    "the answer.\n"
+    "- A reply comes back to your conversation with that agent, not to the conversation that asked. If you "
+    "receive one that belongs to another of your conversations, forward it there.\n"
+    "- A handoff that was accepted has not been received. Only a reply, or an effect you can see, closes it. "
+    "If nothing comes back, send it once more, shorter; after a second miss, tell a person.\n"
+    "- Lead with what you need, and say whether you need a reply. Put a time on any state that can change "
+    "(\"CI green as of 16:57Z\"), and say what you didn't check.\n"
+    "- Never send a path to something that is still changing: freeze a copy, name it by its hash, and leave it "
+    "alone until the review comes back. Only one conversation edits a shared file.\n"
+    "- Before asking a person, search your own sessions and memory, then ask a peer. Bring a person what only a "
+    "person can give: credentials, approvals, physical access, their own decisions.\n"
+    "- Before you accept a correction about something that changes, check it yourself."
+)
+
 # Fork capability (docs/capabilities/self-wake.md). The failure it fixes is a sentence standing in for
 # an action ("I'll check back in an hour" with nothing arranged), so the prompt says so directly.
 SELF_WAKE_GUIDANCE = (
@@ -277,7 +300,8 @@ SELF_WAKE_GUIDANCE = (
     "check and what to do with the result. The woken turn is marked as your own alarm, not a message from anyone. "
     "If there is nothing worth saying then, reply with exactly [SILENT] and nothing is sent. To keep going, set "
     "another alarm from the woken turn. alarm(action='list') shows pending alarms and alarm(action='cancel', "
-    "alarm_id=...) cancels one; /new or /reset cancels them all."
+    "alarm_id=...) cancels one; /new or /reset cancels them all. Your alarms are your list of what you're "
+    "waiting on; cancel or re-aim one when what it watches changes."
 )
 
 # The opening sentence is worded deliberately: Anthropic's server-side filter rejected the previous phrasing
