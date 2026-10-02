@@ -358,16 +358,24 @@ class GatewayPeerCompletionMixin:
                 if proc is not None:
                     proc.kill()
                     # Reap it, BUT WITH A BOUND. asyncio's Process.wait() returns
-                    # when the process has exited AND its pipes have closed, so a
-                    # grandchild that inherited our stdout keeps it open and an
-                    # unbounded wait() hangs forever on a child that is already
-                    # dead. Measured: identical child, `sh -c "dd ...; sleep 60"`
-                    # never reaps (grandchild holds the pipe) while
-                    # `sh -c "dd ...; exec sleep 60"` reaps in 0.001s. `hermes
-                    # peer dm` is free to spawn helpers, so this is reachable.
-                    # The SIGKILL is what guarantees no further delivery; the
-                    # reap only avoids a zombie, so giving up on it after 5s is
-                    # strictly better than hanging the gateway's return leg.
+                    # when the process has exited AND every holder of its stdout
+                    # pipe has let go. SIGKILL kills only the direct child, so any
+                    # surviving grandchild holding inherited stdout hangs this
+                    # wait forever on a child that is already dead.
+                    #
+                    # This is the COMMON case, not an edge case: a shell execs a
+                    # lone final command, but anything else leaves a grandchild.
+                    # Measured — `sh -c "sleep 30"` (no output at all) hangs,
+                    # with the holder identified by name from /proc/*/fd;
+                    # `sh -c "exec sleep 30"` reaps in 0.0007s. The pipe buffer
+                    # is irrelevant.
+                    #
+                    # 5s is ~1600x the slowest legitimate reap measured here
+                    # (2MB unread stdout 0.0008s, 200MB disk write 0.0004s,
+                    # 50 threads 0.0030s). The SIGKILL is what stops further
+                    # delivery; the reap only avoids a zombie, so abandoning it
+                    # leaks a PID slot on a dead process — strictly cheaper than
+                    # hanging every subsequent return on a long-lived gateway.
                     await _asyncio.wait_for(proc.wait(), timeout=5)
             except _asyncio.TimeoutError:
                 logger.warning(

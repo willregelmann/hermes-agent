@@ -135,30 +135,37 @@ def test_reap_is_bounded_when_a_grandchild_holds_stdout(tmp_path, monkeypatch):
     Wren's review of this PR (handoff 3e8151e3) asked whether the unbounded
     ``await proc.wait()`` could deadlock, citing the subprocess docs' warning
     about a full pipe buffer. Her measurement said no. Mine said yes, and the
-    disagreement was real: her fixture left no survivor holding the pipe.
+    real cause is neither the buffer nor luck.
 
-    asyncio's ``Process.wait()`` completes when the process has exited AND its
-    pipes have closed. A grandchild that inherited stdout keeps it open, so
-    ``wait()`` never returns even though ``os.kill(pid, 0)`` says the child is
-    gone. Measured on the same child shape:
+    asyncio's ``Process.wait()`` completes when the process has exited AND
+    every holder of its stdout pipe has let go. ``SIGKILL`` reaches only the
+    direct child, so a surviving grandchild holding inherited stdout hangs the
+    wait forever while ``os.kill(pid, 0)`` already reports the child gone.
 
-        sh -c "dd ...; sleep 60"        -> never reaps (grandchild holds pipe)
-        sh -c "dd ...; exec sleep 60"   -> reaps in 0.001s
+    THE BUFFER IS IRRELEVANT and the case is common, not exotic. Measured:
 
-    ``hermes peer dm`` is a CLI that may spawn helpers, so this is reachable in
-    production. Without a bound the gateway's return leg hangs forever on a
-    child it has already killed — strictly worse than the duplicate delivery
-    this PR exists to prevent.
+        sh -c "sleep 30"        -> never reaps (no output at all)
+        sh -c "exec sleep 30"   -> reaps in 0.0007s
+
+    The holder was identified by name, not inferred from the hang: resolving
+    the pipe inode behind the parent's read fd and scanning ``/proc/*/fd``
+    finds ``('sleep', fd 1)`` in the first case and nothing in the second. A
+    shell execs a lone final command; anything else leaves the grandchild.
+
+    Without a bound the gateway's return leg hangs forever on a child it has
+    already killed — strictly worse than the duplicate delivery this PR exists
+    to prevent.
 
     The whole call is bounded here, so an unbounded regression fails this test
     by timing out rather than hanging the suite.
     """
     marker = tmp_path / "never"
     script = tmp_path / "grandchild-hermes"
-    # 500KB past the pipe buffer, then a GRANDCHILD inheriting stdout.
+    # NO OUTPUT AT ALL. The hang needs only a surviving holder of the child's
+    # stdout pipe; the buffer is irrelevant. A shell execs a lone final
+    # command, so the trailing echo is what keeps `sleep` as a grandchild.
     script.write_text(
         "#!/bin/sh\n"
-        "dd if=/dev/zero bs=1024 count=500 2>/dev/null\n"
         "sleep 60\n"
         f"echo delivered > {marker}\n"
     )
