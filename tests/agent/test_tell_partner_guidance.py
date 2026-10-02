@@ -46,3 +46,26 @@ def test_peer_work_guidance_follows_whether_any_partner_is_an_agent(tmp_path, mo
     block = _tool_guidance_block(_agent({"tell_partner"})) or ""
     assert (PEER_WORK_GUIDANCE in block) is expected
     assert PEER_WORK_GUIDANCE not in (_tool_guidance_block(_agent({"terminal"})) or "")
+
+
+def test_unreadable_roster_warns_instead_of_dropping_the_guidance_silently(tmp_path, monkeypatch, caplog):
+    """The gate stays broad so a bad config cannot block session start, but it must not fail
+    mute: a rename of load_partners/AGENT would otherwise delete the etiquette forever with
+    no error anywhere. Pinning the WARNING is what makes that failure findable."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _partners(tmp_path, {"ash": ASH})
+
+    def _boom():
+        raise RuntimeError("partners table unreadable")
+
+    monkeypatch.setattr("hermes_cli.partners.load_partners", _boom)
+
+    with caplog.at_level("WARNING", logger="agent.system_prompt"):
+        block = _tool_guidance_block(_agent({"tell_partner"})) or ""
+
+    # Degrades to the tool rules alone -- no roster, no peer etiquette, and session start survives.
+    assert TELL_PARTNER_GUIDANCE in block
+    assert PEER_WORK_GUIDANCE not in block
+    assert "ash (agent)" not in block
+    assert any("peer etiquette omitted" in r.getMessage() for r in caplog.records), \
+        f"no WARNING emitted; records={[r.getMessage() for r in caplog.records]}"

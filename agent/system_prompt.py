@@ -280,7 +280,12 @@ def _tell_partner_guidance() -> str:
         partners = load_partners()
         roster = roster_line(partners)
         has_agent = any(e["kind"] == AGENT for e in partners.values())
-    except Exception:
+    except Exception as exc:
+        # Stays broad on purpose: load_partners() reaches load_config(), so a malformed
+        # config.yaml must not block session start (same call as line ~355). But a feature
+        # gate whose failure mode is "the feature silently does not exist" hides a rename
+        # forever, so say so loudly rather than returning a quietly smaller prompt.
+        logger.warning("tell_partner guidance: partner roster unavailable (%s); peer etiquette omitted", exc)
         roster, has_agent = "", False
     text = f"{TELL_PARTNER_GUIDANCE} {roster}".rstrip()
     return text + _pb.PEER_WORK_GUIDANCE if has_agent else text
