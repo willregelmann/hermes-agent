@@ -272,14 +272,18 @@ def _profile_name_for_home(home: Path) -> str:
 
 
 def _tell_partner_guidance() -> str:
-    """TELL_PARTNER_GUIDANCE plus this profile's partner roster. Built once, at session start, like the
-    rest of the system prompt, so a directory edit takes effect in the next session."""
+    """TELL_PARTNER_GUIDANCE plus this profile's partner roster, plus PEER_WORK_GUIDANCE when any partner is
+    an agent. Built once, at session start, like the rest of the system prompt, so a directory edit takes
+    effect in the next session."""
     try:
-        from hermes_cli.partners import roster_line
-        roster = roster_line()
+        from hermes_cli.partners import AGENT, load_partners, roster_line
+        partners = load_partners()
+        roster = roster_line(partners)
+        has_agent = any(e["kind"] == AGENT for e in partners.values())
     except Exception:
-        roster = ""
-    return f"{TELL_PARTNER_GUIDANCE} {roster}".rstrip()
+        roster, has_agent = "", False
+    text = f"{TELL_PARTNER_GUIDANCE} {roster}".rstrip()
+    return text + _pb.PEER_WORK_GUIDANCE if has_agent else text
 
 
 def _tool_guidance_block(agent: Any) -> Optional[str]:
