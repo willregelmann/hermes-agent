@@ -357,22 +357,29 @@ class GatewayPeerCompletionMixin:
             try:
                 if proc is not None:
                     proc.kill()
-                    # Reap it, BUT WITH A BOUND. asyncio's Process.wait() returns
-                    # when the process has exited AND every holder of its stdout
-                    # pipe OTHER THAN the process we killed has let go. SIGKILL
-                    # reaches only the direct child, so any OTHER survivor holding
-                    # that inherited write end hangs this wait forever on a child
-                    # that is already dead. The dead child's own fd does not block
-                    # the reap — the predicate is about OTHER holders (Wren).
+                    # Reap it, BUT WITH A BOUND, because Process.wait() can hang
+                    # forever on a process that is ALREADY DEAD.
                     #
-                    # A surviving grandchild is the COMMON instance, not the rule:
-                    # a shell execs a lone final command, but anything else leaves
-                    # one. Measured — `sh -c "sleep 30"` (no output at all) hangs,
-                    # holders named from /proc/*/fd; `sh -c "exec sleep 30"` reaps
-                    # in 0.0007s. A DIRECT child with no grandchild also hangs if
-                    # an unrelated process was handed the same write end, and
-                    # reaps in 0.0006s when it was not. The pipe buffer is
-                    # irrelevant: "other holder" predicted hang/reap in 4/4 arms.
+                    # WHAT IS MEASURED (and only that — see below for what is not):
+                    #   sh -c "sleep 30"          , nothing closed -> HANGS
+                    #   sh -c "exec sleep 30"     , nothing closed -> reaps 0.0007s
+                    #   stdout=DEVNULL, stderr=PIPE, nothing closed -> HANGS
+                    #   stdout=DEVNULL, stderr=DEVNULL (no pipes)   -> reaps 0.0007s
+                    #   any ONE transport explicitly closed first   -> reaps 0.0001s
+                    # The pipe buffer is irrelevant: a child with NO output hangs.
+                    # os.kill(pid, 0) reports the child gone while wait() still
+                    # blocks, so "dead" and "reaped" are not the same question.
+                    #
+                    # WHAT I DO NOT KNOW, stated so nobody builds on a guess: the
+                    # exact predicate. "A pipe-write-end holder other than the
+                    # process we killed" FAILED a separating arm — closing our own
+                    # transport reaps in 0.0001s while that holder is still alive.
+                    # asyncio's _try_finish() requires all pipes disconnected, but
+                    # closing ONE transport reaps while another pipe stays open,
+                    # which that reading does not explain either. Unresolved.
+                    #
+                    # The bound does not depend on the mechanism: whatever the
+                    # rule is, a reap that has not finished in 5s is not going to.
                     #
                     # 5s is ~1600x the slowest legitimate reap measured here
                     # (2MB unread stdout 0.0008s, 200MB disk write 0.0004s,
