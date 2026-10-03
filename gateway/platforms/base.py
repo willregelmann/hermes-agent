@@ -3141,6 +3141,7 @@ class BasePlatformAdapter(ABC):
             re.IGNORECASE)
         code_spans = _code_spans(content)
         unique: dict = {}  # expanded_path -> raw_match_text, deduped in discovery order
+        prose_spans: list = []  # only the matched prose spans are removed; code-span copies stay
         for match in path_re.finditer(content):
             if any(s <= match.start() < e for s, e in code_spans):
                 continue
@@ -3148,15 +3149,13 @@ class BasePlatformAdapter(ABC):
             expanded = os.path.expanduser(raw)
             if os.path.isfile(expanded):
                 unique.setdefault(expanded, raw)
+                prose_spans.append(match.span())
             else:
                 # Most common reason a promised file never arrives — log the gap.
                 logger.info("Skipping bare file path in reply (no file on disk): %s", _log_safe_path(raw))
         if not unique:
             return [], content
-        cleaned = content
-        for raw in unique.values():
-            cleaned = cleaned.replace(raw, '')
-        return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+        return list(unique), re.sub(r'\n{3,}', '\n\n', _delete_spans(content, prose_spans)).strip()
 
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
                            stop_event: asyncio.Event | None = None) -> None:
