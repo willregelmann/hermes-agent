@@ -112,9 +112,25 @@ check("B4 no identity -> None, NOT a fabricated address",
 # THIS machine's peer list, which is not their subject. Give them a jailed home
 # with a known peer so they measure ROUTING; the H arms below own the
 # no-policy question and each use their own home.
+# WHOSE BOX IS THIS? The C/D/E arms describe a turn that RAN HERE
+# ("ash-local-session") whose reply must go BACK to wren, so this jail is
+# ASH'S box, not wren's. It said agent="wren" until 2026-10-03 and nothing
+# noticed, because no arm asked the box its own name. #81 adds an arm that
+# does: a reply_to naming THIS box is refused as self-addressed. Under the
+# old fixture C1's return address and the box's own identity were the same
+# string, so a legitimate cross-box return was indistinguishable from a
+# self-addressed one and C1/C3/E1/E3 failed. A FIXTURE THAT NAMES TWO ROLES
+# WITH ONE STRING PASSES UNTIL SOMETHING COMPARES THEM.
+# DEAD AS OF 2026-10-03, MEASURED NOT ASSUMED: this jail is overwritten by the
+# `tmp` one below before ANY arm runs — 0 check() calls sit between the two
+# `os.environ["HERMES_HOME"]` writes and `_home_jail` is referenced 0 times
+# after the second. It is kept only because its comment above explains WHY the
+# in-process arms need a jailed home at all. Its identity is matched to the
+# live jail so that a future reader who revives it does not reintroduce the
+# self-addressed collision described below.
 _home_jail = tempfile.mkdtemp(prefix="wren-testhome-")
 with open(os.path.join(_home_jail, "identity.json"), "w", encoding="utf-8") as _fh:
-    json.dump({"agent": "wren", "host": "ha-pi.local",
+    json.dump({"agent": "ash", "host": "will-ms-7b93.local",
                "peers": {"ash": {"host": "will-ms-7b93.local"},
                          "wren": {"host": "ha-pi.local"}}}, _fh)
 # Policy now lives in bot_peers (see the note at the G3/G4 jail), so this home
@@ -134,9 +150,23 @@ from gateway.handoff import DELIVERED, OPEN, HandoffStore  # noqa: E402
 # location defect, and it cost me a red C3 here.
 # The same home also needs a peers map, because #34 refuses any address it
 # cannot verify. The H arms below use their own throwaway homes.
+# WHOSE BOX IS THIS? The C/D/E arms describe a turn that RAN HERE
+# ("ash-local-session") whose reply must go BACK to wren, so this jail is
+# ASH'S box, not wren's. It said agent="wren" until 2026-10-03 and nothing
+# noticed, because no arm asked the box its own name. #81 adds an arm that
+# does: a reply_to naming THIS box is refused as self-addressed. Under the
+# old fixture C1's return address and the box's own identity were the same
+# string, so a legitimate cross-box return was indistinguishable from a
+# self-addressed one and C1/C3/E1/E3 failed. A FIXTURE THAT NAMES TWO ROLES
+# WITH ONE STRING PASSES UNTIL SOMETHING COMPARES THEM.
+#
+# AND NOTE WHICH JAIL IS LIVE: the `_home_jail` above is overwritten by this
+# one at the `os.environ["HERMES_HOME"] = tmp` below, so the C/D/E arms read
+# THIS identity.json, not that one. Two jails, one env var, last write wins —
+# editing the wrong one changes nothing and looks like a failed diagnosis.
 tmp = tempfile.mkdtemp(prefix="wren-route-")
 with open(os.path.join(tmp, "identity.json"), "w", encoding="utf-8") as _fh:
-    json.dump({"agent": "wren", "host": "ha-pi.local",
+    json.dump({"agent": "ash", "host": "will-ms-7b93.local",
                "peers": {"ash": {"host": "will-ms-7b93.local"},
                          "wren": {"host": "ha-pi.local"}}}, _fh)
 with open(os.path.join(tmp, "config.yaml"), "w", encoding="utf-8") as _fh:
@@ -267,13 +297,18 @@ async def drive():
     # different system. These cases use the real defaulted string.
     h6 = store.open_handoff(from_session="peer", to_session="s6",
                             requesting_user="peer", intent="live shape")
+    # The return address must name the OTHER box. This jail is ash's (see the
+    # identity note above), so the live-shape reply goes back to wren. It read
+    # agent="ash" while the jail also claimed to BE ash, which #81's
+    # self-addressed refusal correctly rejects — the arm was describing a box
+    # replying to itself and calling it the live shape.
     evt6 = {"type": "peer_completion", "session_id": "local", "text": "ack",
             "peer": "peer", "handoff_id": h6.id,
-            "reply_to": {"agent": "ash", "host": "will-ms-7b93.local"}}
+            "reply_to": {"agent": "wren", "host": "ha-pi.local"}}
     r6 = FakeRunner()
     ok6 = await r6._deliver_peer_completion(evt6)
     check("G1 THE LIVE SHAPE: peer='peer' + a KNOWN agent DELIVERS",
-          r6.returned == [("ash", "ack")],
+          r6.returned == [("wren", "ack")],
           f"returned={r6.returned} — this is the exact event the live guard "
           f"refused at 11:31:46; if this fails the chain is still broken")
     check("G2 and the row closes on that delivery", ok6 is True, f"got {ok6}")
