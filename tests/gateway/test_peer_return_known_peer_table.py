@@ -232,13 +232,16 @@ def test_identity_known_for_others_but_not_this_peer_is_still_inert(
 # --- the self case: 63 of 118 ------------------------------------------------
 
 
-def test_self_named_return_address_is_not_a_refusal(tmp_path, monkeypatch):
-    """reply_to naming THIS box's own agent is local delivery, not an error.
+def test_self_named_return_address_is_refused_distinctly(tmp_path, monkeypatch, caplog):
+    """reply_to naming THIS box is refused once, with its own message.
 
-    63 of the 118 refusals were `reply_to.agent='ash'` refused on Ash's own
-    box, and 4 of Wren's 6 were 'wren' on hers. Self is correctly absent from
-    one's own peer table; that absence is not a spoof.
+    63 of the 118 refusals were `reply_to.agent='ash'` on Ash's own box.
+    Trusting them is not a fix: the router has no local target for a
+    self-addressed return (see the router test below). So the refusal stays,
+    but says what it is instead of "not a known peer".
     """
+    import logging
+
     r = _runner(
         tmp_path,
         monkeypatch,
@@ -246,7 +249,55 @@ def test_self_named_return_address_is_not_a_refusal(tmp_path, monkeypatch):
         identity={"peers": {"wren": {"host": "ha-pi.local"}}},
         self_agent="ash",
     )
-    assert r._reply_to_is_trustworthy({"agent": "ash"}, {"peer": "peer"}) is True
+    with caplog.at_level(logging.DEBUG, logger="gateway.run_peer_completion"):
+        assert r._reply_to_is_trustworthy({"agent": "ash"}, {"peer": "peer"}) is False
+    msgs = [rec.getMessage() for rec in caplog.records]
+    assert any("names this box" in m for m in msgs), msgs
+    assert not any("not a known peer" in m for m in msgs), msgs
+
+
+def test_router_drops_self_addressed_return_once_instead_of_requeueing(
+    tmp_path, monkeypatch
+):
+    """Foil's B1 on #81, driven through the REAL router.
+
+    The predicate tests above cannot see this: trusting a self-addressed
+    reply_to sends it over the wire to our own name, which fails, returns
+    False, and the watcher requeues it every interval until restart. Only the
+    send and the inject are faked; the router, predicate and _own_agent_name
+    are production's. Red on ebfa015d (delivered False, one wire send).
+    """
+    import asyncio
+    import gateway.run_peer_completion as R
+
+    r = _runner(
+        tmp_path,
+        monkeypatch,
+        bot_peers={"wren": {"url": "http://ha-pi.local:8642"}},
+        identity={"peers": {"wren": {"host": "ha-pi.local"}}},
+        self_agent="ash",
+    )
+    calls = []
+
+    async def _wire(reply_to, text, evt):
+        calls.append(("wire", reply_to.get("agent")))
+        return False  # what `hermes peer dm ash` does on ash's own box: rc=1
+
+    async def _inject(session_id, text, evt):
+        calls.append(("inject", session_id))
+        return True
+
+    cls = type(r)
+    cls._deliver_peer_completion = R.GatewayPeerCompletionMixin._deliver_peer_completion
+    cls._return_peer_completion = staticmethod(_wire)
+    cls._inject_peer_completion_turn = staticmethod(_inject)
+    cls._close_peer_handoff = lambda self, evt: None
+
+    evt = {"session_id": "s1", "text": "hi", "peer": "peer",
+           "reply_to": {"agent": "ash"}}
+    delivered = asyncio.run(r._deliver_peer_completion(evt))
+    assert calls == [], calls          # never sent to ourselves over the wire
+    assert delivered is True           # True = do not requeue (dropped, logged)
 
 
 # --- Wren's gate on the future hook -----------------------------------------

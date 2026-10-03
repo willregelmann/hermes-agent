@@ -185,36 +185,24 @@ class GatewayPeerCompletionMixin:
         what this box already knows. An opaque session id could only be taken
         on faith.
         """
-        # DEFENCE IN DEPTH, NOT A LIVE DEFECT. The only caller (line 123) already
-        # gates on `isinstance(reply_to, dict)`, so a non-dict cannot reach here
-        # today; a negative-control arm of mine fed one directly and got an
-        # AttributeError rather than a refusal. That arm was testing an input the
-        # router cannot produce, so this is not a bug in the live path — but a
-        # validator that RAISES instead of refusing is the wrong failure shape
-        # for a fail-closed check, and the next caller may not guard.
-        if not isinstance(reply_to, dict):
-            logger.error(
-                "peer completion reply_to is %s, not a mapping — refusing; "
-                "dropping (handoff stays open)", type(reply_to).__name__,
-            )
-            return False
-
         agent = str(reply_to.get("agent") or "").strip()
         sender = str(evt.get("peer") or "").strip()
 
-        # SELF IS NOT A PEER, AND ITS ABSENCE IS NOT A SPOOF. 63 of the 118
-        # refusals measured on will-MS-7B93 (2026-09-30..10-02) were
-        # reply_to.agent='ash' refused ON ASH'S OWN BOX; 4 of Wren's 6 on
-        # ha-pi were 'wren'. A box's own name is correctly missing from its own
-        # peer table, so the known-peer arm rejected it. A return address
-        # naming this box means the reply belongs HERE: say so, and let the
-        # caller inject locally instead of trying to send it over the wire.
+        # A RETURN ADDRESS NAMING THIS BOX IS REFUSED, WITH ITS OWN MESSAGE.
+        # 63 of the 118 refusals measured on will-MS-7B93 were reply_to.agent
+        # naming the box itself. Trusting it does not help: the router sends
+        # every trusted reply_to over the wire (`hermes peer dm <own name>`),
+        # which fails, returns False, and the watcher requeues every interval
+        # forever (Foil's B1 on #81). There is no defined local target either:
+        # session_id is where the turn RAN, so injecting there answers
+        # ourselves. Until a local target exists, refuse once, distinctly.
         if agent and agent.casefold() == self._own_agent_name().casefold():
-            logger.debug(
-                "peer completion reply_to names this box (%r) — delivering "
-                "locally rather than over the peer channel", agent,
+            logger.error(
+                "peer completion reply_to names this box (%r) — refusing; "
+                "dropping (handoff stays open). No local target is defined "
+                "for a self-addressed return", agent,
             )
-            return True
+            return False
 
         # WHAT THIS CHECK CAN AND CANNOT DO — corrected after it refused a
         # legitimate reply on a live pair, 2026-09-16 11:31:46:
@@ -361,10 +349,8 @@ class GatewayPeerCompletionMixin:
             # proposition from "no policy" (outcome 2) — policy lives in
             # bot_peers and said yes. Refusing here is what left 55 of the 118
             # refusals in place on my first implementation.
-            #
-            # There is no 3b arm any more. A box that records a host for `wren`
-            # and none for `refsdal` is not withholding a vouch for refsdal; it
-            # simply never learned one, which is the state every peer starts in.
+            # A box that records a host for `wren` and none for `refsdal` is
+            # not withholding a vouch for refsdal; it simply never learned one.
             logger.warning(
                 "peer completion from %r declared host %r for %r, but this box "
                 "records no identity host for that peer — host arm inert, "
