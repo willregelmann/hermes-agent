@@ -947,6 +947,157 @@ refactor/description   # Code restructuring
 3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider macOS, Linux, and WSL2
 4. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.
 
+### Before merging
+
+These are checks on the **pull request**, not on the branch. A PR can be green,
+rebased and locally verified and still fail every one of them.
+
+**Some entries below are limits, not checks, and they are marked.** A limit
+states something this list cannot verify from outside — it has no query and no
+pass/fail. Do not "fix" a limit by rewriting it as a check: the check would be
+enforceable and false. An unenforceable limit is still worth stating, because a
+reader who knows a gap exists behaves differently from one who thinks the list
+is complete.
+
+1. **Read the review list, not your memory of having been reviewed.** Query the
+   reviews endpoint immediately before merging:
+
+   ```bash
+   gh api repos/OWNER/REPO/pulls/N/reviews --jq '.[] | "\(.id) \(.state) \(.user.login) \(.commit_id)"'
+   ```
+
+   An approval is a **cache keyed to a commit**, not a durable attestation. It is
+   silently separated from the bytes it approved by: a new push (`DISMISSED`), a
+   reopen (orphaned), a force-push, or being pinned to a sha that is no longer the
+   head. In every one of those cases the PR page still looks fine.
+
+2. **A review that is a file is not a review the PR can show.** A verdict written
+   to a branch, a relay file or a chat message is invisible to the reviews
+   endpoint, to the merge gate, and to everyone reading the PR afterwards — and if
+   that branch is deleted, the merge has no stated basis at all. Post the verdict
+   as a PR review (preferred) or at minimum as a PR comment, so the attestation
+   travels with the thing it attests.
+
+3. **Do not relay someone else's approval as your own report of it.** If a
+   reviewer's verdict reached you out of band, ask them to post it themselves.
+   Summarising another person's approval onto a permanent record puts words in
+   their mouth, and the reviews endpoint will still show nobody.
+
+4. **Count authors, not commits.** A PR with commits from two authors needs two
+   reviewers: nobody certifies their own bytes, including a one-line fixture fix
+   added during a rebase. Check with:
+
+   ```bash
+   gh api repos/OWNER/REPO/pulls/N/commits --jq '.[].commit.author.email' | sort -u
+   ```
+
+   Re-authoring someone's commit to simplify the bookkeeping launders authorship —
+   get a third reader instead.
+
+5. **A check-run read is valid only for the instant it ran.** Compare
+   `total_count` against the number of rows you actually received (paginate), and
+   count **distinct lane names** rather than rows — a lane can report several
+   times. Re-read immediately before merging: a red lane can appear between two
+   complete reads.
+
+6. **A negative repeated is not a negative confirmed when every attempt shares
+   the same wrong assumption.** Six `404`s on one review id across two
+   repositories and three API namespaces read as conclusive *because* of the
+   volume; the object was live at `pulls/6/reviews` the whole time. Every
+   attempt had inherited the same guess about which collection owned it, so the
+   attempts were not independent and the repetition measured nothing. Before
+   concluding a thing does not exist, change the **assumption**, not the
+   parameters: search by content rather than by identifier, or query a
+   collection you have not tried. Volume reads as thoroughness and is not.
+
+7. **Search the right population, and state its size.** A negative result is
+   only as wide as the corpus it searched, and wider in the *wrong* population
+   is worse than narrow, because the larger number reads as diligence. A
+   "0 hits" over two files (4,105 chars) became 28 hits over the full corpus
+   (104,096 chars) — one of them written by the searcher. Two traps:
+   a corpus selected by *mention* of a subject is not that subject's authored
+   text (filter to authored rows, never to rows containing the string), and in a
+   store that logs its own queries the **instrument's own output enters the
+   corpus it searches**, inflating counts toward whatever was just looked for.
+   Quote the corpus size with the result so a reader can judge the claim.
+
+8. **Never let `||` carry a conclusion, only a status.** `git fetch … || echo
+   "force-push or divergence"` turned "could not look" into "looked and found
+   the opposite" — a fabricated finding with a plausible commit attached
+   instead of an error. The same shape hides in `cd "$VAR" || exit 1`, which
+   with `$VAR` empty returns 0 and stays put. Let the command fail loudly, or
+   print only what the exit code establishes.
+
+9. **A later review does not inherit the earlier one's open items.** GitHub
+   silently allows `APPROVED` to land on top of the same author's unaddressed
+   `CHANGES_REQUESTED` — twice in one day here, once on byte-identical commits
+   six minutes apart, with no intervening push and *nothing anomalous on the
+   PR page*. The only artefact of the failure is the review list itself. This
+   does not need two reviewers or two opinions: a single agent re-posting its
+   own stale copy manufactures the block it then approves over. Re-read your own
+   earlier reviews on the PR before adding another, and run check 1 against the
+   endpoint rather than against your account of what you did.
+
+10. **A claim about the shape of a sentence is a second measurement.** Two
+    instrument failures here, both alleging a defect that did not exist: a
+    substring test over hard-wrapped prose tests the *wrapping*, not the
+    content (`"I\naccept that…"` — flatten whitespace first), and
+    "X constrains A, not B" denies X of B and says nothing about what else
+    constrains B. The common cause is worth more than either rule: a matcher
+    written to find the thing already suspected can only fail toward "something
+    is broken". When a test's possible outcomes are an alleged defect or
+    silence, it is not a test. That applies hardest to a **self**-accusation,
+    which is the claim least likely to be challenged by anyone else — state it
+    as a claim with its measurement, and let someone read the artefact before
+    it becomes a correction on a permanent record.
+
+    **Scope limit, and it is part of the rule:** flatten whitespace over
+    *prose*, never over a span containing an identifier. A normaliser that
+    strips markup also strips identifier characters — `_`, `.` and `-` are
+    markup in prose and semantics in code. Searching a PR body for
+    `bot_peers is now the authority` returned false (the body writes it as a
+    code span), and the markdown-stripping retry *also* returned false, because
+    stripping backticks and underscores turns `bot_peers` into `botpeers`:
+    the second attempt failed for a different reason than the first and looked
+    like confirmation. **Match a code span as a code span** — search the
+    backticked form, or parse. Do not pick a stripping set.
+
+11. **The payload must exist as a file before it is sent.** A comment body
+    passed inline through a shell had its backticks executed: three
+    `command not found` lines, and GitHub accepted the result — a correction
+    *about sha provenance* published with every sha silently removed. A parser
+    error that still produces an artefact defeats read-back-and-compare, because
+    the destruction happens upstream of the artefact and what lands is
+    internally consistent. Write the body to a file, send it with `--body-file`
+    / `--input`, then read the posted copy back and compare it to that file.
+    Two live instances with *different* culprits: a shell expanded backticks
+    before `gh` saw the body, and `-f body=@file` posted the literal 13-char
+    string `@/tmp/i98b.md` because `@` is not implemented for `-f`. So the rule
+    is not "avoid the shell" — it is that something must exist to compare to.
+
+12. **(LIMIT) A failed attempt leaves no artefact, so this checklist cannot be
+    audited from the outside.** (Ash) A rejected review POST — `422 commitOID is not
+    part of the pull request` — creates nothing; the reviews endpoint shows no
+    trace, so counting an agent's clean reviews cannot establish it never typed
+    a sha. Measured: 29 of Wren's reviews across two repos carry 40-char
+    `commit_id`s all present in their PRs' commit lists, and that evidence is
+    consistent with any number of failed attempts. Ash has 5 reviews, clean by
+    the same test, **and one observed 422** — visible only because Ash issued
+    it. The artefact record is silent about attempts; the attempt record exists
+    only in the actor's own session. Neither agent can audit the other for this
+    class: each must report its own failed attempts, and a clean external audit
+    is not evidence of their absence.
+
+13. **A suite you have never run has no baseline, and a first run is not one.**
+    (Ash) A branch run of `tests/tui_gateway` gave 13 failed / 2082 and was
+    reported as a finding; `main` gives 12 / 2078, and a re-run gives 12 with
+    byte-identical failure sets. The baselining discipline had been established
+    on `tests/hermes_state` and did not transfer, because **a baseline is a
+    property of a (suite, tree) pair, not of the agent's habits.** Run the suite
+    on the merge base before reading any number off the branch — and if that is
+    impossible, call the number unbaselined rather than reporting it as a
+    result.
+
 ### PR description
 
 Include:
