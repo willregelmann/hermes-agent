@@ -67,3 +67,26 @@ def test_host_supervisor_pid_alive_delegates_to_pid_exists(monkeypatch):
     assert host_supervisor._pid_alive(0) is False
     assert host_supervisor._pid_alive(-1) is False
     assert calls == [], "non-positive PIDs must short-circuit before probing"
+
+
+def test_unprobeable_pid_does_not_reach_a_signal_at_either_caller(monkeypatch):
+    """Assume-alive is safe at BOTH _pid_alive callers, for two different reasons.
+
+    Wren's review 5401321817 of PR #95: a polarity flip is only safe if EVERY caller
+    tolerates it, and `_pid_alive` has two. `_terminate_pid` is protected by a
+    deadline; `reconcile_startup_orphan` is protected by the identity check, which
+    is a different mechanism and would survive the deadline being removed.
+
+    This arm pins the second one: an unprobeable PID must land on the identity
+    check and be classified pid-reuse-ignored, never signalled.
+    """
+    def _boom(pid):
+        raise OSError("probe unavailable")
+
+    monkeypatch.setattr(gateway.status, "_pid_exists", _boom)
+    # Unprobeable => assume alive, so the "not-running" branch is NOT taken.
+    assert host_supervisor._pid_alive(os.getpid()) is True
+
+    # An unreadable cmdline must fail closed: no identity, hence no signal.
+    monkeypatch.setattr(host_supervisor, "_pid_command", lambda pid: "")
+    assert host_supervisor.is_compute_host_identity(os.getpid()) is False

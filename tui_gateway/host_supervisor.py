@@ -94,8 +94,16 @@ def _pid_alive(pid: int) -> bool:
         from gateway.status import _pid_exists
         return bool(_pid_exists(pid))
     except Exception:
-        # Cannot probe: report alive. `_terminate_pid`'s loop is deadline-bounded and
-        # escalates to SIGKILL, so this defers rather than spinning.
+        # Cannot probe: report alive. Safe at BOTH callers, for two DIFFERENT reasons --
+        # a polarity flip is only safe if every caller tolerates it (Wren, review
+        # 5401321817):
+        #   `_terminate_pid`: its wait loop is deadline-bounded and escalates to SIGKILL,
+        #     so a spurious True defers a shutdown by at most the timeout, never hangs.
+        #   `reconcile_startup_orphan`: a spurious True falls through to the IDENTITY
+        #     check, not to a signal. `is_compute_host_identity` requires
+        #     "tui_gateway.compute_host" in `_pid_command(pid)`, and an unreadable
+        #     cmdline yields "" -> False -> "pid-reuse-ignored". The identity check is
+        #     what carries assume-alive here; the deadline is irrelevant on that path.
         return True
 
 
