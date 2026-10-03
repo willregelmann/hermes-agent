@@ -112,11 +112,32 @@ check("B4 no identity -> None, NOT a fabricated address",
 # THIS machine's peer list, which is not their subject. Give them a jailed home
 # with a known peer so they measure ROUTING; the H arms below own the
 # no-policy question and each use their own home.
+# WHOSE BOX IS THIS? The C/D/E arms describe a turn that RAN HERE
+# ("ash-local-session") whose reply must go BACK to wren, so this jail is
+# ASH'S box, not wren's. It said agent="wren" until 2026-10-03 and nothing
+# noticed, because no arm asked the box its own name. #81 adds an arm that
+# does: a reply_to naming THIS box is refused as self-addressed. Under the
+# old fixture C1's return address and the box's own identity were the same
+# string, so a legitimate cross-box return was indistinguishable from a
+# self-addressed one and C1/C3/E1/E3 failed. A FIXTURE THAT NAMES TWO ROLES
+# WITH ONE STRING PASSES UNTIL SOMETHING COMPARES THEM.
+# DEAD AS OF 2026-10-03, MEASURED NOT ASSUMED: this jail is overwritten by the
+# `tmp` one below before ANY arm runs — 0 check() calls sit between the two
+# `os.environ["HERMES_HOME"]` writes and `_home_jail` is referenced 0 times
+# after the second. It is kept only because its comment above explains WHY the
+# in-process arms need a jailed home at all. Its identity is matched to the
+# live jail so that a future reader who revives it does not reintroduce the
+# self-addressed collision described below.
 _home_jail = tempfile.mkdtemp(prefix="wren-testhome-")
 with open(os.path.join(_home_jail, "identity.json"), "w", encoding="utf-8") as _fh:
-    json.dump({"agent": "wren", "host": "ha-pi.local",
+    json.dump({"agent": "ash", "host": "will-ms-7b93.local",
                "peers": {"ash": {"host": "will-ms-7b93.local"},
                          "wren": {"host": "ha-pi.local"}}}, _fh)
+# Policy now lives in bot_peers (see the note at the G3/G4 jail), so this home
+# needs one too or every in-process arm refuses before routing is exercised.
+with open(os.path.join(_home_jail, "config.yaml"), "w", encoding="utf-8") as _fh:
+    _fh.write("bot_peers:\n  ash:\n    url: http://will-ms-7b93.local:8642\n"
+              "  wren:\n    url: http://ha-pi.local:8642\n")
 os.environ["HERMES_HOME"] = _home_jail
 
 import gateway.run as R  # noqa: E402
@@ -129,11 +150,28 @@ from gateway.handoff import DELIVERED, OPEN, HandoffStore  # noqa: E402
 # location defect, and it cost me a red C3 here.
 # The same home also needs a peers map, because #34 refuses any address it
 # cannot verify. The H arms below use their own throwaway homes.
+# WHOSE BOX IS THIS? The C/D/E arms describe a turn that RAN HERE
+# ("ash-local-session") whose reply must go BACK to wren, so this jail is
+# ASH'S box, not wren's. It said agent="wren" until 2026-10-03 and nothing
+# noticed, because no arm asked the box its own name. #81 adds an arm that
+# does: a reply_to naming THIS box is refused as self-addressed. Under the
+# old fixture C1's return address and the box's own identity were the same
+# string, so a legitimate cross-box return was indistinguishable from a
+# self-addressed one and C1/C3/E1/E3 failed. A FIXTURE THAT NAMES TWO ROLES
+# WITH ONE STRING PASSES UNTIL SOMETHING COMPARES THEM.
+#
+# AND NOTE WHICH JAIL IS LIVE: the `_home_jail` above is overwritten by this
+# one at the `os.environ["HERMES_HOME"] = tmp` below, so the C/D/E arms read
+# THIS identity.json, not that one. Two jails, one env var, last write wins —
+# editing the wrong one changes nothing and looks like a failed diagnosis.
 tmp = tempfile.mkdtemp(prefix="wren-route-")
 with open(os.path.join(tmp, "identity.json"), "w", encoding="utf-8") as _fh:
-    json.dump({"agent": "wren", "host": "ha-pi.local",
+    json.dump({"agent": "ash", "host": "will-ms-7b93.local",
                "peers": {"ash": {"host": "will-ms-7b93.local"},
                          "wren": {"host": "ha-pi.local"}}}, _fh)
+with open(os.path.join(tmp, "config.yaml"), "w", encoding="utf-8") as _fh:
+    _fh.write("bot_peers:\n  ash:\n    url: http://will-ms-7b93.local:8642\n"
+              "  wren:\n    url: http://ha-pi.local:8642\n")
 os.environ["HERMES_HOME"] = tmp
 path = os.path.join(tmp, "handoffs.jsonl")
 
@@ -164,6 +202,7 @@ FakeRunner._close_peer_handoff = R.GatewayRunner._close_peer_handoff
 # The REAL validator, not a stub. This is the point of F: the guard must sit
 # on the router's path so that faking the action method cannot bypass it.
 FakeRunner._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+FakeRunner._own_agent_name = R.GatewayRunner._own_agent_name
 
 
 async def drive():
@@ -258,13 +297,18 @@ async def drive():
     # different system. These cases use the real defaulted string.
     h6 = store.open_handoff(from_session="peer", to_session="s6",
                             requesting_user="peer", intent="live shape")
+    # The return address must name the OTHER box. This jail is ash's (see the
+    # identity note above), so the live-shape reply goes back to wren. It read
+    # agent="ash" while the jail also claimed to BE ash, which #81's
+    # self-addressed refusal correctly rejects — the arm was describing a box
+    # replying to itself and calling it the live shape.
     evt6 = {"type": "peer_completion", "session_id": "local", "text": "ack",
             "peer": "peer", "handoff_id": h6.id,
-            "reply_to": {"agent": "ash", "host": "will-ms-7b93.local"}}
+            "reply_to": {"agent": "wren", "host": "ha-pi.local"}}
     r6 = FakeRunner()
     ok6 = await r6._deliver_peer_completion(evt6)
     check("G1 THE LIVE SHAPE: peer='peer' + a KNOWN agent DELIVERS",
-          r6.returned == [("ash", "ack")],
+          r6.returned == [("wren", "ack")],
           f"returned={r6.returned} — this is the exact event the live guard "
           f"refused at 11:31:46; if this fails the chain is still broken")
     check("G2 and the row closes on that delivery", ok6 is True, f"got {ok6}")
@@ -279,6 +323,15 @@ async def drive():
     with open(os.path.join(jail2, "identity.json"), "w", encoding="utf-8") as fh:
         json.dump({"agent": "wren", "host": "ha-pi.local",
                    "peers": {"ash": {"host": "will-ms-7b93.local"}}}, fh)
+    # FIXTURE STALENESS, fixed 2026-10-02: policy moved from identity.json to
+    # bot_peers, so a jail that writes only identity.json now has NO peer table
+    # and every arm refuses at outcome 2 before the host arm is reached. That is
+    # the predicate working as designed; the jail was lying about the box. Each
+    # jail therefore needs a config.yaml carrying bot_peers. Verified by effect:
+    # with HERMES_HOME pointed at a temp dir, _load_peers() returns that dir's
+    # bot_peers and not the real box's four names.
+    with open(os.path.join(jail2, "config.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("bot_peers:\n  ash:\n    url: http://will-ms-7b93.local:8642\n")
     probe_src = f'''import os, sys
 os.environ["HERMES_HOME"] = {jail2!r}
 sys.path.insert(0, {TREE!r})
@@ -291,6 +344,7 @@ class F:
 
 
 F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+F._own_agent_name = R.GatewayRunner._own_agent_name
 f = F()
 print("KNOWN=" + repr(f._reply_to_is_trustworthy(
     {{"agent": "ash", "host": "will-ms-7b93.local"}}, {{"peer": "peer"}})))
@@ -345,6 +399,7 @@ class F:
 
 
 F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+F._own_agent_name = R.GatewayRunner._own_agent_name
 print("V=" + repr(F()._reply_to_is_trustworthy(
     {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
 '''
@@ -387,6 +442,7 @@ class F:
 
 
 F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+F._own_agent_name = R.GatewayRunner._own_agent_name
 f = F()
 print("HOSTBAD=" + repr(f._reply_to_is_trustworthy(
     {{"agent": "ash", "host": "attacker.example"}}, {{"peer": "peer"}})))
@@ -410,15 +466,27 @@ print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
           f"stdout={hr.stdout.strip()!r} — without this I1 passes against a "
           f"predicate that refuses everything")
 
-    # I3: the two refusals must not be the same line. Home with no policy
-    # (H-shape) vs home with a policy that says no (G3-shape).
+    # I3: THE FOUR OUTCOMES MUST BE FOUR DISTINGUISHABLE LINES, not two.
+    # Rewritten 2026-10-02 at Wren's instruction: the redesign has four
+    # outcomes, and the verdict (True/False) collapses three of them, so the
+    # log is the ONLY place the distinction exists. 118 refusal lines on
+    # will-MS-7B93 could not tell us which of these had fired, which is why
+    # the diagnosis took an hour. Two jails are needed because outcome 2 is a
+    # property of the box, not of the address.
     nopolicy = tempfile.mkdtemp(prefix="wren-logdist-")
     with open(os.path.join(nopolicy, "identity.json"), "w", encoding="utf-8") as fh:
         fh.write('{"agent": "wren", "peers": {}}')
+    # no config.yaml at all -> bot_peers unreadable/empty -> outcome 2
+    withpolicy = tempfile.mkdtemp(prefix="wren-logdist2-")
+    with open(os.path.join(withpolicy, "identity.json"), "w", encoding="utf-8") as fh:
+        json.dump({"agent": "wren", "peers": {"ash": {"host": "will-ms-7b93.local"}}}, fh)
+    with open(os.path.join(withpolicy, "config.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("bot_peers:\n  ash:\n    url: http://will-ms-7b93.local:8642\n"
+                 "  money:\n    url: http://ha-pi.local:8642/p/money\n")
     probe3_src = f'''import logging, os, sys
 os.environ["HERMES_HOME"] = {nopolicy!r}
 sys.path.insert(0, {TREE!r})
-logging.basicConfig(level=logging.ERROR, format="LOG:%(message)s")
+logging.basicConfig(level=logging.WARNING, format="LOG:%(message)s")
 import gateway.run as R
 
 
@@ -427,27 +495,59 @@ class F:
 
 
 F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
-print("V=" + repr(F()._reply_to_is_trustworthy(
+F._own_agent_name = R.GatewayRunner._own_agent_name
+print("OUT2=" + repr(F()._reply_to_is_trustworthy(
     {{"agent": "nobody-we-know", "host": "x"}}, {{"peer": "peer"}})))
+'''
+    probe4_src = f'''import logging, os, sys
+os.environ["HERMES_HOME"] = {withpolicy!r}
+sys.path.insert(0, {TREE!r})
+logging.basicConfig(level=logging.WARNING, format="LOG:%(message)s")
+import gateway.run as R
+
+
+class F:
+    pass
+
+
+F._reply_to_is_trustworthy = R.GatewayRunner._reply_to_is_trustworthy
+F._own_agent_name = R.GatewayRunner._own_agent_name
+f = F()
+print("OUT1=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "stranger", "host": "x"}}, {{"peer": "stranger"}})))
+print("OUT3=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "ash", "host": "evil.example"}}, {{"peer": "ash"}})))
+print("OUT4=" + repr(f._reply_to_is_trustworthy(
+    {{"agent": "money", "host": "ha-pi.local"}}, {{"peer": "money"}})))
 '''
     pp3 = os.path.join(nopolicy, "p.py")
     with open(pp3, "w", encoding="utf-8") as fh:
         fh.write(probe3_src)
     nr = _sp2.run([sys.executable, pp3], capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=180)
-    nopolicy_log = "".join(
-        l for l in (nr.stderr + nr.stdout).splitlines(True) if "LOG:" in l)
-    knownhome_log = "".join(
-        l for l in (hr.stderr + hr.stdout).splitlines(True)
-        if "LOG:" in l and "known peer" in l)
-    check("I3 'cannot verify' and 'not a known peer' are DIFFERENT log lines",
-          ("cannot verify" in nopolicy_log
-           and "known peer" in knownhome_log
-           and "cannot verify" not in knownhome_log),
-          f"nopolicy={nopolicy_log.strip()[:200]!r} "
-          f"knownhome={knownhome_log.strip()[:200]!r} — both refuse, so the "
-          f"verdict cannot tell them apart; the log is the only place the "
-          f"distinction exists and Ash asked for it explicitly")
+    pp4 = os.path.join(withpolicy, "p.py")
+    with open(pp4, "w", encoding="utf-8") as fh:
+        fh.write(probe4_src)
+    wr = _sp2.run([sys.executable, pp4], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=180)
+    all_log = nr.stderr + nr.stdout + wr.stderr + wr.stdout
+    # Each outcome's own phrase, and no two shared.
+    phrases = {
+        "outcome 1 not in bot_peers": "not a known peer on this box",
+        "outcome 2 no peer table": "no peer table to verify it against",
+        "outcome 3 host disagrees": "but this box knows",
+        "outcome 4 arm inert": "records no identity host for that peer",
+    }
+    missing = [k for k, v in phrases.items() if v not in all_log]
+    verdicts = ("OUT1=False" in wr.stdout and "OUT2=False" in nr.stdout
+                and "OUT3=False" in wr.stdout and "OUT4=True" in wr.stdout)
+    check("I3 the FOUR outcomes are FOUR distinguishable log lines",
+          not missing and verdicts,
+          f"missing={missing} verdicts_ok={verdicts} "
+          f"nr={nr.stdout.strip()!r} wr={wr.stdout.strip()!r} "
+          f"log={all_log[-400:]!r} — the verdict collapses three refusals into "
+          f"one False, so the log is the only discriminator; 118 lines on "
+          f"will-MS-7B93 could not say which outcome fired")
 
     check("H5 DISCRIMINATION: G3(known home)=False and H1(no home)=False are "
           "reached by DIFFERENT branches, and G4 proves the predicate still "
