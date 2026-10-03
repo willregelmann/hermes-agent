@@ -172,7 +172,8 @@ async def drive():
     check("D4 failed delivery returns False so the caller requeues",
           ok2 is False, f"got {ok2}")
     rows2 = [r for r in HandoffStore(path, author="r").all_latest() if r.id == h2.id]
-    check("D5 FAILED delivery LEAVES the row open (still owed)",
+    # (The literal below says "open (" in prose; the checker matches it.)
+    check("D5 FAILED delivery LEAVES the row open (still owed)",  # windows-footgun: ok
           rows2 and rows2[0].status == OPEN,
           f"status={rows2[0].status if rows2 else 'none'}")
     check("D6 NON-VACUITY: the two arms differ",
