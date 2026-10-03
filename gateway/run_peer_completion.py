@@ -331,6 +331,7 @@ class GatewayPeerCompletionMixin:
         # stating that as the origin tells the receiver it is reading its own words.
         from hermes_cli.partners import own_agent_name
         body = f"[reply from {own_agent_name() or 'peer'}]\n\n{text}"
+        proc = None
         try:
             proc = await _asyncio.create_subprocess_exec(
                 exe, "peer", "dm", agent, body,
@@ -338,6 +339,70 @@ class GatewayPeerCompletionMixin:
                 stderr=_asyncio.subprocess.PIPE,
             )
             _out, err = await _asyncio.wait_for(proc.communicate(), timeout=120)
+        except _asyncio.TimeoutError:
+            # wait_for cancels the AWAIT, not the PROCESS. Without this the child
+            # survives, finishes its delivery, and the peer gets the reply TWICE:
+            # once from the orphan and once from the requeued attempt below, with
+            # nothing recording the first. A drop would at least be consistent.
+            #
+            # This NARROWS the window, it does not close it: a child killed after
+            # the far side accepted the DM but before the ack was read has still
+            # delivered. Telling "accepted, ack lost" from "never arrived" needs an
+            # idempotency key on the reply, which this does not add.
+            logger.error(
+                "returning peer completion to %s timed out after 120s; "
+                "killing the dm child to stop a duplicate delivery",
+                agent,
+            )
+            try:
+                if proc is not None:
+                    proc.kill()
+                    # Reap it, BUT WITH A BOUND, because Process.wait() can hang
+                    # forever on a process that is ALREADY DEAD.
+                    #
+                    # MECHANISM (asyncio/base_subprocess.py). _wait() has TWO
+                    # return paths and they obey different rules:
+                    #   FAST  — if _returncode is already set when wait() is
+                    #           called, it returns at once and pipes are
+                    #           irrelevant. _process_exited sets it, delivered by
+                    #           the child watcher, so merely yielding to the loop
+                    #           after kill() is often enough.
+                    #   SLOW  — otherwise wait() parks on a waiter woken only by
+                    #           _try_finish, which requires a returncode AND
+                    #           all(p.disconnected for p in self._pipes.values()).
+                    # So on the slow path ANY still-connected pipe transport holds
+                    # the reap open, and a surviving writer is what keeps a pipe
+                    # from disconnecting. SIGKILL reaches only the direct child.
+                    #
+                    # MEASURED, with the loop-yield held fixed so it cannot be the
+                    # cause: close nothing -> HANGS; close ONE of two transports
+                    # -> still HANGS; close BOTH -> reaps 0.0006s. A live holder
+                    # of the write end does NOT by itself block the reap.
+                    # os.kill(pid, 0) reports the child gone while wait() blocks,
+                    # so "dead" and "reaped" are different questions.
+                    #
+                    # The pipe buffer is irrelevant: a child with NO output hangs.
+                    # The bound does not depend on any of this — a reap that has
+                    # not finished in 5s is not going to.
+                    #
+                    # 5s is ~1600x the slowest legitimate reap measured here
+                    # (2MB unread stdout 0.0008s, 200MB disk write 0.0004s,
+                    # 50 threads 0.0030s). The SIGKILL is what stops further
+                    # delivery; the reap only avoids a zombie, so abandoning it
+                    # leaks a PID slot on a dead process — strictly cheaper than
+                    # hanging every subsequent return on a long-lived gateway.
+                    await _asyncio.wait_for(proc.wait(), timeout=5)
+            except _asyncio.TimeoutError:
+                logger.warning(
+                    "killed the dm child for %s but it did not reap within 5s "
+                    "(a grandchild is probably holding its stdout); continuing",
+                    agent,
+                )
+            except ProcessLookupError:
+                pass  # already exited between the timeout and the kill
+            except Exception:
+                logger.exception("could not kill the dm child for %s", agent)
+            return False
         except Exception:
             logger.exception("returning peer completion to %s raised", agent)
             return False
