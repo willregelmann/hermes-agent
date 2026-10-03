@@ -1260,6 +1260,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Return a retryable response while the gateway drains existing work."""
         if not self._gateway_is_draining():
             return None
+        # The 503 goes to the caller and /health keeps serving 200 throughout a
+        # drain, so without this line the draining box keeps no record that it
+        # refused anything. A twelve-minute drain cost an hour of cross-host
+        # diagnosis for exactly that reason.
+        logger.warning(
+            "API server refused a request: 503 gateway_draining (external_drain=%s)",
+            bool(getattr(self, "_external_drain_active", False)),
+        )
         return _error_response(
             "Gateway is draining existing work; retry shortly.", 503, code="gateway_draining",
             headers={"Retry-After": "1"})
@@ -3821,9 +3829,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         inflight = self.active_agent_work_count()
         # The current request's own reservation must not consume its last available slot.
         reservation = _api_agent_request_reservation.get()
-        if reservation and reservation["active"]:
+        reservation_active = bool(reservation and reservation["active"])
+        if reservation_active:
             inflight -= 1
         if inflight >= limit:
+            # Log the COMPONENTS, not the total: pending=7/inflight=2 and
+            # pending=0/inflight=9 both reach 9, and a single "inflight=N" cannot
+            # tell them apart. The 429 goes to the caller, so without this the
+            # refusing box keeps no record of which counter was decisive.
+            # The components are raw; effective_inflight has the caller's own
+            # reservation subtracted, so pending+inflight_runs+run_tasks ==
+            # effective_inflight + reservation_active. Log the flag so the line
+            # reconciles with itself.
+            logger.warning(
+                "API server refused a run: 429 rate_limit_exceeded "
+                "(limit=%s effective_inflight=%s reservation_active=%s "
+                "pending=%s inflight_runs=%s run_tasks=%s)",
+                limit, inflight, reservation_active,
+                int(getattr(self, "_pending_agent_requests", 0)),
+                int(getattr(self, "_inflight_agent_runs", 0)),
+                sum(not task.done() for task in getattr(self, "_active_run_tasks", {}).values()),
+            )
             return _error_response(
                 f"Too many concurrent runs (max {limit})", 429, err_type="rate_limit_error",
                 code="rate_limit_exceeded", headers={"Retry-After": "1"})
