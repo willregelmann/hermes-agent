@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1842,3 +1843,34 @@ class TestGoogleChatStandaloneSend:
         assert kwargs["headers"]["Authorization"] == "Bearer the-token"
         assert kwargs["json"] == {"text": "hello cron"}
 
+
+
+class TestCanAttachLocalFiles:
+    """#86: the probe must agree with the credential choice ``_send_file`` makes, so a bare path is
+    only cut from the reply when an upload can actually be attempted."""
+
+    @staticmethod
+    def _source(chat_id="spaces/S"):
+        return SimpleNamespace(chat_id=chat_id)
+
+    def test_no_sender_token_and_no_legacy_client_is_false(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter._last_sender_by_chat["spaces/S"] = "alice@example.com"
+        adapter._user_chat_api = None
+        assert adapter.can_attach_local_files(self._source()) is False
+
+    def test_sender_token_file_is_true(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "google_chat_user_tokens").mkdir(parents=True)
+        (tmp_path / "google_chat_user_tokens" / "alice@example.com.json").write_text("{}")
+        adapter._last_sender_by_chat["spaces/S"] = "alice@example.com"
+        adapter._user_chat_api = None
+        assert adapter.can_attach_local_files(self._source()) is True
+        # A different sender in a different space has no token: the answer is per sender.
+        adapter._last_sender_by_chat["spaces/T"] = "bob@example.com"
+        assert adapter.can_attach_local_files(self._source("spaces/T")) is False
+
+    def test_legacy_client_is_true_for_unknown_sender(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter._user_chat_api = MagicMock()
+        assert adapter.can_attach_local_files(self._source("spaces/U")) is True
