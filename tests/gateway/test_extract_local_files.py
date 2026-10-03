@@ -222,3 +222,21 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestCodeSpanCopiesSurvive:
+    """A path detected in prose must not be deleted from a code span elsewhere in the text.
+
+    Live case 2026-10-03: "Replaces ~/x/B.md (queued) ... It replaces `~/x/B.md`" was
+    posted as "It replaces ``" because the prose match drove a global str.replace.
+    """
+
+    def test_prose_match_leaves_inline_code_copy(self):
+        paths, cleaned = _extract("Replaces ~/x/B.md (queued). It replaces `~/x/B.md`, see.")
+        assert paths == ["/home/user/x/B.md"]
+        assert "`~/x/B.md`" in cleaned
+
+    def test_prose_match_leaves_fenced_copy(self):
+        paths, cleaned = _extract("See /tmp/r.md now.\n```\ncat /tmp/r.md\n```\n")
+        assert paths == ["/tmp/r.md"]
+        assert "cat /tmp/r.md" in cleaned
