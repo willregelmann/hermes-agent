@@ -486,3 +486,37 @@ class TestEnvVarRegistration:
         assert info["category"] == "messaging"
         assert info["password"] is False
 
+
+
+class TestProxyTypingIndicator:
+    """The proxy path calls send_typing directly at turn start; typing_indicator=false must silence
+    it. The on arm is the contrast: the same proxied turn with the flag on types once."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled, expected", [(True, 1), (False, 0)])
+    async def test_proxy_turn_types_only_when_enabled(self, monkeypatch, enabled, expected):
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.config = PlatformConfig(enabled=True, token="t", typing_indicator=enabled)
+        adapter.send_typing = AsyncMock(return_value=None)
+        from gateway.platforms.base import BasePlatformAdapter
+        adapter.typing_if_enabled = lambda chat_id, metadata=None: BasePlatformAdapter.typing_if_enabled(
+            adapter, chat_id, metadata=metadata)
+        runner.adapters = {Platform.MATRIX: adapter}
+        runner._adapter_for_source = lambda source: adapter
+
+        resp = _FakeSSEResponse(status=200, sse_chunks=[
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'])
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(_FakeSession(resp)):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hi", context_prompt="", history=[], source=_make_source(),
+                        session_id="s-typing",
+                    )
+
+        assert result["final_response"] == "ok", "precondition: the proxied turn completed"
+        assert adapter.send_typing.await_count == expected

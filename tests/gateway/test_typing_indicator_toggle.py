@@ -84,3 +84,32 @@ async def test_typing_indicator_enabled_spawns_refresh_loop():
     assert adapter.send_typing.await_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_typing_indicator_disabled_spawns_no_refresh_loop():
+    """typing_indicator=False: the refresh loop never calls send_typing."""
+    adapter = _make_adapter(typing_indicator=False)
+
+    async def _slow_handler(_event):
+        await asyncio.sleep(0.05)
+        return "ok"
+
+    adapter._message_handler = _slow_handler
+    adapter._active_sessions[_sk()] = asyncio.Event()
+
+    await adapter._process_message_background(_make_event(), _sk())
+
+    assert adapter.send_typing.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled, expected", [(True, 1), (False, 0)])
+async def test_direct_typing_calls_honour_the_toggle(enabled, expected):
+    """The turn-start, retry and post-progress callers bypass ``_keep_typing``; they go through
+    ``typing_if_enabled``, so the toggle governs them too. Both arms run, so the off arm's 0 is a
+    contrast against the on arm's 1, not a mock that never fires."""
+    adapter = _make_adapter(typing_indicator=enabled)
+
+    await adapter.typing_if_enabled("C123", metadata={"thread_id": "t"})
+
+    assert adapter.send_typing.await_count == expected
+
