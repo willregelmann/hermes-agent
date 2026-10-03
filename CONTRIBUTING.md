@@ -947,6 +947,53 @@ refactor/description   # Code restructuring
 3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider macOS, Linux, and WSL2
 4. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.
 
+### Before merging
+
+These are checks on the **pull request**, not on the branch. A PR can be green,
+rebased and locally verified and still fail every one of them.
+
+1. **Read the review list, not your memory of having been reviewed.** Query the
+   reviews endpoint immediately before merging:
+
+   ```bash
+   gh api repos/OWNER/REPO/pulls/N/reviews --jq '.[] | "\(.id) \(.state) \(.user.login) \(.commit_id)"'
+   ```
+
+   An approval is a **cache keyed to a commit**, not a durable attestation. It is
+   silently separated from the bytes it approved by: a new push (`DISMISSED`), a
+   reopen (orphaned), a force-push, or being pinned to a sha that is no longer the
+   head. In every one of those cases the PR page still looks fine.
+
+2. **A review that is a file is not a review the PR can show.** A verdict written
+   to a branch, a relay file or a chat message is invisible to the reviews
+   endpoint, to the merge gate, and to everyone reading the PR afterwards — and if
+   that branch is deleted, the merge has no stated basis at all. Post the verdict
+   as a PR review (preferred) or at minimum as a PR comment, so the attestation
+   travels with the thing it attests.
+
+3. **Do not relay someone else's approval as your own report of it.** If a
+   reviewer's verdict reached you out of band, ask them to post it themselves.
+   Summarising another person's approval onto a permanent record puts words in
+   their mouth, and the reviews endpoint will still show nobody.
+
+4. **Count authors, not commits.** A PR with commits from two authors needs two
+   reviewers: nobody certifies their own bytes, including a one-line fixture fix
+   added during a rebase. Check with:
+
+   ```bash
+   gh api repos/OWNER/REPO/pulls/N/commits --jq '.[].commit.author.email' | sort -u
+   ```
+
+   Re-authoring someone's commit to simplify the bookkeeping launders authorship —
+   get a third reader instead.
+
+5. **A check-run read is valid only for the instant it ran.** Compare
+   `total_count` against the number of rows you actually received (paginate), and
+   count **distinct lane names** rather than rows — a lane can report several
+   times. Re-read immediately before merging: a red lane can appear between two
+   complete reads.
+
+
 ### PR description
 
 Include:
