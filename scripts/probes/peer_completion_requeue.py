@@ -29,10 +29,12 @@ import queue
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Repo root is two levels up from tests/gateway/, not one. My first version
-# used dirname(HERE) — which resolved to tests/ — and S1 correctly reported
-# the subject absent rather than skipping. The guard did its job on its
-# own author.
+# Repo root is two levels up from THIS FILE'S DIRECTORY, not one. The first
+# version used dirname(HERE) and S1 correctly reported the subject absent
+# rather than skipping -- the guard did its job on its own author.
+# Stated relative to __file__ on purpose: an earlier wording said "two levels
+# up from tests/gateway/", which stayed true-looking after this file moved to
+# scripts/probes/ only because that path is also two deep.
 TREE = os.environ.get("WATCHER_TREE",
                       os.path.dirname(os.path.dirname(HERE)))
 
