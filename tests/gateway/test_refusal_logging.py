@@ -22,7 +22,7 @@ import logging
 
 import pytest
 
-from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import APIServerAdapter, _api_agent_request_reservation
 
 
 class _Stub(APIServerAdapter):
@@ -107,3 +107,61 @@ def test_draining_503_silent_when_not_draining(caplog, stub_draining):
 
     assert response is None
     assert "gateway_draining" not in caplog.text
+
+
+@pytest.fixture
+def active_reservation():
+    """The caller holds its own admission slot, as inside a reserved request."""
+    token = _api_agent_request_reservation.set({"active": True})
+    try:
+        yield
+    finally:
+        _api_agent_request_reservation.reset(token)
+
+
+def _parse_fields(text):
+    line = next(l for l in text.splitlines() if "rate_limit_exceeded" in l)
+    body = line[line.index("(") + 1:line.rindex(")")]
+    return dict(kv.split("=", 1) for kv in body.split())
+
+
+def test_reservation_does_not_refuse_its_own_holder(caplog, active_reservation):
+    """Components summing to exactly ``limit`` include the caller's own slot:
+    the caller must be admitted, and nothing logged (Wren, review 5399008183)."""
+    adapter = _Stub(pending=3, inflight=2, limit=5)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"):
+        response = adapter._concurrency_limited_response()
+
+    assert response is None, "the caller's own reservation refused the caller"
+    assert "rate_limit_exceeded" not in caplog.text
+
+
+def test_reservation_refusal_line_reconciles_with_itself(caplog, active_reservation):
+    """With a reservation active the raw components sum to effective_inflight + 1;
+    the line must carry reservation_active so a reader can reconcile it instead of
+    guessing between the reservation and a sampling skew."""
+    adapter = _Stub(pending=4, inflight=2, limit=5)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"):
+        response = adapter._concurrency_limited_response()
+
+    assert response is not None and response.status == 429
+    f = _parse_fields(caplog.text)
+    assert f["reservation_active"] == "True", f
+    parts = int(f["pending"]) + int(f["inflight_runs"]) + int(f["run_tasks"])
+    assert parts == int(f["effective_inflight"]) + 1, f
+
+
+def test_no_reservation_line_reconciles_exactly(caplog):
+    """Control for the reconciliation arm: without a reservation the components
+    sum to effective_inflight exactly and the flag says so."""
+    adapter = _Stub(pending=7, inflight=2, limit=5)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.api_server"):
+        adapter._concurrency_limited_response()
+
+    f = _parse_fields(caplog.text)
+    assert f["reservation_active"] == "False", f
+    parts = int(f["pending"]) + int(f["inflight_runs"]) + int(f["run_tasks"])
+    assert parts == int(f["effective_inflight"]), f
