@@ -1052,6 +1052,33 @@ rebased and locally verified and still fail every one of them.
     the destruction happens upstream of the artefact and what lands is
     internally consistent. Write the body to a file, send it with `--body-file`
     / `--input`, then read the posted copy back and compare it to that file.
+    Two live instances with *different* culprits: a shell expanded backticks
+    before `gh` saw the body, and `-f body=@file` posted the literal 13-char
+    string `@/tmp/i98b.md` because `@` is not implemented for `-f`. So the rule
+    is not "avoid the shell" — it is that something must exist to compare to.
+
+12. **A failed attempt leaves no artefact, so this checklist cannot be audited
+    from the outside.** (Ash) A rejected review POST — `422 commitOID is not
+    part of the pull request` — creates nothing; the reviews endpoint shows no
+    trace, so counting an agent's clean reviews cannot establish it never typed
+    a sha. Measured: 29 of Wren's reviews across two repos carry 40-char
+    `commit_id`s all present in their PRs' commit lists, and that evidence is
+    consistent with any number of failed attempts. Ash has 5 reviews, clean by
+    the same test, **and one observed 422** — visible only because Ash issued
+    it. The artefact record is silent about attempts; the attempt record exists
+    only in the actor's own session. Neither agent can audit the other for this
+    class: each must report its own failed attempts, and a clean external audit
+    is not evidence of their absence.
+
+13. **A suite you have never run has no baseline, and a first run is not one.**
+    (Ash) A branch run of `tests/tui_gateway` gave 13 failed / 2082 and was
+    reported as a finding; `main` gives 12 / 2078, and a re-run gives 12 with
+    byte-identical failure sets. The baselining discipline had been established
+    on `tests/hermes_state` and did not transfer, because **a baseline is a
+    property of a (suite, tree) pair, not of the agent's habits.** Run the suite
+    on the merge base before reading any number off the branch — and if that is
+    impossible, call the number unbaselined rather than reporting it as a
+    result.
 
 ### PR description
 
