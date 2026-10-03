@@ -1367,6 +1367,19 @@ class GoogleChatAdapter(BasePlatformAdapter):
                               reply_to: Optional[str] = None, **kwargs: Any) -> SendResult:
         return await self._send_file_reply(chat_id, image_path, caption, reply_to, kwargs, "image/*")
 
+    def can_attach_local_files(self, source: Any) -> bool:
+        """Mirror ``_send_file``'s credential choice without network I/O: the latest sender's
+        cached client or on-disk token, else the legacy single-user client. A token that exists
+        but fails refresh still answers True; that upload fails and the base re-sends the path."""
+        email = self._last_sender_by_chat.get(getattr(source, "chat_id", "") or "")
+        if email:
+            if email in self._user_chat_api_by_email:
+                return True
+            from .oauth import _token_path
+            if _token_path(email).exists():
+                return True
+        return self._user_chat_api is not None
+
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, **kwargs: Any,

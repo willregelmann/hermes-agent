@@ -3007,6 +3007,20 @@ class BasePlatformAdapter(ABC):
         if problem is not None:
             logger.debug("[%s] Could not send media-delivery-failure notice: %s", self.name, problem)
 
+    async def _restore_local_path(self, chat_id: str, path: str, *,
+                                  metadata: Optional[Dict[str, Any]] = None) -> None:
+        """A bare path was cut from the already-sent text and its upload failed: re-send the path
+        itself. Content, not a diagnostic, so it bypasses the warning gate (#86, Hearth NC7: an
+        outbound step that altered the reply must not look delivered)."""
+        try:
+            result = await self.send(chat_id, f"Couldn't attach the file; it is on the host at `{path}`",
+                                     metadata=metadata)
+            problem = None if result.success else result.error
+        except Exception as err:
+            problem = err
+        if problem is not None:
+            logger.warning("[%s] Could not re-send stripped local path %s: %s", self.name, path, problem)
+
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -3025,6 +3039,13 @@ class BasePlatformAdapter(ABC):
         return [
             (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
             if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path"))]
+
+    def can_attach_local_files(self, source: SessionSource) -> bool:
+        """Whether a bare local path in a reply to ``source`` can become a native attachment.
+        False keeps the path in the text: extraction deletes it before any upload, so an adapter
+        that knows the upload cannot happen (Google Chat without the sender's user OAuth) would
+        otherwise deliver the reply with the path silently gone (#86)."""
+        return True
 
     @staticmethod
     def filter_local_delivery_paths(file_paths, session_key: str = "") -> List[str]:
@@ -4064,7 +4085,10 @@ class BasePlatformAdapter(ABC):
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
-                await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
+                if media_tag:
+                    await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
+                else:
+                    await self._restore_local_path(chat_id, path, metadata=metadata)
             return result
         queue = [(p, v, True) for p, v in media_files if v or not _as_image(p)]
         if queue:
@@ -4208,7 +4232,7 @@ class BasePlatformAdapter(ABC):
             if images:
                 logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
             local_files = []
-            if not is_ephemeral_response:
+            if not is_ephemeral_response and self.can_attach_local_files(event.source):
                 local_files, text_content = self.extract_local_files(text_content)
                 local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
         history = (await self._bounded_history_media_paths_for_session(session_key)
