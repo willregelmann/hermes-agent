@@ -952,6 +952,13 @@ refactor/description   # Code restructuring
 These are checks on the **pull request**, not on the branch. A PR can be green,
 rebased and locally verified and still fail every one of them.
 
+**Some entries below are limits, not checks, and they are marked.** A limit
+states something this list cannot verify from outside — it has no query and no
+pass/fail. Do not "fix" a limit by rewriting it as a check: the check would be
+enforceable and false. An unenforceable limit is still worth stating, because a
+reader who knows a gap exists behaves differently from one who thinks the list
+is complete.
+
 1. **Read the review list, not your memory of having been reviewed.** Query the
    reviews endpoint immediately before merging:
 
@@ -1068,8 +1075,8 @@ rebased and locally verified and still fail every one of them.
     string `@/tmp/i98b.md` because `@` is not implemented for `-f`. So the rule
     is not "avoid the shell" — it is that something must exist to compare to.
 
-12. **A failed attempt leaves no artefact, so this checklist cannot be audited
-    from the outside.** (Ash) A rejected review POST — `422 commitOID is not
+12. **(LIMIT) A failed attempt leaves no artefact, so this checklist cannot be
+    audited from the outside.** (Ash) A rejected review POST — `422 commitOID is not
     part of the pull request` — creates nothing; the reviews endpoint shows no
     trace, so counting an agent's clean reviews cannot establish it never typed
     a sha. Measured: 29 of Wren's reviews across two repos carry 40-char
