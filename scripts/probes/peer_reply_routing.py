@@ -95,7 +95,7 @@ _probe = (
     "from hermes_cli.subcommands.peer import _self_origin;"
     "print('RESULT=' + repr(_self_origin()))" % (jail, TREE)
 )
-_r = _sp.run([sys.executable, "-c", _probe], capture_output=True, text=True, timeout=120)
+_r = _sp.run([sys.executable, "-c", _probe], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
 blank_line = [l for l in _r.stdout.splitlines() if l.startswith("RESULT=")]
 check("B3 the jailed probe actually ran (non-vacuity)",
       bool(blank_line), f"stdout={_r.stdout[-200:]!r} stderr={_r.stderr[-200:]!r}")
@@ -301,7 +301,7 @@ print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
     with open(probe_path, "w", encoding="utf-8") as fh:
         fh.write(probe_src)
     pr = _sp2.run([sys.executable, probe_path], capture_output=True,
-                  text=True, timeout=180)
+                  text=True, encoding="utf-8", errors="replace", timeout=180)
     out = pr.stdout
     check("G3 CONTROL: with a real identity.json, an UNKNOWN agent is REFUSED",
           "UNKNOWN=False" in out,
@@ -351,7 +351,7 @@ print("V=" + repr(F()._reply_to_is_trustworthy(
         pp = os.path.join(hj, "p.py")
         with open(pp, "w", encoding="utf-8") as fh:
             fh.write(src)
-        rr = _sp2.run([sys.executable, pp], capture_output=True, text=True,
+        rr = _sp2.run([sys.executable, pp], capture_output=True, text=True, encoding="utf-8", errors="replace",
                       timeout=180)
         check(f"{label} -> an unverifiable address is REFUSED",
               "V=False" in rr.stdout,
@@ -398,7 +398,7 @@ print("UNKNOWN=" + repr(f._reply_to_is_trustworthy(
     pp2 = os.path.join(jail2, "probe_host.py")
     with open(pp2, "w", encoding="utf-8") as fh:
         fh.write(probe2_src)
-    hr = _sp2.run([sys.executable, pp2], capture_output=True, text=True,
+    hr = _sp2.run([sys.executable, pp2], capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=180)
     check("I1 a KNOWN agent declaring the WRONG HOST is REFUSED",
           "HOSTBAD=False" in hr.stdout,
@@ -433,7 +433,7 @@ print("V=" + repr(F()._reply_to_is_trustworthy(
     pp3 = os.path.join(nopolicy, "p.py")
     with open(pp3, "w", encoding="utf-8") as fh:
         fh.write(probe3_src)
-    nr = _sp2.run([sys.executable, pp3], capture_output=True, text=True,
+    nr = _sp2.run([sys.executable, pp3], capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=180)
     nopolicy_log = "".join(
         l for l in (nr.stderr + nr.stdout).splitlines(True) if "LOG:" in l)

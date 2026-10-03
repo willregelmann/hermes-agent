@@ -657,6 +657,14 @@ select = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.
 "tests/**" = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
+# Standalone probes, run by hand as scripts and never imported by the gateway.
+# They carry the same exemptions as tests/** because they ARE the same code --
+# relocated out of tests/ in #90 so pytest stops collecting them. They DO run
+# event loops of their own via asyncio.run(), so the ASYNC rules are not
+# vacuous here; they are relaxed because a probe blocking its own private loop
+# delays only itself, never a live turn. PLW1514 stays relaxed for the same
+# reason tests/** has it.
+"scripts/probes/**" = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
 # Skills and plugins are partially user-authored — their own conventions.
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
