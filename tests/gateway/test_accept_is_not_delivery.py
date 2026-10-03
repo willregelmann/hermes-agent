@@ -168,4 +168,15 @@ if FAILED:
     for f in FAILED:
         print(f"  RED: {f}")
 print("=" * 72)
-sys.exit(1 if FAILED else 0)
+
+
+def test_accept_is_not_delivery() -> None:
+    """A 202 accept is not a delivery; the row stays open.
+
+    The cases above run at import; this asserts their verdict. A module-scope
+    sys.exit() raises SystemExit during collection, which pytest reports as
+    INTERNALERROR and "no tests ran" -- aborting the entire directory even
+    when every case passed.
+    """
+    assert PASSED, "no cases ran at all -- the probe body did not execute"
+    assert not FAILED, "red cases: " + "; ".join(FAILED)
