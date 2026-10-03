@@ -528,7 +528,7 @@ print("OUT4=" + repr(f._reply_to_is_trustworthy(
     pp4 = os.path.join(withpolicy, "p.py")
     with open(pp4, "w", encoding="utf-8") as fh:
         fh.write(probe4_src)
-    wr = _sp2.run([sys.executable, pp4], capture_output=True, text=True,
+    wr = _sp2.run([sys.executable, pp4], capture_output=True, text=True, encoding="utf-8", errors="replace",
                   timeout=180)
     all_log = nr.stderr + nr.stdout + wr.stderr + wr.stdout
     # Each outcome's own phrase, and no two shared.
