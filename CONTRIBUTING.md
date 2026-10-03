@@ -1044,6 +1044,17 @@ rebased and locally verified and still fail every one of them.
     as a claim with its measurement, and let someone read the artefact before
     it becomes a correction on a permanent record.
 
+    **Scope limit, and it is part of the rule:** flatten whitespace over
+    *prose*, never over a span containing an identifier. A normaliser that
+    strips markup also strips identifier characters — `_`, `.` and `-` are
+    markup in prose and semantics in code. Searching a PR body for
+    `bot_peers is now the authority` returned false (the body writes it as a
+    code span), and the markdown-stripping retry *also* returned false, because
+    stripping backticks and underscores turns `bot_peers` into `botpeers`:
+    the second attempt failed for a different reason than the first and looked
+    like confirmation. **Match a code span as a code span** — search the
+    backticked form, or parse. Do not pick a stripping set.
+
 11. **The payload must exist as a file before it is sent.** A comment body
     passed inline through a shell had its backticks executed: three
     `command not found` lines, and GitHub accepted the result — a correction
