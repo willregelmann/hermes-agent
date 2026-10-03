@@ -1082,7 +1082,14 @@ def _clear_lock_holder_record(handle) -> None:
 
 def _lock_holder_provably_dead(record) -> bool:
     """True ONLY when the recorded holder is provably dead or PID-recycled.  Anything indeterminate
-    (no/malformed record, PID owned by another user, /proc unavailable) is False: FAIL CLOSED and defer."""
+    (no/malformed record, PID owned by another user, /proc unavailable) is False: FAIL CLOSED and defer.
+
+    Liveness goes through ``gateway.status._pid_exists`` rather than ``os.kill(pid, 0)``: on Windows
+    that signal delivers ``CTRL_C_EVENT`` to the holder's whole console process group (bpo-14484), so
+    the probe for "is the holder still alive" could terminate the holder — and the caller unlinks the
+    lock file six lines later, making the guard manufacture the condition it then acts on.
+    ``_pid_exists`` keeps EPERM-means-alive, so a PID owned by another user still reaches the
+    start-ticks comparison and only a genuine recycle (different start time) returns True."""
     try:
         pid = int(record["pid"])
     except (KeyError, TypeError, ValueError):
@@ -1090,11 +1097,12 @@ def _lock_holder_provably_dead(record) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False  # PermissionError et al.: PID exists (or unknowable) — closed
+        from gateway.status import _pid_exists
+        alive = _pid_exists(pid)
+    except Exception:
+        return False  # cannot probe -> indeterminate -> fail closed
+    if not alive:
+        return True  # provably dead (or a zombie, which cannot be holding a live fd)
     recorded_ticks = record.get("start_ticks")
     if recorded_ticks is None:
         return False

@@ -87,10 +87,16 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        # NOT os.kill(pid, 0): on Windows that sends CTRL_C_EVENT to the target's whole
+        # console process group (bpo-14484), so the liveness probe can kill the process it
+        # is checking plus unrelated siblings — and `_terminate_pid` polls this in a
+        # `while _pid_alive(pid)` loop, which would signal the group on every iteration.
+        from gateway.status import _pid_exists
+        return bool(_pid_exists(pid))
+    except Exception:
+        # Cannot probe: report alive. `_terminate_pid`'s loop is deadline-bounded and
+        # escalates to SIGKILL, so this defers rather than spinning.
         return True
-    except Exception as exc:
-        return isinstance(exc, PermissionError)
 
 
 def _signal_pid(pid: int, sig: int, label: str) -> bool:
