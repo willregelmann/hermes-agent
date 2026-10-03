@@ -359,16 +359,20 @@ class GatewayPeerCompletionMixin:
                     proc.kill()
                     # Reap it, BUT WITH A BOUND. asyncio's Process.wait() returns
                     # when the process has exited AND every holder of its stdout
-                    # pipe has let go. SIGKILL kills only the direct child, so any
-                    # surviving grandchild holding inherited stdout hangs this
-                    # wait forever on a child that is already dead.
+                    # pipe OTHER THAN the process we killed has let go. SIGKILL
+                    # reaches only the direct child, so any OTHER survivor holding
+                    # that inherited write end hangs this wait forever on a child
+                    # that is already dead. The dead child's own fd does not block
+                    # the reap — the predicate is about OTHER holders (Wren).
                     #
-                    # This is the COMMON case, not an edge case: a shell execs a
-                    # lone final command, but anything else leaves a grandchild.
-                    # Measured — `sh -c "sleep 30"` (no output at all) hangs,
-                    # with the holder identified by name from /proc/*/fd;
-                    # `sh -c "exec sleep 30"` reaps in 0.0007s. The pipe buffer
-                    # is irrelevant.
+                    # A surviving grandchild is the COMMON instance, not the rule:
+                    # a shell execs a lone final command, but anything else leaves
+                    # one. Measured — `sh -c "sleep 30"` (no output at all) hangs,
+                    # holders named from /proc/*/fd; `sh -c "exec sleep 30"` reaps
+                    # in 0.0007s. A DIRECT child with no grandchild also hangs if
+                    # an unrelated process was handed the same write end, and
+                    # reaps in 0.0006s when it was not. The pipe buffer is
+                    # irrelevant: "other holder" predicted hang/reap in 4/4 arms.
                     #
                     # 5s is ~1600x the slowest legitimate reap measured here
                     # (2MB unread stdout 0.0008s, 200MB disk write 0.0004s,
