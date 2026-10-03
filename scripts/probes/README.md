@@ -8,16 +8,25 @@ python scripts/probes/peer_completion_e2e.py
 
 They live outside `tests/` on purpose. Two reasons, both load-bearing.
 
-## 1. They assert on source text, which is banned inside `tests/`
+## 1. They test source *shape*, which is banned inside `tests/`
 
-Each of these opens a `.py` file and asserts on its contents:
+Each opens a `.py` file and makes its verdict depend on the text:
 
 ```python
 api_src = open(api_py, encoding="utf-8").read()
+check("the router sets reply_to on the outbound extra",
+      'extra["reply_to"] = origin' in peer_src)
 ```
 
-`AGENTS.md` bans that outright under *"Never read source code in tests"* — such a
-check passes when the implementation is subtly broken (the regex matches a
+Note the form. Two of the three contain **zero `assert` statements** — the
+substring test is an expression passed to a `check()` helper that prints
+PASS/FAIL and records the verdict. So grepping for `assert.*src` finds nothing
+and clears a file that is wholly built on source matching. **A file can test
+source shape with no asserts in it**; the question to ask is not "does it assert
+on source text" but *what is every variable read from a `.py` file used for*.
+
+`AGENTS.md` bans this outright under *"Never read source code in tests"* — such
+a check passes when the implementation is subtly broken (the match hits a
 mis-wired call site), fails on correct refactors, and blocks structural cleanup.
 As a **probe** the same read is honest: it is explicitly a statement about the
 shape of the source at a moment in time, not a behaviour contract.
