@@ -87,10 +87,24 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        # NOT os.kill(pid, 0): on Windows that sends CTRL_C_EVENT to the target's whole
+        # console process group (bpo-14484), so the liveness probe can kill the process it
+        # is checking plus unrelated siblings — and `_terminate_pid` polls this in a
+        # `while _pid_alive(pid)` loop, which would signal the group on every iteration.
+        from gateway.status import _pid_exists
+        return bool(_pid_exists(pid))
+    except Exception:
+        # Cannot probe: report alive. Safe at BOTH callers, for two DIFFERENT reasons --
+        # a polarity flip is only safe if every caller tolerates it (Wren, review
+        # 5401321817):
+        #   `_terminate_pid`: its wait loop is deadline-bounded and escalates to SIGKILL,
+        #     so a spurious True defers a shutdown by at most the timeout, never hangs.
+        #   `reconcile_startup_orphan`: a spurious True falls through to the IDENTITY
+        #     check, not to a signal. `is_compute_host_identity` requires
+        #     "tui_gateway.compute_host" in `_pid_command(pid)`, and an unreadable
+        #     cmdline yields "" -> False -> "pid-reuse-ignored". The identity check is
+        #     what carries assume-alive here; the deadline is irrelevant on that path.
         return True
-    except Exception as exc:
-        return isinstance(exc, PermissionError)
 
 
 def _signal_pid(pid: int, sig: int, label: str) -> bool:
