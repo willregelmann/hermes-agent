@@ -993,6 +993,65 @@ rebased and locally verified and still fail every one of them.
    times. Re-read immediately before merging: a red lane can appear between two
    complete reads.
 
+6. **A negative repeated is not a negative confirmed when every attempt shares
+   the same wrong assumption.** Six `404`s on one review id across two
+   repositories and three API namespaces read as conclusive *because* of the
+   volume; the object was live at `pulls/6/reviews` the whole time. Every
+   attempt had inherited the same guess about which collection owned it, so the
+   attempts were not independent and the repetition measured nothing. Before
+   concluding a thing does not exist, change the **assumption**, not the
+   parameters: search by content rather than by identifier, or query a
+   collection you have not tried. Volume reads as thoroughness and is not.
+
+7. **Search the right population, and state its size.** A negative result is
+   only as wide as the corpus it searched, and wider in the *wrong* population
+   is worse than narrow, because the larger number reads as diligence. A
+   "0 hits" over two files (4,105 chars) became 28 hits over the full corpus
+   (104,096 chars) — one of them written by the searcher. Two traps:
+   a corpus selected by *mention* of a subject is not that subject's authored
+   text (filter to authored rows, never to rows containing the string), and in a
+   store that logs its own queries the **instrument's own output enters the
+   corpus it searches**, inflating counts toward whatever was just looked for.
+   Quote the corpus size with the result so a reader can judge the claim.
+
+8. **Never let `||` carry a conclusion, only a status.** `git fetch … || echo
+   "force-push or divergence"` turned "could not look" into "looked and found
+   the opposite" — a fabricated finding with a plausible commit attached
+   instead of an error. The same shape hides in `cd "$VAR" || exit 1`, which
+   with `$VAR` empty returns 0 and stays put. Let the command fail loudly, or
+   print only what the exit code establishes.
+
+9. **A later review does not inherit the earlier one's open items.** GitHub
+   silently allows `APPROVED` to land on top of the same author's unaddressed
+   `CHANGES_REQUESTED` — twice in one day here, once on byte-identical commits
+   six minutes apart, with no intervening push and *nothing anomalous on the
+   PR page*. The only artefact of the failure is the review list itself. This
+   does not need two reviewers or two opinions: a single agent re-posting its
+   own stale copy manufactures the block it then approves over. Re-read your own
+   earlier reviews on the PR before adding another, and run check 1 against the
+   endpoint rather than against your account of what you did.
+
+10. **A claim about the shape of a sentence is a second measurement.** Two
+    instrument failures here, both alleging a defect that did not exist: a
+    substring test over hard-wrapped prose tests the *wrapping*, not the
+    content (`"I\naccept that…"` — flatten whitespace first), and
+    "X constrains A, not B" denies X of B and says nothing about what else
+    constrains B. The common cause is worth more than either rule: a matcher
+    written to find the thing already suspected can only fail toward "something
+    is broken". When a test's possible outcomes are an alleged defect or
+    silence, it is not a test. That applies hardest to a **self**-accusation,
+    which is the claim least likely to be challenged by anyone else — state it
+    as a claim with its measurement, and let someone read the artefact before
+    it becomes a correction on a permanent record.
+
+11. **The payload must exist as a file before it is sent.** A comment body
+    passed inline through a shell had its backticks executed: three
+    `command not found` lines, and GitHub accepted the result — a correction
+    *about sha provenance* published with every sha silently removed. A parser
+    error that still produces an artefact defeats read-back-and-compare, because
+    the destruction happens upstream of the artefact and what lands is
+    internally consistent. Write the body to a file, send it with `--body-file`
+    / `--input`, then read the posted copy back and compare it to that file.
 
 ### PR description
 
