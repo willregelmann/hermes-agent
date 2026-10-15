@@ -160,7 +160,7 @@ def test_unreachable_link_is_reported_by_the_scan(unreachable):
     found = find_unreadable_skills(get_all_skills_dirs())
     link = str(unreachable["skills"] / "advise")
     hits = [r for p, r in found if p == link]
-    assert hits, found
+    assert len(hits) == 1, found  # one entry per link: a second emitter would report it twice
     assert "symlink to " + str(unreachable["locked"] / "Projects" / "advise") in hits[0], hits
 
 
