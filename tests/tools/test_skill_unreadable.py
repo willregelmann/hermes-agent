@@ -62,22 +62,72 @@ def test_prompt_index_names_the_unreadable_skill(home, name):
     from agent.prompt_builder import build_skills_system_prompt
     index = build_skills_system_prompt()
     assert "readable" in index  # precondition: the index was built at all
-    tail = index.split("present but can't be read", 1)
+    tail = index.split("Some skill paths can't be read", 1)
     assert len(tail) == 2 and name in tail[1], index
 
 
-def test_skill_view_says_unreadable_not_missing_for_an_untraversable_dir(home):
+def test_skill_view_points_at_an_untraversable_dir_instead_of_saying_not_found(home):
     from tools.skills_tool import skill_view
     out = json.loads(skill_view("lockeddir"))
     assert out["success"] is False
-    assert "can't be read" in out["error"] and "not found" not in out["error"], out
+    assert "can't be read" in out["error"] and str(home / "skills" / "finance" / "lockeddir") in out["error"], out
 
 
-def test_skill_manage_says_unreadable_not_missing(home):
+def test_skill_manage_points_at_an_untraversable_dir_instead_of_saying_not_found(home):
     from tools.skill_manager_tool import skill_manage
     out = json.loads(skill_manage(action="patch", name="lockeddir", old_string="Body.", new_string="New."))
     assert out["success"] is False
-    assert "can't be read" in out["error"] and "not found" not in out["error"], out
+    assert "can't be read" in out["error"] and str(home / "skills" / "finance" / "lockeddir") in out["error"], out
+
+
+def test_a_skill_inside_a_locked_category_points_at_the_category(home):
+    # Ash's probe on #99: with the whole category folder locked, the skill's own name never
+    # appears in any path, so an exact-name match finds nothing and "not found" came back.
+    from tools.skills_tool import skill_view
+    cat = home / "skills" / "finance"
+    os.chmod(cat, 0)
+    try:
+        out = json.loads(skill_view("readable"))
+    finally:
+        os.chmod(cat, 0o755)
+    assert out["success"] is False
+    assert "can't be read" in out["error"] and str(cat) in out["error"], out
+
+
+def test_a_locked_folder_is_not_claimed_to_be_a_skill(home):
+    # Ash's probe on #99: a locked folder with no skill in it was reported as
+    # "Skill 'stray' exists". A folder that can't be entered is only ever named as a folder.
+    # (skill_view's direct-path probe already fails on the EACCES itself; skill_manage reaches
+    # the not-found path, so it is the one that can make the false claim.)
+    from tools.skill_manager_tool import skill_manage
+    from tools.skills_tool import skills_list
+    stray = home / "skills" / "stray"
+    stray.mkdir()
+    os.chmod(stray, 0)
+    try:
+        out = json.loads(skill_manage(action="patch", name="stray", old_string="a", new_string="b"))
+        listed = json.loads(skills_list())["unreadable"]
+    finally:
+        os.chmod(stray, 0o755)
+    assert "may be inside one" in out["error"] and str(stray) in out["error"], out
+    assert "exists" not in out["error"], out
+    assert {"path": str(stray), "kind": "folder", "error": "Permission denied"} in listed, listed
+    assert [u["kind"] for u in listed if u["path"].endswith("lockedfile/SKILL.md")] == ["skill_file"], listed
+
+
+def test_a_skill_locked_after_the_first_build_is_named_in_the_next(home):
+    # The in-process index cache is shared by every session a long-lived gateway serves. A
+    # permission change after the first build must still reach the next session's prompt.
+    from agent.prompt_builder import build_skills_system_prompt
+    late = home / "skills" / "finance" / "readable"
+    first = build_skills_system_prompt()
+    assert str(late) not in first  # precondition: not named while readable
+    os.chmod(late, 0)
+    try:
+        second = build_skills_system_prompt()
+    finally:
+        os.chmod(late, 0o755)
+    assert str(late) in second.split("Some skill paths can't be read", 1)[1], second
 
 
 def test_a_readable_skill_is_not_reported(home):

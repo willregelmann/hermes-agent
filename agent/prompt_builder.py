@@ -1462,7 +1462,8 @@ def _build_skills_system_prompt_inner(
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
-            return cached
+    if cached is not None:
+        return cached + _unreadable_skills_note([skills_dir, *external_dirs], cached)
 
     def hides(frontmatter_name: str, skill_name: str, conditions: dict) -> bool:
         """Per-build visibility rule shared by every skill source (snapshot, scan, project, external)."""
@@ -1515,19 +1516,28 @@ def _build_skills_system_prompt_inner(
             category_descriptions.setdefault(cat, cat_desc)
 
     result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
-    unreadable = find_unreadable_skills([skills_dir, *external_dirs])
-    if unreadable:
-        # Named, so the agent says "there but unreadable" rather than treating the skill as never written.
-        result += ("\n\n" if result else "") + (
-            "These skills are present but can't be read (permission denied); they won't load until "
-            "their files are fixed. Tell the user rather than recreating them:\n"
-            + "\n".join(f"  - {p}: {reason}" for p, reason in unreadable))
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)
-    return result
+    return result + _unreadable_skills_note([skills_dir, *external_dirs], result)
+
+
+def _unreadable_skills_note(roots: "list[Path]", index: str) -> str:
+    """Names skill paths this process can't read, so the agent says "there but unreadable" rather
+    than treating a skill as never written. Computed on every build and kept OUT of the shared
+    index cache: a permission change must reach the next session in a long-lived process. Each
+    conversation freezes its own system prompt, so this never changes mid-conversation.
+    A folder that can't be entered may or may not hold skills, so it's worded as a folder."""
+    unreadable = find_unreadable_skills(roots)
+    if not unreadable:
+        return ""
+    return ("\n\n" if index else "") + (
+        "Some skill paths can't be read (permission denied). Skills there won't load until the files "
+        "are fixed; tell the user rather than recreating them:\n"
+        + "\n".join(f"  - {'skill file' if Path(p).name == 'SKILL.md' else 'folder'} {p}: {reason}"
+                    for p, reason in unreadable))
 
 
 def _truncate_content(
