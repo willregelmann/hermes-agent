@@ -210,7 +210,7 @@ scripts/run_tests.sh
 pytest tests/ -v
 ```
 
-**On this fork (willregelmann/hermes-agent), Python unit tests do not run in CI.** `tests.yml` gates the `Python tests / Run tests` job on `vars.HAS_LARGE_RUNNERS == 'true'`, which isn't true here, so the job is skipped (on PRs and on pushes to main) while "All required checks pass" still goes green. A green check means lints, e2e and macOS-only tests, not the pytest suite. Run the tests locally and cite the counts in the PR body; reviewers re-run them rather than rely on CI.
+**On this fork (willregelmann/hermes-agent), most test suites do not run in CI.** Every job that asks for a paid large runner is gated on `vars.HAS_LARGE_RUNNERS == 'true'`, which isn't true here, so these are skipped on PRs and on pushes to main while "All required checks pass" still goes green: the Python unit tests (`tests.yml` `Run tests`), JS & TS checks (`js-tests.yml`), Desktop Playwright E2E (`e2e-desktop.yml`), the Rust bootstrap-installer `cargo test` (`rust-tests.yml`), `nix flake check` (`nix.yml`) and the Windows-only tests (`tests-os.yml`). The list is `LARGE_RUNNER_JOBS` in `ci.yaml`, which also prints it as a warning on every run. A green check means lints, the Python e2e tests and macOS-only tests. Run the affected suites locally and cite the counts in the PR body; reviewers re-run them rather than rely on CI. (`ruff + ty diff` and the supply-chain scan are different: they're skipped only when a change doesn't need them, i.e. on pushes to main or when no relevant files changed.)
 
 ---
 
