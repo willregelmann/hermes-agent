@@ -10,6 +10,7 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 import contextvars as _ctxvars
 import hashlib
 import json
+import os
 from contextlib import ExitStack, suppress
 import logging
 import re
@@ -31,7 +32,8 @@ from agent.skill_utils import (
 from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
     _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
-    _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
+    _org_mirror_write_guard, _outside_roots_write_guard, _pinned_guard, _validate_delete_target,
+    _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
@@ -219,10 +221,12 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
 
 
 def _iter_skill_dirs(root: Path):
-    from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
-        if not is_excluded_skill_path(skill_md):
-            yield skill_md.parent
+    """Skill dirs under *root*: the same walk skills_list and skill_view use (it follows
+    symlinked dirs, which ``rglob`` does not, so a linked skill is never "not found" here
+    while it lists and views fine). Writes through a link are refused separately."""
+    from agent.skill_utils import iter_skill_index_files
+    for skill_md in iter_skill_index_files(root, "SKILL.md"):
+        yield skill_md.parent
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
@@ -357,7 +361,8 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
-    guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
+    guard = (_outside_roots_write_guard(name, skill_dir, action)
+             or (org_guard and _org_mirror_write_guard(name, skill_dir, action))
              or _background_review_write_guard(name, skill_dir, action))
     return (None, guard) if guard else (skill_dir, None)
 
@@ -429,6 +434,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     skill_dir = _resolve_skill_dir(name, category)
+    if os.path.lexists(skill_dir):  # e.g. a symlink whose target can't be reached: never write into it
+        return _err(f"A skill named '{name}' already exists at {skill_dir}, but can't be read; "
+                    f"see skills_list's 'unreadable' entries.")
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir)
     skill_md = skill_dir / "SKILL.md"

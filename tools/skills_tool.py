@@ -268,9 +268,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 def _unreadable_skills_report() -> List[Dict[str, str]]:
     """Skill dirs or SKILL.md files under the scanned roots that this process can't read.
     Listed so a skill that's there but unreadable is never reported as simply absent."""
-    from agent.skill_utils import find_unreadable_skills
+    from agent.skill_utils import find_unreadable_skills, unreadable_kind
     _, all_dirs, _ = _skill_search_dirs()
-    return [{"path": p, "kind": "skill_file" if Path(p).name == "SKILL.md" else "folder", "error": reason}
+    return [{"path": p, "kind": unreadable_kind(p), "error": reason}
             for p, reason in find_unreadable_skills(all_dirs)]
 
 
@@ -357,7 +357,11 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
 
     def _record_direct(direct_path: Path, search_root: Path) -> None:  # "mlops/axolotl" / "axolotl" or its flat .md sibling
         flat = direct_path.with_suffix(".md")
-        if not _is_skill_support_path(direct_path) and direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+        try:  # a symlink whose target can't be reached raises here; the not-found path names it
+            is_skill_dir = direct_path.is_dir() and (direct_path / "SKILL.md").exists()
+        except OSError:
+            is_skill_dir = False
+        if not _is_skill_support_path(direct_path) and is_skill_dir:
             _record(direct_path, direct_path / "SKILL.md")
         elif (flat.exists() and not _is_skill_support_path(flat)
               and not _is_package_owned_markdown(flat, search_root)):
