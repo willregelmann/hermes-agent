@@ -7,7 +7,9 @@ never runs. This job runs on ubuntu-latest instead, over a selection:
 * every test file named for a changed source file (``foo.py`` ->
   ``tests/**/test_foo.py``),
 * and, when that selects nothing, a fixed smoke set, so the job is never
-  vacuous.
+  vacuous;
+* plus, always, this job's own guard (tests/ci/test_select_fork_tests.py),
+  so a change that only touches the workflow still checks the job survived.
 
 ``--check-log`` reads the runner's output afterwards and fails unless it
 reports at least one passed test: a selection that ran nothing is a failure,
@@ -35,6 +37,11 @@ SMOKE = (
     "tests/ci/test_classify_changes.py",
 )
 
+# Run on every selection. It guards this job itself (ungated, on a free
+# runner, failing on zero passed). A sync that rewrites tests.yml changes
+# no .py file, so name-matching alone would never select the guard.
+ALWAYS = ("tests/ci/test_select_fork_tests.py",)
+
 # Directories run_tests_parallel.py skips by default; they need services this
 # runner doesn't have. Must equal run_tests_parallel._SKIP_PARTS (tested).
 SKIP_PARTS = {"integration", "e2e", "docker"}
@@ -61,7 +68,7 @@ def select(changed: list[str], tracked: list[str]) -> list[str]:
             picked.add(path)
         elif path.endswith(".py") and not path.startswith("tests/"):
             picked.update(by_name.get(f"test_{PurePosixPath(path).stem}.py", ()))
-    return sorted(picked) or list(SMOKE)
+    return sorted((picked or set(SMOKE)) | set(ALWAYS))
 
 
 def check_log(text: str) -> str | None:

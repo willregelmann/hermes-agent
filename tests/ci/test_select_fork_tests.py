@@ -33,27 +33,51 @@ TRACKED = [
 ]
 
 
+def _with_always(*files):
+    return sorted(set(files) | set(sel.ALWAYS))
+
+
 def test_a_touched_test_file_is_selected():
-    assert sel.select(["tests/tools/test_skill_unreadable.py"], TRACKED) == [
-        "tests/tools/test_skill_unreadable.py"]
+    assert sel.select(["tests/tools/test_skill_unreadable.py"], TRACKED) == _with_always(
+        "tests/tools/test_skill_unreadable.py")
 
 
 def test_a_changed_source_file_selects_every_same_named_test_outside_skipped_dirs():
-    assert sel.select(["tools/skills_tool.py"], TRACKED) == [
-        "tests/gateway/test_skills_tool.py", "tests/tools/test_skills_tool.py"]
+    assert sel.select(["tools/skills_tool.py"], TRACKED) == _with_always(
+        "tests/gateway/test_skills_tool.py", "tests/tools/test_skills_tool.py")
 
 
 def test_nothing_selected_falls_back_to_smoke():
     for changed in ([], ["README.md"], ["tests/conftest.py"], ["tests/tools/test_gone.py"],
                     ["tests/integration/test_skills_tool.py"]):
-        assert sel.select(changed, TRACKED) == list(sel.SMOKE), changed
+        assert sel.select(changed, TRACKED) == _with_always(*sel.SMOKE), changed
 
 
-def test_every_smoke_file_exists_in_the_tree():
+def test_the_guard_runs_on_a_change_that_only_touches_the_workflow():
+    # An upstream sync that rewrites tests.yml changes no .py file. The guard below must still run.
+    assert "tests/ci/test_select_fork_tests.py" in sel.ALWAYS
+    assert set(sel.ALWAYS) <= set(sel.select([".github/workflows/tests.yml"], TRACKED))
+
+
+def test_every_smoke_and_always_file_exists_in_the_tree():
     tracked = set(subprocess.run(["git", "ls-files", "tests"], cwd=_ROOT, check=True,
                                  capture_output=True, text=True).stdout.split())
     assert sel.SMOKE and set(sel.SMOKE) <= tracked
-    assert sel.select([], sorted(tracked)) == list(sel.SMOKE)
+    assert set(sel.ALWAYS) <= tracked
+    assert sel.select([], sorted(tracked)) == _with_always(*sel.SMOKE)
+
+
+def test_the_fork_tests_job_is_present_ungated_free_and_checked():
+    # The job this file guards: a sync that rewrites tests.yml must not drop it, gate it behind
+    # HAS_LARGE_RUNNERS, move it to a paid runner, or lose the zero-passed check.
+    import yaml
+    wf = yaml.safe_load((_ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    job = wf["jobs"].get("fork-tests")
+    assert job is not None, "tests.yml has no fork-tests job"
+    assert "if" not in job, job.get("if")
+    assert job["runs-on"] == "ubuntu-latest", job["runs-on"]
+    runs = "\n".join(s.get("run", "") for s in job["steps"])
+    assert "select_fork_tests.py --base" in runs and "select_fork_tests.py --check-log" in runs, runs
 
 
 def test_skipped_dirs_match_the_runner():
