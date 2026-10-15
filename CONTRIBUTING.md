@@ -210,6 +210,10 @@ scripts/run_tests.sh
 pytest tests/ -v
 ```
 
+**On this fork (willregelmann/hermes-agent), most test suites do not run in CI.** Every job that asks for a paid large runner is gated on `vars.HAS_LARGE_RUNNERS == 'true'`, which isn't true here, so these are skipped on PRs and on pushes to main while "All required checks pass" still goes green: the Python unit tests (`tests.yml` `Run tests`), JS & TS checks (`js-tests.yml`), Desktop Playwright E2E (`e2e-desktop.yml`), the Rust bootstrap-installer `cargo test` (`rust-tests.yml`), `nix flake check` (`nix.yml`) and the Windows-only tests (`tests-os.yml`). The list is `LARGE_RUNNER_JOBS` in `ci.yaml`, which also prints it as a warning on every run. A green check means lints, the Python e2e tests and macOS-only tests. Run the affected suites locally and cite the counts in the PR body; reviewers re-run them rather than rely on CI. (`ruff + ty diff` and the supply-chain scan are different: they're skipped only when a change doesn't need them, i.e. on pushes to main or when no relevant files changed.)
+
+A push by `foil290` has so far triggered no Actions run of its own (observed: no run triggered by the push itself for `788204cf`, `aa7f6f4e` or `7e3ef1dc`; runs that appeared later on such heads list `ash862` as their actor). So until someone else triggers a run, "All required checks pass" is absent on that head, not green. If the ruleset ever requires status checks, such heads can't merge without that. This is an observation on a few heads, not a documented rule.
+
 ---
 
 ## Project Structure
