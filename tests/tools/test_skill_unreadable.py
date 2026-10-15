@@ -177,10 +177,14 @@ def test_a_missing_skills_dir_is_not_unreadable(tmp_path):
 
 
 def test_a_symlinked_skill_whose_target_is_unreachable_is_reported(tmp_path):
-    # Tally's real failure on ha-pi (2026-10-11 .. 10-15, ~3d7h silent): the money profile's
+    # Tally's real failure on ha-pi (2026-10-11 .. 10-15, ~3d7h): the money profile's
     # skills/ held symlinks into another user's home, and that home was mode 0700. Every
     # endpoint was fine -- target dirs 755, SKILL.md 644 -- and the agent still had no
-    # procedure, with no notice anywhere. os.walk CANNOT see this: os.path.isdir() follows
+    # procedure. The DISCOVERY path was silent throughout: skills_list simply omitted the
+    # three, with no log line and no notice. (A direct skill_view did surface EACCES, so
+    # it was not silent everywhere -- but nothing tied that error to its cause, and
+    # nothing told the agent its skill set had shrunk.) os.walk CANNOT see this:
+    # os.path.isdir() follows
     # the link, the stat fails on the untraversable parent, so the entry is classified as a
     # non-directory, never scanned, and onerror never fires. The name is not "SKILL.md"
     # either, so the os.access() branch never runs. A SYMLINK IS VALIDATED BY THE WALK,
