@@ -210,6 +210,8 @@ scripts/run_tests.sh
 pytest tests/ -v
 ```
 
+**On this fork (willregelmann/hermes-agent), Python unit tests do not run in CI.** `tests.yml` gates the `Python tests / Run tests` job on `vars.HAS_LARGE_RUNNERS == 'true'`, which isn't true here, so the job is skipped (on PRs and on pushes to main) while "All required checks pass" still goes green. A green check means lints, e2e and macOS-only tests, not the pytest suite. Run the tests locally and cite the counts in the PR body; reviewers re-run them rather than rely on CI.
+
 ---
 
 ## Project Structure
