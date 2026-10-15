@@ -779,6 +779,20 @@ def iter_skill_index_files(skills_dir: Path, filename: str, unreadable: Optional
     # A missing skills dir is "no skills", not an unreadable one, so only an existing dir reports.
     onerror = _note_unwalkable if unreadable is not None and os.path.isdir(skills_dir_str) else None
     for root, dirs, files in os.walk(skills_dir_str, onerror=onerror, followlinks=True):
+        # os.walk classifies an entry by a FOLLOWED stat, so a symlink whose target is
+        # unreachable (target fine, a parent not traversable) lands in `files`, is never
+        # scanned, and never reaches onerror. Its name is not `filename` either, so the
+        # readability check below never sees it: the skill vanishes silently. Report the
+        # link itself -- a symlink is validated by the walk, not by its target.
+        if unreadable is not None:
+            for name in files:
+                p = os.path.join(root, name)
+                if not os.path.islink(p):
+                    continue
+                try:
+                    os.stat(p)
+                except OSError as err:
+                    unreadable.append((p, err.strerror or str(err)))
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
