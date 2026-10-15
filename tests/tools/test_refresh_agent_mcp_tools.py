@@ -481,3 +481,27 @@ def test_snapshot_rebuild_never_grants_message_agent_to_unauthorized_sessions(
         assert _message_agent_schema_count(agent) == 0
         assert "message_agent" not in agent.valid_tool_names
         _assert_tool_snapshot_coherent(agent)
+
+
+def test_eviction_rebuild_never_re_adds_a_config_disabled_tool(monkeypatch):
+    """A saved tool whose toolset is now disabled must not ride the pin back in.
+
+    The pin carries a registered tool the fresh build lacks, which is right for a
+    check_fn flap. A tool removed by ``agent.disabled_toolsets`` is also absent
+    from the fresh build and still registered, so without the selection check
+    every pre-existing session keeps (and executes) the disabled tool.
+    """
+    from tools import registry as registry_mod
+
+    saved = ["read_file", "web_search", "browser_navigate", "terminal"]
+    entries = {n: types.SimpleNamespace(name=n, schema=_tool(n)["function"]) for n in saved}
+    monkeypatch.setattr(registry_mod.registry, "get_all_entries", lambda: list(entries.values()), raising=False)
+    monkeypatch.setattr(registry_mod.registry, "get_entry", lambda name, **kw: entries.get(name), raising=False)
+
+    # web disabled by config; browser_navigate merely flapped its probe.
+    rebuilt = _agent(["read_file", "terminal"], disabled=["web"])
+    _mcp_agent.restore_agent_tool_prefix(rebuilt, saved)
+
+    names = [t["function"]["name"] for t in rebuilt.tools]
+    assert "web_search" not in names and "web_search" not in rebuilt.valid_tool_names
+    assert names == ["read_file", "browser_navigate", "terminal"]

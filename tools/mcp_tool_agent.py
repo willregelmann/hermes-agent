@@ -151,6 +151,12 @@ def persist_agent_tool_names(agent) -> None:
         logger.debug("tool_names persist skipped", exc_info=True)
 
 
+def _config_permitted_names(agent) -> set:
+    """Tool names this agent's toolset selection allows before ``check_fn``: all a pin may carry."""
+    from model_tools import _select_tool_names
+    return _select_tool_names(getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None), True)
+
+
 def restore_agent_tool_prefix(agent, saved_names: list) -> bool:
     """Fold a freshly built agent's ``tools`` onto the session's saved order; True if changed.
     After agent-cache eviction the gateway rebuilds a NEW AIAgent with no predecessor to
@@ -170,6 +176,12 @@ def restore_agent_tool_prefix(agent, saved_names: list) -> bool:
 
     saved_defs = [d for d in map(_saved_def, saved_names) if d is not None]
     registered_names = {entry.name for entry in registry.get_all_entries()}
+    # Carry a saved tool the fresh build lacks only while this agent's toolset selection
+    # still allows it: a check_fn flap keeps its slot, a config removal (disabled_toolsets,
+    # a narrowed platform_toolsets) does not come back.
+    carried = ({_def_name(d) for d in saved_defs} - set(fresh)) & registered_names
+    if carried:
+        registered_names -= carried - _config_permitted_names(agent)
     merged, merged_names = _merge_preserving_prefix(saved_defs, fresh_defs, registered_names)
     _reinject_authorized_dynamic_tools(agent, merged, merged_names)
     with _agent_tools_lock:
