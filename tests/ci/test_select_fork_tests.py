@@ -60,8 +60,8 @@ def test_the_guard_runs_on_a_change_that_only_touches_the_workflow():
 
 
 def test_every_smoke_and_always_file_exists_in_the_tree():
-    tracked = set(subprocess.run(["git", "ls-files", "tests"], cwd=_ROOT, check=True,
-                                 capture_output=True, text=True).stdout.split())
+    tracked = set(subprocess.run(["git", "ls-files", "tests"], cwd=_ROOT, check=True, capture_output=True,
+                                 text=True, encoding="utf-8").stdout.split())
     assert sel.SMOKE and set(sel.SMOKE) <= tracked
     assert set(sel.ALWAYS) <= tracked
     assert sel.select([], sorted(tracked)) == _with_always(*sel.SMOKE)

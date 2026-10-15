@@ -85,7 +85,8 @@ def check_log(text: str) -> str | None:
 
 
 def _git(*args: str) -> list[str]:
-    out = subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+    raw = subprocess.run(["git", *args], check=True, capture_output=True).stdout
+    out = raw.decode("utf-8", errors="replace")
     return [line for line in out.splitlines() if line]
 
 
