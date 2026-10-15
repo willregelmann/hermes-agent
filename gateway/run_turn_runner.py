@@ -676,7 +676,7 @@ class TurnRunner:
         ctx = self._ctx
         await asyncio.sleep(0.3)
         if ctx._run_still_current():
-            await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+            await st.adapter.typing_if_enabled(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
     async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
