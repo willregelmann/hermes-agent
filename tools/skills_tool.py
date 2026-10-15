@@ -246,18 +246,31 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
         if not all_skills:
+            unreadable = _unreadable_skills_report()
             return _json({"success": True, "skills": [], "categories": [],
-                          "message": "No skills found in skills/ directory."})
+                          "message": "No skills found in skills/ directory.",
+                          **({"unreadable": unreadable} if unreadable else {})})
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
         all_skills = _sort_skills(all_skills)
         categories = sorted({s.get("category") for s in all_skills if s.get("category")})
-        return _json({
+        result = {
             "success": True, "skills": all_skills, "categories": categories,
             "count": len(all_skills),
-            "hint": "Use skill_view(name) to see full content, tags, and linked files"})
+            "hint": "Use skill_view(name) to see full content, tags, and linked files"}
+        if unreadable := _unreadable_skills_report():
+            result["unreadable"] = unreadable
+        return _json(result)
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def _unreadable_skills_report() -> List[Dict[str, str]]:
+    """Skill dirs or SKILL.md files under the scanned roots that this process can't read.
+    Listed so a skill that's there but unreadable is never reported as simply absent."""
+    from agent.skill_utils import find_unreadable_skills
+    _, all_dirs, _ = _skill_search_dirs()
+    return [{"path": p, "error": reason} for p, reason in find_unreadable_skills(all_dirs)]
 
 
 def _resolve_plugin_skill(name, file_path, task_id, preprocess):
@@ -546,6 +559,10 @@ def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: l
                 hint="Inspect the skill in the repo checkout, or untrust the repo with "
                 "`hermes skills untrust`."), None, None
     if not skill_md or not skill_md.exists():
+        from agent.skill_utils import find_unreadable_skills, unreadable_skill_matching
+        if hit := unreadable_skill_matching(name, find_unreadable_skills(all_dirs)):
+            return _fail(f"Skill '{name}' exists but can't be read: {hit[1]} ({hit[0]}).",
+                         hint="Its files' owner or permissions need fixing; it is not missing."), None, None
         available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
         return _fail(f"Skill '{name}' not found.", available_skills=available,
                      hint="Use skills_list to see all available skills"), None, None

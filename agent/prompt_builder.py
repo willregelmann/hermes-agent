@@ -23,8 +23,8 @@ from agent.model_metadata import CHARS_PER_TOKEN
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS, ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE, SKILL_SUPPORT_DIRS,
-    extract_skill_conditions, extract_skill_description, get_all_skills_dirs, get_disabled_skill_names,
-    iter_skill_index_files, parse_frontmatter, read_active_org_id, skill_matches_environment,
+    extract_skill_conditions, extract_skill_description, find_unreadable_skills, get_all_skills_dirs,
+    get_disabled_skill_names, iter_skill_index_files, parse_frontmatter, read_active_org_id, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
@@ -1515,6 +1515,13 @@ def _build_skills_system_prompt_inner(
             category_descriptions.setdefault(cat, cat_desc)
 
     result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    unreadable = find_unreadable_skills([skills_dir, *external_dirs])
+    if unreadable:
+        # Named, so the agent says "there but unreadable" rather than treating the skill as never written.
+        result += ("\n\n" if result else "") + (
+            "These skills are present but can't be read (permission denied); they won't load until "
+            "their files are fixed. Tell the user rather than recreating them:\n"
+            + "\n".join(f"  - {p}: {reason}" for p, reason in unreadable))
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

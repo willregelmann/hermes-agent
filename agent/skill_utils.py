@@ -2,6 +2,7 @@
 Import-light by design: no tool registry, CLI config, or provider resolution."""
 
 import ast
+import errno
 import logging
 import os
 import re
@@ -758,16 +759,26 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
     return len(_normalize_skill_description(frontmatter)) > SKILL_PROMPT_DESC_LIMIT
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
+def iter_skill_index_files(skills_dir: Path, filename: str, unreadable: Optional[list] = None):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
     EXCLUDED_SKILL_DIRS and support dirs of skill roots. Org mirrors are
     TOKEN-GATED: only the active org's subdir is walked, so leaving an org
-    stops its skills resolving without manual cleanup."""
+    stops its skills resolving without manual cleanup.
+
+    With *unreadable* (a list), a directory the walk can't enter and a matching
+    file the process can't read are appended as ``(path, reason)`` and the file
+    is not yielded. Without it they vanish silently, which reads as "no such
+    skill" when the truth is "a skill is there and can't be read"."""
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+
+    def _note_unwalkable(err: OSError) -> None:
+        unreadable.append((err.filename or skills_dir_str, err.strerror or str(err)))
+    # A missing skills dir is "no skills", not an unreadable one, so only an existing dir reports.
+    onerror = _note_unwalkable if unreadable is not None and os.path.isdir(skills_dir_str) else None
+    for root, dirs, files in os.walk(skills_dir_str, onerror=onerror, followlinks=True):
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
@@ -775,8 +786,33 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             dirs[:] = [d for d in dirs if d == active_org]
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
-            matches.append(os.path.join(root, filename))
+            path = os.path.join(root, filename)
+            if unreadable is not None and not os.access(path, os.R_OK):
+                unreadable.append((path, os.strerror(errno.EACCES)))
+                continue
+            matches.append(path)
     yield from map(Path, sorted(matches))
+
+
+def find_unreadable_skills(skills_dirs) -> list[tuple[str, str]]:
+    """``(path, reason)`` for every skill directory or SKILL.md under *skills_dirs* that
+    can't be read, so a caller can say "there but unreadable" instead of "not found"."""
+    unreadable: list[tuple[str, str]] = []
+    for d in skills_dirs:
+        for _ in iter_skill_index_files(Path(d), "SKILL.md", unreadable=unreadable):
+            pass
+    return unreadable
+
+
+def unreadable_skill_matching(name: str, unreadable: list[tuple[str, str]]) -> Optional[tuple[str, str]]:
+    """The unreadable entry whose skill directory is *name* (bare or categorized), if any."""
+    bare = name.rstrip("/").rsplit("/", 1)[-1]
+    for path, reason in unreadable:
+        p = Path(path)
+        skill_dir = p.parent if p.name == "SKILL.md" else p
+        if skill_dir.name == bare:
+            return path, reason
+    return None
 
 
 # Namespace helpers for plugin-provided skills.
