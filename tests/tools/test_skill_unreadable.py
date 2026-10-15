@@ -174,3 +174,44 @@ def test_a_readable_skill_is_not_reported(home):
 def test_a_missing_skills_dir_is_not_unreadable(tmp_path):
     from agent.skill_utils import find_unreadable_skills
     assert find_unreadable_skills([tmp_path / "nope"]) == []
+
+
+def test_a_symlinked_skill_whose_target_is_unreachable_is_reported(tmp_path):
+    # Tally's real failure on ha-pi (2026-10-11 .. 10-15, ~3d7h silent): the money profile's
+    # skills/ held symlinks into another user's home, and that home was mode 0700. Every
+    # endpoint was fine -- target dirs 755, SKILL.md 644 -- and the agent still had no
+    # procedure, with no notice anywhere. os.walk CANNOT see this: os.path.isdir() follows
+    # the link, the stat fails on the untraversable parent, so the entry is classified as a
+    # non-directory, never scanned, and onerror never fires. The name is not "SKILL.md"
+    # either, so the os.access() branch never runs. A SYMLINK IS VALIDATED BY THE WALK,
+    # NOT BY ITS TARGET.
+    from agent.skill_utils import find_unreadable_skills
+    locked = tmp_path / "otherhome"
+    (locked / "ingest").mkdir(parents=True)
+    (locked / "ingest" / "SKILL.md").write_text("---\nname: ingest\ndescription: x\n---\n\nBody.\n")
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "ingest").symlink_to(locked / "ingest")
+    os.chmod(locked, 0)
+    try:
+        hits = find_unreadable_skills([skills])
+    finally:
+        os.chmod(locked, 0o755)
+    assert any(Path(p).name == "ingest" for p, _ in hits), hits
+
+
+def test_a_reachable_symlink_is_not_reported(tmp_path):
+    # CONTROL for the arm above, and it took two tries to make it bite. A reachable
+    # symlink-to-DIRECTORY is placed in os.walk's `dirs`, never `files`, so it never
+    # reaches the new loop at all and cannot discriminate "report unreachable links"
+    # from "report every link". The subject that DOES reach the loop is a reachable
+    # symlink to a FILE. A GUARD NEEDS A SUBJECT THAT TRIPS IT.
+    from agent.skill_utils import find_unreadable_skills
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "NOTES.md").write_text("notes\n")
+    skills = tmp_path / "skills" / "ingest"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("---\nname: ingest\ndescription: x\n---\n\nBody.\n")
+    (skills / "NOTES.md").symlink_to(elsewhere / "NOTES.md")
+    assert find_unreadable_skills([tmp_path / "skills"]) == []
