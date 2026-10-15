@@ -67,6 +67,25 @@ def test_every_smoke_and_always_file_exists_in_the_tree():
     assert sel.select([], sorted(tracked)) == _with_always(*sel.SMOKE)
 
 
+def test_a_divergently_named_regression_test_is_selected_for_its_source():
+    # Name-matching pairs skill_utils.py with test_skill_utils.py, so the regression test
+    # named after the BUG is invisible to it. SMOKE cannot cover the gap: SMOKE is the
+    # fallback for an EMPTY selection, and this change selects test_skill_utils.py by name,
+    # so a non-empty pick suppresses it. Without EXTRA_TESTS the assert below fails.
+    tracked = TRACKED + ["tests/agent/test_skill_utils.py"]
+    sel_out = sel.select(["agent/skill_utils.py"], tracked)
+    assert "tests/tools/test_skill_unreadable.py" in sel_out, sel_out
+
+
+def test_every_extra_tests_entry_names_a_real_source_and_real_tests():
+    # A stale key silently stops protecting anything, which is the failure this map invites.
+    tracked = set(subprocess.run(["git", "ls-files"], cwd=_ROOT, check=True, capture_output=True,
+                                 text=True, encoding="utf-8").stdout.split())
+    for source, tests in sel.EXTRA_TESTS.items():
+        assert source in tracked, source
+        assert tests and set(tests) <= tracked, (source, tests)
+
+
 def test_the_fork_tests_job_is_present_ungated_free_and_checked():
     # The job this file guards: a sync that rewrites tests.yml must not drop it, gate it behind
     # HAS_LARGE_RUNNERS, move it to a paid runner, or lose the zero-passed check.
