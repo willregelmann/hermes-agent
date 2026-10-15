@@ -42,6 +42,15 @@ SMOKE = (
 # no .py file, so name-matching alone would never select the guard.
 ALWAYS = ("tests/ci/test_select_fork_tests.py",)
 
+# Name-matching pairs foo.py with test_foo.py. A regression test named after
+# the BUG rather than the source file is therefore invisible to it, and SMOKE
+# cannot rescue it: SMOKE is the fallback for an EMPTY selection, so a change
+# that picks test_skill_utils.py by name already suppresses it. Each entry
+# below names a source file and the divergently-named tests that cover it.
+EXTRA_TESTS = {
+    "agent/skill_utils.py": ("tests/tools/test_skill_unreadable.py",),
+}
+
 # Directories run_tests_parallel.py skips by default; they need services this
 # runner doesn't have. Must equal run_tests_parallel._SKIP_PARTS (tested).
 SKIP_PARTS = {"integration", "e2e", "docker"}
@@ -68,6 +77,7 @@ def select(changed: list[str], tracked: list[str]) -> list[str]:
             picked.add(path)
         elif path.endswith(".py") and not path.startswith("tests/"):
             picked.update(by_name.get(f"test_{PurePosixPath(path).stem}.py", ()))
+        picked.update(t for t in EXTRA_TESTS.get(path, ()) if t in present)
     return sorted((picked or set(SMOKE)) | set(ALWAYS))
 
 
