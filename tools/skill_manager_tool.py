@@ -294,8 +294,14 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
 
 
 def _skill_not_found_error(name: str, suffix: str = "") -> str:
-    """Not-found error naming other profiles that hold the skill, plus ``suffix``."""
+    """Not-found error naming other profiles that hold the skill, plus ``suffix``. A skill that is
+    there but unreadable says so instead: "not found" would send the agent off to recreate it."""
     from agent.file_safety import _resolve_active_profile_name
+    from agent.skill_utils import (
+        find_unreadable_skills, get_all_skills_dirs, unreadable_folders_note, unreadable_skill_note)
+    unreadable = find_unreadable_skills(get_all_skills_dirs())
+    if note := unreadable_skill_note(name, unreadable):
+        return f"{note} Active profile: '{_resolve_active_profile_name()}'." + suffix
     base = f"Skill '{name}' not found in active profile '{_resolve_active_profile_name()}'."
     others = _find_skill_in_other_profiles(name)
     if len(others) == 1:
@@ -311,7 +317,7 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
             f"<name>`) to edit there, or edit the files directly (file tools / terminal).")
     else:
         base += " Use skills_list() to see available skills."
-    return base + suffix
+    return base + (unreadable_folders_note(unreadable) or "") + suffix
 
 
 def _validate_file_path(file_path: str) -> Optional[str]:
