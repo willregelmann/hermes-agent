@@ -130,6 +130,41 @@ def test_a_skill_locked_after_the_first_build_is_named_in_the_next(home):
     assert str(late) in second.split("Some skill paths can't be read", 1)[1], second
 
 
+def test_an_unrelated_locked_folder_keeps_the_ordinary_not_found_help(home):
+    # Refsdal on #99 at 28cb15a1: the folder note REPLACED the not-found answer for every miss,
+    # so a typo lost available_skills and the skills_list hint. The note is added, not swapped in.
+    from tools.skills_tool import skill_view
+    out = json.loads(skill_view("readabl"))  # typo of a readable skill; lockeddir is unrelated
+    assert out["success"] is False
+    assert "readable" in (out.get("available_skills") or []), out
+    assert "skills_list" in out.get("hint", ""), out
+    assert str(home / "skills" / "finance" / "lockeddir") in out["error"], out  # the note is still there
+
+
+def test_an_unrelated_locked_folder_keeps_the_other_profile_hint(home):
+    # The other-profile hint is what stops a skill being recreated in the wrong profile. While any
+    # folder was locked, skill_manage returned early and never looked in the other profiles.
+    from tools.skill_manager_tool import skill_manage
+    other = home / "profiles" / "other" / "skills" / "elsewhere"
+    other.mkdir(parents=True)
+    (other / "SKILL.md").write_text("---\nname: elsewhere\ndescription: x\n---\n\nBody.\n")
+    out = json.loads(skill_manage(action="patch", name="elsewhere", old_string="Body.", new_string="New."))
+    assert out["success"] is False
+    assert "profile 'other'" in out["error"], out
+    assert str(home / "skills" / "finance" / "lockeddir") in out["error"], out
+
+
+def test_an_unreadable_skill_md_still_replaces_not_found(home):
+    # The positive case keeps its replacement: a SKILL.md that exists is not "not found", and the
+    # folder sentence is only ever appended. (Through the tools this case is mostly preempted by a
+    # raw EACCES on the read itself; that is a separate follow-up, so the contract is pinned here.)
+    from agent.skill_utils import find_unreadable_skills, unreadable_folders_note, unreadable_skill_note
+    hits = find_unreadable_skills([home / "skills"])
+    assert "exists but its SKILL.md can't be read" in unreadable_skill_note("lockedfile", hits)
+    assert unreadable_skill_note("readabl", hits) is None  # a lone folder never replaces the answer
+    assert "lockeddir" in unreadable_folders_note(hits) and "exists" not in unreadable_folders_note(hits)
+
+
 def test_a_readable_skill_is_not_reported(home):
     from agent.skill_utils import find_unreadable_skills
     hits = find_unreadable_skills([home / "skills"])

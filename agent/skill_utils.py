@@ -805,20 +805,26 @@ def find_unreadable_skills(skills_dirs) -> list[tuple[str, str]]:
 
 
 def unreadable_skill_note(name: str, unreadable: list[tuple[str, str]]) -> Optional[str]:
-    """What to say instead of "not found" for *name*, given ``find_unreadable_skills`` output.
-
-    A SKILL.md that can't be read names a skill that exists. A folder that can't be entered says
-    nothing about what's inside it, so it is only offered as where the skill may be, never
-    claimed as the skill. None when nothing unreadable could explain the miss."""
+    """The answer that REPLACES "not found" for *name*: its own SKILL.md exists but can't be read.
+    None otherwise; an unreadable folder never stands in for the answer (see
+    ``unreadable_folders_note``)."""
     bare = name.rstrip("/").rsplit("/", 1)[-1]
     for path, reason in unreadable:
         p = Path(path)
         if p.name == "SKILL.md" and p.parent.name == bare:
             return f"Skill '{name}' exists but its SKILL.md can't be read: {reason} ({path})."
+    return None
+
+
+def unreadable_folders_note(unreadable: list[tuple[str, str]]) -> Optional[str]:
+    """A sentence to APPEND to the ordinary not-found answer when folders under the skills dirs
+    can't be entered. A folder says nothing about what's inside it, so it is offered as where
+    the skill may be, never claimed as the skill, and never hides available_skills or the
+    other-profile hint (an unrelated locked folder must not turn every typo into a dead end)."""
     folders = [f"{path} ({reason})" for path, reason in unreadable if Path(path).name != "SKILL.md"]
     if folders:
-        return (f"Skill '{name}' not found among the readable skills, but these folders under the skills "
-                f"directories can't be read and it may be inside one: {'; '.join(folders)}.")
+        return (f" These folders under the skills directories can't be read, and it may be inside "
+                f"one: {'; '.join(folders)}.")
     return None
 
 
