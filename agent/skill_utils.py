@@ -765,10 +765,13 @@ def iter_skill_index_files(skills_dir: Path, filename: str, unreadable: Optional
     TOKEN-GATED: only the active org's subdir is walked, so leaving an org
     stops its skills resolving without manual cleanup.
 
-    With *unreadable* (a list), a directory the walk can't enter and a matching
-    file the process can't read are appended as ``(path, reason)`` and the file
-    is not yielded. Without it they vanish silently, which reads as "no such
-    skill" when the truth is "a skill is there and can't be read"."""
+    With *unreadable* (a list), a directory the walk can't enter, a matching file the
+    process can't read, and a symlinked entry whose target can't be reached are appended
+    as ``(path, reason)`` and nothing is yielded for them. Without it they vanish silently,
+    which reads as "no such skill" when the truth is "a skill is there and can't be read".
+    A link whose target can't be stat'ed is a FILE to os.walk (isdir is False), so onerror
+    never fires for it; it is checked here, outside skill dirs only (a link inside a skill
+    is a supporting file, not a skill)."""
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
@@ -779,26 +782,18 @@ def iter_skill_index_files(skills_dir: Path, filename: str, unreadable: Optional
     # A missing skills dir is "no skills", not an unreadable one, so only an existing dir reports.
     onerror = _note_unwalkable if unreadable is not None and os.path.isdir(skills_dir_str) else None
     for root, dirs, files in os.walk(skills_dir_str, onerror=onerror, followlinks=True):
-        # os.walk classifies an entry by a FOLLOWED stat, so a symlink whose target is
-        # unreachable (target fine, a parent not traversable) lands in `files`, is never
-        # scanned, and never reaches onerror. Its name is not `filename` either, so the
-        # readability check below never sees it: the skill vanishes silently. Report the
-        # link itself -- a symlink is validated by the walk, not by its target.
-        if unreadable is not None:
-            for name in files:
-                p = os.path.join(root, name)
-                if not os.path.islink(p):
-                    continue
-                try:
-                    os.stat(p)
-                except OSError as err:
-                    unreadable.append((p, err.strerror or str(err)))
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             dirs[:] = [d for d in dirs if d == active_org]
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        if unreadable is not None and not has_skill_md:
+            # os.walk classifies an entry by a FOLLOWED stat, so a symlink whose target is
+            # unreachable (target fine, a parent not traversable) lands in `files`, is never
+            # scanned, and never reaches onerror; its name isn't `filename` either. Report the
+            # link itself: a symlink is validated by the walk, not by its target.
+            unreadable.extend(_unreachable_links(root, files))
         if filename in files:
             path = os.path.join(root, filename)
             if unreadable is not None and not os.access(path, os.R_OK):
@@ -806,6 +801,26 @@ def iter_skill_index_files(skills_dir: Path, filename: str, unreadable: Optional
                 continue
             matches.append(path)
     yield from map(Path, sorted(matches))
+
+
+def _unreachable_links(root: str, files: list) -> list[tuple[str, str]]:
+    """Symlinks in *root* whose target can't be reached (stat fails), as ``(link, reason)``.
+    The reason quotes ``os.readlink``: the link's first hop as written (relative or a further
+    link), not a claim about the final target."""
+    found = []
+    for entry in files:
+        link = os.path.join(root, entry)
+        if not os.path.islink(link):
+            continue
+        try:
+            os.stat(link)
+        except OSError as exc:
+            try:
+                hop = os.readlink(link)
+            except OSError:
+                hop = "?"
+            found.append((link, f"symlink to {hop}, which can't be reached: {exc.strerror or exc}"))
+    return found
 
 
 def find_unreadable_skills(skills_dirs) -> list[tuple[str, str]]:
@@ -818,15 +833,26 @@ def find_unreadable_skills(skills_dirs) -> list[tuple[str, str]]:
     return unreadable
 
 
+def unreadable_kind(path: str) -> str:
+    """``skill_file`` | ``link`` | ``folder`` for an entry from :func:`find_unreadable_skills`.
+    ``link`` is a symlink whose target can't be reached; a link to a readable-but-locked dir is
+    reported by the walk as the folder it is."""
+    if Path(path).name == "SKILL.md":
+        return "skill_file"
+    return "link" if os.path.islink(path) and not os.path.exists(path) else "folder"
+
+
 def unreadable_skill_note(name: str, unreadable: list[tuple[str, str]]) -> Optional[str]:
-    """The answer that REPLACES "not found" for *name*: its own SKILL.md exists but can't be read.
-    None otherwise; an unreadable folder never stands in for the answer (see
-    ``unreadable_folders_note``)."""
+    """The answer that REPLACES "not found" for *name*: its own SKILL.md exists but can't be read,
+    or its entry is a symlink whose target can't be reached. None otherwise; an unreadable folder
+    never stands in for the answer (see ``unreadable_folders_note``)."""
     bare = name.rstrip("/").rsplit("/", 1)[-1]
     for path, reason in unreadable:
         p = Path(path)
         if p.name == "SKILL.md" and p.parent.name == bare:
             return f"Skill '{name}' exists but its SKILL.md can't be read: {reason} ({path})."
+        if p.name == bare and unreadable_kind(path) == "link":
+            return f"Skill '{name}' is at {path}, a {reason}."
     return None
 
 
@@ -835,7 +861,7 @@ def unreadable_folders_note(unreadable: list[tuple[str, str]]) -> Optional[str]:
     can't be entered. A folder says nothing about what's inside it, so it is offered as where
     the skill may be, never claimed as the skill, and never hides available_skills or the
     other-profile hint (an unrelated locked folder must not turn every typo into a dead end)."""
-    folders = [f"{path} ({reason})" for path, reason in unreadable if Path(path).name != "SKILL.md"]
+    folders = [f"{path} ({reason})" for path, reason in unreadable if unreadable_kind(path) == "folder"]
     if folders:
         return (f" These folders under the skills directories can't be read, and it may be inside "
                 f"one: {'; '.join(folders)}.")

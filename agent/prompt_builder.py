@@ -1533,10 +1533,12 @@ def _unreadable_skills_note(roots: "list[Path]", index: str) -> str:
     unreadable = find_unreadable_skills(roots)
     if not unreadable:
         return ""
+    from agent.skill_utils import unreadable_kind
+    label = {"skill_file": "skill file", "link": "symlink", "folder": "folder"}
     return ("\n\n" if index else "") + (
-        "Some skill paths can't be read (permission denied). Skills there won't load until the files "
+        "Some skill paths can't be read. Skills there won't load until the files "
         "are fixed; tell the user rather than recreating them:\n"
-        + "\n".join(f"  - {'skill file' if Path(p).name == 'SKILL.md' else 'folder'} {p}: {reason}"
+        + "\n".join(f"  - {label[unreadable_kind(p)]} {p}: {reason}"
                     for p, reason in unreadable))
 
 

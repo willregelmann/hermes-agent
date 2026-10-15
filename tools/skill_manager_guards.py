@@ -5,6 +5,7 @@ so test patches keep working."""
 
 import contextvars as _ctxvars
 import logging
+import os
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -92,6 +93,28 @@ def _containing_skills_root(skill_path: Path) -> Path:
     from tools import skill_manager_tool as _smt
     resolved, roots = _resolved_roots(skill_path)
     return next((root for root, r in roots if resolved.is_relative_to(r)), _smt._skills_dir())
+
+
+def _outside_roots_write_guard(name: str, skill_dir: Path, action: str) -> Optional[Dict[str, Any]]:
+    """Refuse, by name, a write or delete whose skill dir RESOLVES outside every skills root: it
+    is reached through a symlink (the skill dir or a category above it), and following it would
+    write wherever the link points. A link into another skills root (external_dirs) resolves
+    inside one and passes: skill_manage could already write there directly."""
+    resolved, roots = _resolved_roots(skill_dir)
+    if any(resolved.is_relative_to(r) for _root, r in roots):
+        return None
+    link = next((p for p in (skill_dir, *skill_dir.parents) if p.is_symlink()), None)
+    if link is None:
+        return _refusal(
+            f"Refusing {action} for skill '{name}': it resolves to {resolved}, which is not inside "
+            f"any known skills root (outside the trusted skills directories).")
+    via = f"{link} is a symlink"
+    with suppress(OSError):
+        via += f" to {os.readlink(link)}"
+    return _refusal(
+        f"Refusing {action} for skill '{name}': it resolves to {resolved}, outside the trusted "
+        f"skills directories ({via}). skill_manage won't write through a link out of every skills "
+        f"root; edit the target directly, or replace the link with a real copy.")
 
 
 def _is_path_redirect(path: Path) -> bool:
